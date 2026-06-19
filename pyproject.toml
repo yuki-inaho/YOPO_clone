@@ -1,0 +1,74 @@
+[project]
+name = "yopo"
+version = "3.3.0"
+description = "YOPO: You Only Pose Once — monocular RGB category-level 9D pose (MMDetection-based, uv/cu121 stack)"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+# cu121 (torch 2.4.0 + cu121) dependency stack, matching YOPO's documented base
+# image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel`.
+#
+# The `yopo` package itself is NOT pip-installed (it is the repo root, a renamed
+# MMDetection fork). It is made importable develop-style by `just sync` (a .pth
+# file pointing at the repo root). mmcv is the prebuilt cu121 manylinux 2.2.0
+# wheel (no source build); mmengine comes from PyPI. Because the package is not
+# built, YOPO's own setup.py `install_requires` (requirements/runtime.txt) are
+# NOT applied — so every MMDet/YOPO runtime dep is listed explicitly below.
+dependencies = [
+    "torch==2.4.0",
+    "torchvision==0.19.0",
+    "numpy<2",
+    "mmcv==2.2.0",
+    "mmengine>=0.7.1,<1.0.0",
+    "setuptools<81",
+    "wheel",
+    # --- OpenMMLab / MMDetection runtime deps (requirements/runtime.txt + the
+    #     transitive deps mmengine/mmcv expect at import time) ---
+    "addict",
+    "pyyaml",
+    "rich",
+    "termcolor",
+    "yapf",
+    "matplotlib",
+    "packaging",
+    "prettytable",
+    "pycocotools",
+    "scipy",
+    "shapely",
+    "six",
+    "terminaltables",
+    "tqdm",
+    "einops",
+    "importlib-metadata",
+    "opencv-python",
+    "pillow",
+    # --- YOPO category-level 9D pose extras (yopo/datasets/pose_estimation,
+    #     yopo/evaluation/metrics) ---
+    "plyfile",
+    "scikit-learn",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "pytest",
+    "ruff",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+# Prebuilt mmcv 2.2.0 manylinux wheel for torch 2.4.0 + cu121 (no source build;
+# runs on the L4 sm_89 GPU). From the official OpenMMLab wheel index.
+mmcv = { url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.4.0/mmcv-2.2.0-cp310-cp310-manylinux1_x86_64.whl" }
+torch = { index = "pytorch-cu121" }
+torchvision = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"

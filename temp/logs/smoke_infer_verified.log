@@ -1,0 +1,32 @@
+"/home/kasm-user/Desktop/YOPO/.venv/bin/python" scripts/smoke_infer.py --ckpt "checkpoints/nocs_yopo_real_camera_r50.pth" --data "data/nocs_smoke"
+/home/kasm-user/Desktop/YOPO/.venv/lib/python3.10/site-packages/mmengine/optim/optimizer/zero_optimizer.py:11: DeprecationWarning: `TorchScript` support for functional optimizers is deprecated and will be removed in a future PyTorch release. Consider using the `torch.compile` optimizer instead.
+  from torch.distributed.optim import \
+/home/kasm-user/Desktop/YOPO/.venv/lib/python3.10/site-packages/mmengine/runner/checkpoint.py:347: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  checkpoint = torch.load(filename, map_location=map_location)
+/home/kasm-user/Desktop/YOPO/.venv/lib/python3.10/site-packages/torch/functional.py:513: UserWarning: torch.meshgrid: in an upcoming release, it will be required to pass the indexing argument. (Triggered internally at ../aten/src/ATen/native/TensorShape.cpp:3609.)
+  return _VF.meshgrid(tensors, **kwargs)  # type: ignore[attr-defined]
+Config loaded: configs/yopo/nocs_yopo_real_camera_r50.py
+Model built: DINO9DCenter2DPose
+Loads checkpoint by local backend from path: checkpoints/nocs_yopo_real_camera_r50.pth
+Checkpoint loaded: checkpoints/nocs_yopo_real_camera_r50.pth
+Model on device: cuda:0
+Loading test sample from: data/nocs_smoke
+Running forward pass (eval + no_grad)...
+Forward pass completed.
+
+--- Prediction summary ---
+  sample[0]: DetDataSample
+    pred_instances keys: ['rotations', 'labels', 'scores', 'centers_2d', 'z', 'translations', 'sizes', 'T', 'bboxes']
+      rotations: shape=torch.Size([300, 6]) dtype=torch.float32
+      labels: shape=torch.Size([300]) dtype=torch.int64
+      scores: shape=torch.Size([300]) dtype=torch.float32
+      centers_2d: shape=torch.Size([300, 2]) dtype=torch.float32
+      z: shape=torch.Size([300, 1]) dtype=torch.float32
+      translations: shape=torch.Size([300, 3]) dtype=torch.float32
+      sizes: shape=torch.Size([300, 3]) dtype=torch.float32
+      T: shape=torch.Size([300, 4, 4]) dtype=torch.float32
+      bboxes: shape=torch.Size([300, 4]) dtype=torch.float32
+--------------------------
+All required prediction keys present: ['T', 'bboxes', 'labels', 'rotations', 'scores', 'sizes', 'translations']
+
+SMOKE INFER OK

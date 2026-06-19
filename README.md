@@ -38,7 +38,41 @@ Current YOPO entry points are in:
 |---|---|---:|---:|---:|---|
 | YOPO Swin-L | [file](configs/yopo/housecat6d_yopo_swinl.py) | 71.3 | 34.8 | 33.3 | [link](https://github.com/pitin-ev/YOPO/releases/download/v1.0.0/housecat6d_yopo_swinl.pth) |
 
-## Environment
+## Quickstart (uv + cu121)
+
+The recommended setup uses **uv** with a repo-local venv and the cu121 stack.
+No Docker required.
+
+```bash
+# Clone and switch to the cu121 branch
+git clone git@github.com:yuki-inaho/YOPO.git
+cd YOPO
+git checkout cu121
+
+# One-time setup
+just setup
+
+# Verify the environment
+just env-doctor
+# Expected: torch 2.4.0+cu121 / mmcv 2.2.0 / mmengine 0.10.7 / cuda_available True
+
+# Generate synthetic data for smoke tests
+just gen-synthetic
+
+# Download the official R50 checkpoint
+just download-ckpt
+
+# GPU smoke training (1 epoch, saves checkpoint)
+just smoke-train
+
+# GPU smoke inference (loads official checkpoint, runs forward pass)
+just smoke-infer
+```
+
+See [docs/CU121_TRAINING.md](docs/CU121_TRAINING.md) for full details on the
+stack, smoke configs, known gotchas, and non-goals.
+
+## Environment (Docker)
 
 The target base environment is:
 
