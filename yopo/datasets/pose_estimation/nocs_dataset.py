@@ -214,7 +214,7 @@ class NOCSDataset(BaseDetDataset):
 
         return data_info
 
-    def _parse_instance_info(self, gt_info: dict, intrinsic: list[float]) -> List[dict]:
+    def _parse_instance_info(self, gt_info: dict, intrinsic: List[float]) -> List[dict]:
         """parse instance information.
 
         Args:

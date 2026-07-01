@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from typing import Optional
 import warnings
@@ -892,4 +894,3 @@ class PadAndResizeForPoseTest(Resize):
     def __repr__(self) -> str:
         repr_str = super().__repr__()
         return repr_str
-

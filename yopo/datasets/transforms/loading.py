@@ -1,5 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 import warnings
 
 import mmcv
@@ -1378,7 +1378,7 @@ class ConvertDepthToPointCloud(BaseTransform):
     """
 
     def __init__(self,
-                 img_scale: list[int, int] = [640, 480],
+                 img_scale: List[int] = [640, 480],
                  concatenate_to_rgb: bool = False,
     ):
         self.img_scale = img_scale
