@@ -1,6 +1,6 @@
 _base_ = './housecat6d_yopo_r50.py'
 
-data_root = 'data/housecat6d_pipe_nyx650_250'
+data_root = 'data/housecat6d_tube_nyx650_250'
 
 model = dict(
     train_cfg=dict(
@@ -35,8 +35,8 @@ default_hooks = dict(
         type='CheckpointHook',
         interval=1,
         # AP50 is kept as the MMEngine checkpoint hook metric, but it ranks
-        # all raw 300 DINO/YOPO queries and can disagree with pipe deployment.
-        # For the pipe-only use case, choose the final model with the actual
+        # all raw 300 DINO/YOPO queries and can disagree with tube deployment.
+        # For the tube-only use case, choose the final model with the actual
         # inference policy: tube confidence threshold followed by 2D bbox NMS.
         # Threshold-only inference is not enough because duplicate queries
         # remain; inspect threshold+NMS F1/recall before publishing a model.
