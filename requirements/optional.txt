@@ -3,3 +3,5 @@ emoji
 fairscale
 imagecorruptions
 scikit-learn
+schedulefree==1.4.1
+muon-optimizer@git+https://github.com/KellerJordan/Muon.git@f98f1cacc0263b04290753e32be8d498c1efc806
