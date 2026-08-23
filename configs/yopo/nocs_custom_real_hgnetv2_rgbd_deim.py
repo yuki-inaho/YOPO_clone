@@ -63,10 +63,11 @@ optim_wrapper = dict(
     accumulative_counts=3,
     clip_grad=dict(max_norm=0.1, norm_type=2))
 
-# ── Learning policy (train until loss converges) ──────────────────────────
+# ── Learning policy (train until loss converges, cosine annealing) ──────────
 # 20 epochs was not enough (loss 682->151 still slowly decreasing). Extended to
-# 100 epochs with later MultiStep milestones so the learning rate stays high
-# long enough for the loss to fully converge; resume from the 20-epoch ckpt.
+# 100 epochs (~75 min at ~45 s/epoch) with cosine-annealing lr so the loss can
+# fully converge; resume from the 20-epoch checkpoint.
+#   - Linear warmup (5 epochs, by iter) then cosine decay over the full run.
 max_epochs = 100
 train_cfg = dict(
     type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
@@ -83,14 +84,14 @@ param_scheduler = [
         start_factor=1e-3,
         by_epoch=False,
         begin=0,
-        end=1000),
+        end=200),
     dict(
-        type='MultiStepLR',
+        type='CosineAnnealingLR',
+        T_max=max_epochs,
+        eta_min=1e-6,
         begin=0,
         end=max_epochs,
-        by_epoch=True,
-        milestones=[60, 80],
-        gamma=0.1),
+        by_epoch=True),
 ]
 
 # ── AMP (fp16) is intentionally NOT used (see header note); ScheduleFree runs
