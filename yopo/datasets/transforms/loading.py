@@ -1430,3 +1430,56 @@ class ConvertDepthToPointCloud(BaseTransform):
                     f"img_scale={self.img_scale}, ")
 
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class ConcatDepthToImage(BaseTransform):
+    """Concatenate the normalized depth map to the RGB image as a 4th channel.
+
+    Produces an (H, W, 4) float32 tensor (RGB + depth) for 4-channel RGB-D
+    learning. The depth map must already be loaded by ``LoadDepthImageFromFile``
+    (i.e. ``results['depth']`` exists, normalized float32 in [0, 1]).
+
+    Required Keys:
+
+    - img
+    - depth
+
+    Modified Keys:
+
+    - img (H, W, 4) float32
+
+    Args:
+        depth_scale (float): Multiplier applied to the (0-1 normalized) depth
+            before appending, to make the depth channel numerically match the
+            RGB uint8 range. Defaults to 255.0.
+    """
+
+    def __init__(self, depth_scale: float = 255.0):
+        self.depth_scale = depth_scale
+
+    def transform(self, results: dict) -> dict:
+        assert 'img' in results, 'ConcatDepthToImage requires "img"'
+        assert 'depth' in results, (
+            'ConcatDepthToImage requires "depth" (add LoadDepthImageFromFile '
+            'before it in the pipeline)')
+
+        img = results['img']
+        depth = results['depth']
+
+        if img.dtype != np.float32:
+            img = img.astype(np.float32)
+
+        depth_ch = depth.astype(np.float32) * self.depth_scale
+        if depth_ch.ndim == 2:
+            depth_ch = depth_ch[..., None]
+        elif depth_ch.ndim == 3 and depth_ch.shape[2] != 1:
+            depth_ch = depth_ch[..., :1]
+
+        results['img'] = np.concatenate([img, depth_ch], axis=-1)
+        return results
+
+    def __repr__(self):
+        repr_str = (f'{self.__class__.__name__}('
+                    f'depth_scale={self.depth_scale})')
+        return repr_str

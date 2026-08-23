@@ -88,14 +88,47 @@ class DetDataPreprocessor(ImgDataPreprocessor):
                  boxtype2tensor: bool = True,
                  non_blocking: Optional[bool] = False,
                  batch_augments: Optional[List[dict]] = None):
-        super().__init__(
-            mean=mean,
-            std=std,
-            pad_size_divisor=pad_size_divisor,
-            pad_value=pad_value,
-            bgr_to_rgb=bgr_to_rgb,
-            rgb_to_bgr=rgb_to_bgr,
-            non_blocking=non_blocking)
+        is_rgbd_4ch = (mean is not None
+                       and isinstance(mean, (list, tuple, Sequence))
+                       and len(mean) == 4)
+        if is_rgbd_4ch:
+            # RGB-D 4-channel preprocessor.
+            # mmengine's ImgDataPreprocessor only supports 1/3 channel mean;
+            # register the 4-channel normalization buffers ourselves and call
+            # the parent without mean/std to bypass its assert.
+            if std is None or len(std) != 4:
+                raise ValueError('RGB-D (4-channel) mode requires a 4-value std '
+                                 f'matching the 4-value mean, got std={std}')
+            self._rbgd_4ch = True
+            super().__init__(
+                mean=None,
+                std=None,
+                pad_size_divisor=pad_size_divisor,
+                pad_value=pad_value,
+                bgr_to_rgb=bgr_to_rgb,
+                rgb_to_bgr=rgb_to_bgr,
+                non_blocking=non_blocking)
+            self._enable_normalize = True
+            self.register_buffer('mean',
+                                 torch.tensor(list(mean), dtype=torch.float32)
+                                 .view(-1, 1, 1), False)
+            self.register_buffer('std',
+                                 torch.tensor(list(std), dtype=torch.float32)
+                                 .view(-1, 1, 1), False)
+            # Disable BGR<->RGB channel permutation for the 4-channel RGB-D
+            # input: permuting the first 3 channels would corrupt the depth
+            # channel layout (and mmengine's [2,1,0] index would drop it).
+            self._channel_conversion = False
+        else:
+            self._rbgd_4ch = False
+            super().__init__(
+                mean=mean,
+                std=std,
+                pad_size_divisor=pad_size_divisor,
+                pad_value=pad_value,
+                bgr_to_rgb=bgr_to_rgb,
+                rgb_to_bgr=rgb_to_bgr,
+                non_blocking=non_blocking)
         if batch_augments is not None:
             self.batch_augments = nn.ModuleList(
                 [MODELS.build(aug) for aug in batch_augments])

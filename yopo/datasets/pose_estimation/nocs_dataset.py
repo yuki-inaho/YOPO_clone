@@ -79,6 +79,7 @@ class NOCSDataset(BaseDetDataset):
         num_sample_points: int = 1000,
         use_cuboid_as_bbox: bool = False,
         use_log_z: bool = False,
+        intrinsic: Optional[List[float]] = None,
         **kwargs,
     ) -> None:
         assert split in self.SPLIT_INFO, (
@@ -87,6 +88,11 @@ class NOCSDataset(BaseDetDataset):
         )
 
         self.split = split
+        # Allow overriding the (normally hard-coded) per-split intrinsic from
+        # the config. Used by the custom RGB-D dataset whose camera intrinsics
+        # differ from the stock NOCS/REAL275 values.
+        if intrinsic is not None:
+            self.SPLIT_INFO[self.split]["intrinsic"] = list(intrinsic)
         self.num_sample_points = num_sample_points
         self.use_cuboid_as_bbox = use_cuboid_as_bbox
         self.use_log_z = use_log_z
