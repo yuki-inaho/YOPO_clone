@@ -173,28 +173,28 @@
 ### フェーズ 3: 反映・push・full training
 
 ### 手順 7: config / モジュール一式の build 検証
-- [ ] 🖐 **操作**: `just env-doctor`＋該当 config の `Config.fromfile` + `MODELS.build` を実行。
-- [ ] 🔎 **確認**: torch 2.4.0+cu121 / mmcv 2.2.0 / yopo 3.3.0 / cuda True / モデル build OK。
-- [ ] 🧪 **テスト**: import エラーなし。
-- [ ] 🛠 **エラー時対処**: import 失敗は registry 登録漏れの可能性。`register_all_modules` 経由を確認。
+- [x] 🖐 **操作**: `just env-doctor`＋両 config の `Config.fromfile` + `MODELS.build` を実行。
+- [x] 🔎 **確認**: torch 2.4.0+cu121 / mmcv 2.2.0 / yopo 3.3.0 / cuda True / RTX 4000 Ada（20GB, sm_89）/ モデル build 両方 OK。
+- [x] 🧪 **テスト**: import エラーなし（`MODELS.build OK` ×2）。
+- [x] 🛠 **エラー時対処**: 不要（全 build 成功）。
 
 ### 手順 8: commit & push（rgb-d）
-- [ ] 🖐 **操作**: `git add`（該当 コード + config）→ `git commit -m "..."` → `git push origin rgb-d`。
-- [ ] 🔎 **確認**: `git status` クリーン、push 成功。
-- [ ] 🧪 **テスト**: `git log --oneline -1` でコミット確認。
-- [ ] 🛠 **エラー時対処**: コミット対象が大容量（work_dirs/data）でないこと、`.gitignore` を確認。
+- [x] 🖐 **操作**: `git add`（コード+config+workdoc）→ `git commit -m "feat(rgbd): DEIM experiment stack..."` → `git push origin rgb-d`。
+- [x] 🔎 **確認**: `git status` クリーン、push 成功（`4b851d7..f5de525`）。
+- [x] 🧪 **テスト**: `git log --oneline -1` で `f5de525` を確認。
+- [x] 🛠 **エラー時対処**: コミット対象に work_dirs/data 含まず（OK）。
 
 ### 手順 9: full training のバックグラウンド起動
-- [ ] 🖐 **操作**: `nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd_deim.py --work-dir work_dirs/<run> [--amp] > /tmp/opencode/full_train.log 2>&1 &`
-- [ ] 🔎 **確認**: プロセス起動、ログに epoch 進行・loss 出力。
-- [ ] 🧪 **テスト**: 初回 epoch の iter が進み loss が減少。
-- [ ] 🛠 **エラー時対処**: 即死時はログの traceback を確認し、config/モジュールを修正して再起動。
+- [x] 🖐 **操作**: `nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd_deim.py --work-dir work_dirs/full_run > /tmp/opencode/full_train.log 2>&1 &`（PID 715176 で起動）。
+- [x] 🔎 **確認**: プロセス生存、ログに epoch 進行・loss 出力。
+- [x] 🧪 **テスト**: epoch 1→2 で loss 682→488 と減少、NaN なし、memory 8.7GB（nvidia-smi 実測 10.3GB/20GB）。
+- [x] 🛠 **エラー時対処**: 即死時はログの traceback を確認し修正して再起動（発生せず）。
 
 ### 手順 10: 監視と記録
-- [ ] 🖐 **操作**: `tail -f /tmp/opencode/full_train.log`（または定期確認）で epoch/loss/checkpoint を監視。
-- [ ] 🔎 **確認**: 複数 epoch 継続、checkpoint 生成、VRAM 余裕。
-- [ ] 🧪 **テスト**: `nvidia-smi` で VRAM を確認。
-- [ ] 🛠 **エラー時対処**: 途中 NaN/OOM はログから原因特定し、config 修正 → 再起動。
+- [x] 🖐 **操作**: `tail -f /tmp/opencode/full_train.log` で epoch/loss/checkpoint を確認。
+- [x] 🔎 **確認**: 20 epoch 継続予定、checkpoint 生成、VRAM 余裕（10.3/20GB）。
+- [x] 🧪 **テスト**: `nvidia-smi` で VRAM 10.3GB/20GB（余裕）。
+- [x] 🛠 **エラー時対処**: 本 run 継続。NaN/OOM 発生時はログから原因特定 → config 修正 → 再起動。
 
 ---
 
@@ -244,10 +244,10 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 
 *作業が最後まで完了したら `[ ]` を `[x]` にしつつ、作業が本当に完了したかをチェックします*
 
-- [ ] 観点1: ゴール要求分析で定義した成功条件（NaN なし 1 epoch・encoder lr×0.5・実効 batch 24・push・full training 起動）を満たしている。
-- [ ] 観点2: すべての Trace ID（TR-1..6）に対応する証跡が作業記録（§7）に残っている。
-- [ ] 観点3: uv 環境で必要な build / smoke が成功している。
-- [ ] 観点4: 暗黙 fallback を使わず、例外・未対応事項（例: AutoMuon への paramwise_cfg 非対応）は明示的に記録されている。
+- [x] 観点1: ゴール要求分析で定義した成功条件（NaN なし 1 epoch・encoder lr×0.5・実効 batch 24・push・full training 起動）を満たしている。（NaN なし 20 epoch、encoder lr=0.00125=0.5×base、batch 8×3=24、push f5de525、full_train PID 715176 動作中）
+- [x] 観点2: すべての Trace ID（TR-1..6）に対応する証跡が作業記録（§7）に残っている。（§7 に全記録）
+- [x] 観点3: uv 環境で必要な build / smoke が成功している。（env-doctor / MODELS.build / 20 epoch smoke 成功）
+- [x] 観点4: 暗黙 fallback を使わず、例外・未対応事項（例: AutoMuon への paramwise_cfg 非対応）は明示的に記録されている。（§7 に AutoMuon 非対応・AMP NaN を明記）
 
 ---
 
@@ -273,9 +273,11 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 | `2026-08-23` | `16:14~16:17 UTC` | opencode | ScheduleFree train-mode 対応 | schedulefree は `optimizer.train()` 必須のため `ScheduleFreeOptimWrapper`（OptimWrapper サブクラス）を deim_optimizers.py に追加し、step 前に lazy train へ。 |
 | `2026-08-23` | `16:15~16:32 UTC` | opencode | AMP 調査 | `--amp`/`AmpOptimWrapper` で fp16 forward が iter0 から assigner NaN を誘発（pred 全 NaN）。AdamW+fp32 分離ランは batch8+accum3 で 20 epoch 完走（memory 8.6GB）→ **fp32 を維持**と決定。 |
 | `2026-08-23` | `16:34~16:39 UTC` | opencode | フェーズ2: 手順6（batch/accum 検証） | `ScheduleFreeOptimWrapper`(fp32)+batch8+accum3 の fresh 20 epoch smoke 成功（NaN 0回、loss 682→175、memory ~8.7GB、iter=38/epoch=実効24）。 |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ3: 手順8（commit & push） | （コミット hash を記録） |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ3: 手順9（full training 起動） | （起動コマンド・pid・log パスを記録） |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ3: 手順10（監視） | （epoch/loss/VRAM を記録） |
+| `2026-08-23` | `16:20 UTC` | opencode | フェーズ3: 手順7（build 検証） | `just env-doctor`（torch2.4.0+cu121/cuda True/RTX4000Ada）+ 両 config の `MODELS.build` 成功。 |
+| `2026-08-23` | `16:21~16:50 UTC` | opencode | フェーズ3: 手順8（commit & push） | `git commit f5de525`（16 ファイル / +1126行）。`git push origin rgb-d` 成功（`4b851d7..f5de525`）。 |
+| `2026-08-23` | `16:50 UTC` | opencode | ストレージ整理 | work_dirs の不要 smoke run（計 ~7GB）を削除。モデルファイル(.pth)は保持。 |
+| `2026-08-23` | `16:55 UTC` | opencode | フェーズ3: 手順9（full training 起動） | PID 715176、`work_dirs/full_run`、log `/tmp/opencode/full_train.log`。20 epoch / 実効 batch 24 / fp32。 |
+| `2026-08-23` | `16:57 UTC` | opencode | フェーズ3: 手順10（監視） | epoch1→2 進行、loss 682→488 減少、NaN なし、VRAM 実測 10.3GB/20GB、Saving checkpoint OK。 |
 
 ---
 
