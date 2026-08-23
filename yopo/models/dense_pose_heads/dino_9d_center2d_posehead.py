@@ -49,6 +49,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             use_bbox_for_rotation : bool = False,
             use_bbox_for_size : bool = False,
             use_log_z: bool = False,
+            use_cop_chain: bool = False,
             loss_bbox: ConfigType = dict(type='L1Loss', loss_weight=5.0),
             loss_iou: ConfigType = dict(type='GIoULoss', loss_weight=2.0),
             loss_centers_2d: ConfigType = dict(type='L1PoseLoss', loss_weight=5.0),
@@ -96,6 +97,11 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.use_bbox_for_size = use_bbox_for_size
 
         self.use_log_z = use_log_z
+
+        self.use_cop_chain = use_cop_chain
+        if use_cop_chain:
+            self.cop_loss_weights = dict(
+                size=3.0, rotation=2.0, z=1.0)
 
         self.loss_centers_2d = MODELS.build(loss_centers_2d)
         self.loss_z = MODELS.build(loss_z)
@@ -173,6 +179,35 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.reg_rotation_branch = self.replicate(all_branches[2], self.num_pred_layer)
         self.reg_size_branch = self.replicate(all_branches[3], self.num_pred_layer)
 
+        # ── CoP (Chain-of-Prediction) auxiliary nets ──────────────────────
+        # AttributeNet A(·) per attribute (MonoCoP Eq.6): two Linear layers
+        # with ReLU between. The chain follows the best prediction order
+        # size -> rotation -> depth, with residual aggregation (Eq.8):
+        #   f_s  = A_s(q);          f̃_s = f_s + q
+        #   f_a  = A_a(f̃_s);       f̃_a = f_a + f̃_s
+        #   f_d  = A_d(f̃_a);       f̃_d = f_d + f̃_a
+        if self.use_cop_chain:
+
+            def _attr_net():
+                return nn.Sequential(
+                    nn.Linear(self.embed_dims, self.embed_dims), nn.ReLU(),
+                    nn.Linear(self.embed_dims, self.embed_dims))
+
+            self.cop_size_net = self.replicate(_attr_net(), self.num_pred_layer)
+            self.cop_rotation_net = self.replicate(
+                _attr_net(), self.num_pred_layer)
+            self.cop_z_net = self.replicate(_attr_net(), self.num_pred_layer)
+
+            # Final prediction heads on the aggregated CoP features.
+            s_dim = 3 * self.num_classes if self.classwise_sizes else 3
+            r_dim = self.rot_dim * self.num_classes if self.classwise_rotation else self.rot_dim
+            self.cop_size_out = self.replicate(
+                nn.Linear(self.embed_dims, s_dim), self.num_pred_layer)
+            self.cop_rotation_out = self.replicate(
+                nn.Linear(self.embed_dims, r_dim), self.num_pred_layer)
+            self.cop_z_out = self.replicate(
+                nn.Linear(self.embed_dims, 1), self.num_pred_layer)
+
     def init_weights(self) -> None:
         """Initialize weights of the DINO 9D pose head."""
         if self.loss_cls.use_sigmoid:
@@ -199,6 +234,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             # constant_init(m[-1], 0, bias=0.0)
             constant_init(m[-1], 0, bias=0.5)
 
+        if self.use_cop_chain:
+            for m in self.cop_size_out:
+                constant_init(m, 0, bias=0.5)
+            for m in self.cop_rotation_out:
+                constant_init(m, 0, bias=0.5)
+            for m in self.cop_z_out:
+                constant_init(m, 0, bias=0.5)
+
         if self.as_two_stage:
             for m in self.reg_branches:
                 nn.init.constant_(m[-1].bias.data[2:], 0.0)
@@ -215,6 +258,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         all_layers_outputs_z = []
         all_layers_outputs_rotations = []
         all_layers_outputs_sizes = []
+        all_layers_outputs_size_chain = []
+        all_layers_outputs_rotation_chain = []
+        all_layers_outputs_z_chain = []
 
         if self.use_cuboid_conditioning:
             if batch_img_metas is None:
@@ -261,6 +307,21 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             tmp_rotation_preds = self.reg_rotation_branch[layer_id](tmp_rotation_input)
             tmp_sizes = self.reg_size_branch[layer_id](tmp_size_input)
 
+            if self.use_cop_chain:
+                # CoP chain: size -> rotation -> depth with residual aggregation.
+                f_s = self.cop_size_net[layer_id](hidden_state)
+                f_s_a = f_s + hidden_state
+                f_a = self.cop_rotation_net[layer_id](f_s_a)
+                f_a_a = f_a + f_s_a
+                f_d = self.cop_z_net[layer_id](f_a_a)
+                f_d_a = f_d + f_a_a
+                # Classwise indexing is applied later in loss (same as parallel).
+                tmp_sizes_chain = self.cop_size_out[layer_id](f_s_a)
+                tmp_rotation_chain = self.cop_rotation_out[layer_id](f_a_a)
+                tmp_z_chain = self.cop_z_out[layer_id](f_d_a)
+            else:
+                tmp_sizes_chain = tmp_rotation_chain = tmp_z_chain = None
+
 
             all_layers_outputs_classes.append(outputs_class)
             all_layers_outputs_coords.append(outputs_coord)
@@ -268,6 +329,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             all_layers_outputs_z.append(tmp_reg_z_preds)
             all_layers_outputs_rotations.append(tmp_rotation_preds)
             all_layers_outputs_sizes.append(tmp_sizes)
+            all_layers_outputs_size_chain.append(tmp_sizes_chain)
+            all_layers_outputs_rotation_chain.append(tmp_rotation_chain)
+            all_layers_outputs_z_chain.append(tmp_z_chain)
 
         all_layers_outputs_classes = torch.stack(all_layers_outputs_classes)
         all_layers_outputs_coords = torch.stack(all_layers_outputs_coords)
@@ -275,10 +339,15 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         all_layers_outputs_z = torch.stack(all_layers_outputs_z)
         all_layers_outputs_rotations = torch.stack(all_layers_outputs_rotations)
         all_layers_outputs_sizes = torch.stack(all_layers_outputs_sizes)
+        all_layers_outputs_size_chain = torch.stack(all_layers_outputs_size_chain)
+        all_layers_outputs_rotation_chain = torch.stack(all_layers_outputs_rotation_chain)
+        all_layers_outputs_z_chain = torch.stack(all_layers_outputs_z_chain)
 
         return (all_layers_outputs_classes, all_layers_outputs_coords,
                 all_layers_outputs_centers_2d, all_layers_outputs_z,
-                all_layers_outputs_rotations, all_layers_outputs_sizes)
+                all_layers_outputs_rotations, all_layers_outputs_sizes,
+                all_layers_outputs_size_chain, all_layers_outputs_rotation_chain,
+                all_layers_outputs_z_chain)
 
     def loss(self, hidden_states: Tensor, references: List[Tensor],
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
@@ -299,10 +368,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                               batch_gt_instances, batch_img_metas, dn_meta)
         losses = self.loss_by_feat(*loss_inputs)
         return losses
-
     def loss_by_feat(self, all_layers_cls_scores: Tensor, all_layers_bbox_preds: Tensor,
                      all_layers_centers_2d_preds: Tensor, all_layers_z_preds: Tensor,
                      all_layers_rotation_preds: Tensor, all_layers_sizes_preds: Tensor,
+                     all_layers_sizes_chain_preds: Tensor,
+                     all_layers_rotation_chain_preds: Tensor,
+                     all_layers_z_chain_preds: Tensor,
                      enc_cls_scores: Tensor, enc_bbox_preds: Tensor,
                      enc_outputs_centers_2d: Tensor, enc_outputs_z: Tensor,
                      enc_outputs_rotation: Tensor, enc_outputs_size: Tensor,
@@ -320,19 +391,35 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                               all_layers_centers_2d_preds, all_layers_z_preds,
                               all_layers_rotation_preds, all_layers_sizes_preds, dn_meta)
 
+        # CoP chain outputs: only keep the matching (non-denoising) slice for
+        # the auxiliary chain losses (the denoising branch keeps the plain
+        # parallel predictions).
+        if self.use_cop_chain and dn_meta is not None:
+            n_dn = dn_meta['num_denoising_queries']
+            all_m_sizes_chain = all_layers_sizes_chain_preds[:, :, n_dn:, :]
+            all_m_rotation_chain = all_layers_rotation_chain_preds[:, :, n_dn:, :]
+            all_m_z_chain = all_layers_z_chain_preds[:, :, n_dn:, :]
+        else:
+            all_m_sizes_chain = all_layers_sizes_chain_preds
+            all_m_rotation_chain = all_layers_rotation_chain_preds
+            all_m_z_chain = all_layers_z_chain_preds
+
         loss_dict = self.loss_by_feat_simple(
             all_layers_matching_cls_scores, all_layers_matching_bbox_preds,
             all_layers_matching_centers_2d_preds, all_layers_matching_z_preds,
             all_layers_matching_rotation_preds, all_layers_matching_sizes_preds,
+            all_m_sizes_chain, all_m_rotation_chain, all_m_z_chain,
             batch_gt_instances, batch_img_metas, batch_gt_instances_ignore)
 
         # loss of proposal generated from encode feature map.
         if enc_cls_scores is not None:
             (enc_loss_cls, enc_losses_bbox, enc_losses_iou, 
-             enc_loss_centers_2d, enc_loss_z, enc_loss_rotation, enc_loss_size) = \
+             enc_loss_centers_2d, enc_loss_z, enc_loss_rotation, enc_loss_size,
+             _enc_size_chain, _enc_rotation_chain, _enc_z_chain) = \
                 self.loss_by_feat_single(enc_cls_scores, enc_bbox_preds,
                                        enc_outputs_centers_2d, enc_outputs_z,
                                        enc_outputs_rotation, enc_outputs_size,
+                                       None, None, None,
                                        batch_gt_instances=batch_gt_instances,
                                        batch_img_metas=batch_img_metas)
             loss_dict['enc_loss_cls'] = enc_loss_cls
@@ -379,6 +466,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
     def loss_by_feat_simple(self, all_layers_cls_scores: Tensor, all_layers_bbox_preds: Tensor,
                            all_layers_centers_2d_preds: Tensor, all_layers_z_preds: Tensor,
                            all_layers_rotation_preds: Tensor, all_layers_sizes_preds: Tensor,
+                           all_layers_sizes_chain_preds: Tensor,
+                           all_layers_rotation_chain_preds: Tensor,
+                           all_layers_z_chain_preds: Tensor,
                            batch_gt_instances: InstanceList, batch_img_metas: List[dict],
                            batch_gt_instances_ignore: OptInstanceList = None) -> Dict[str, Tensor]:
         """Loss function."""
@@ -387,10 +477,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             'for batch_gt_instances_ignore setting to None.'
 
         (losses_cls, losses_bbox, losses_iou, losses_centers_2d, 
-         losses_z, losses_rotation, losses_sizes) = multi_apply(
+         losses_z, losses_rotation, losses_sizes,
+         losses_size_chain, losses_rotation_chain, losses_z_chain) = multi_apply(
             self.loss_by_feat_single, all_layers_cls_scores, all_layers_bbox_preds,
             all_layers_centers_2d_preds, all_layers_z_preds,
             all_layers_rotation_preds, all_layers_sizes_preds,
+            all_layers_sizes_chain_preds, all_layers_rotation_chain_preds,
+            all_layers_z_chain_preds,
             batch_gt_instances=batch_gt_instances, batch_img_metas=batch_img_metas)
 
         loss_dict = dict()
@@ -402,12 +495,16 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         loss_dict['loss_z'] = losses_z[-1]
         loss_dict['loss_rotation'] = losses_rotation[-1]
         loss_dict['loss_size'] = losses_sizes[-1]
+        if self.use_cop_chain:
+            loss_dict['loss_size_chain'] = losses_size_chain[-1]
+            loss_dict['loss_rotation_chain'] = losses_rotation_chain[-1]
+            loss_dict['loss_z_chain'] = losses_z_chain[-1]
 
         # loss from other decoder layers
         num_dec_layer = 0
-        for loss_cls_i, loss_bbox_i, loss_iou_i, loss_centers_2d_i, loss_z_i, loss_rotation_i, loss_sizes_i in \
-                zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1],
-                   losses_centers_2d[:-1], losses_z[:-1], losses_rotation[:-1], losses_sizes[:-1]):
+        for i, (loss_cls_i, loss_bbox_i, loss_iou_i, loss_centers_2d_i, loss_z_i, loss_rotation_i, loss_sizes_i) in \
+                enumerate(zip(losses_cls[:-1], losses_bbox[:-1], losses_iou[:-1],
+                   losses_centers_2d[:-1], losses_z[:-1], losses_rotation[:-1], losses_sizes[:-1])):
             loss_dict[f'd{num_dec_layer}.loss_cls'] = loss_cls_i
             loss_dict[f'd{num_dec_layer}.loss_bbox'] = loss_bbox_i
             loss_dict[f'd{num_dec_layer}.loss_iou'] = loss_iou_i
@@ -415,6 +512,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_dict[f'd{num_dec_layer}.loss_z'] = loss_z_i
             loss_dict[f'd{num_dec_layer}.loss_rotation'] = loss_rotation_i
             loss_dict[f'd{num_dec_layer}.loss_size'] = loss_sizes_i
+            if self.use_cop_chain:
+                loss_dict[f'd{num_dec_layer}.loss_size_chain'] = losses_size_chain[i]
+                loss_dict[f'd{num_dec_layer}.loss_rotation_chain'] = losses_rotation_chain[i]
+                loss_dict[f'd{num_dec_layer}.loss_z_chain'] = losses_z_chain[i]
             num_dec_layer += 1
         return loss_dict
 
@@ -615,6 +716,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
     def loss_by_feat_single(self, cls_scores: Tensor, bbox_preds: Tensor,
                            centers_2d_preds: Tensor, z_preds: Tensor,
                            rotation_preds: Tensor, sizes_preds: Tensor,
+                           sizes_chain_preds: Tensor,
+                           rotation_chain_preds: Tensor, z_chain_preds: Tensor,
                            batch_gt_instances: InstanceList, batch_img_metas: List[dict]) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer."""
         num_imgs = cls_scores.size(0)
@@ -709,7 +812,43 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             sizes_preds = sizes_preds.reshape(-1, 3)
         loss_sizes = self.loss_sizes(sizes_preds, sizes_targets, sizes_weights, avg_factor=num_total_pos)
 
-        return (loss_cls, loss_bbox, loss_iou, loss_centers_2d, loss_z, loss_rotation, loss_sizes)
+        # ── CoP auxiliary losses (chain outputs, same targets as parallel) ──
+        if self.use_cop_chain and sizes_chain_preds is not None:
+            if self.classwise_sizes:
+                sizes_chain = sizes_chain_preds.reshape(
+                    -1, self.num_classes, 3)
+                sizes_chain = sizes_chain[
+                    torch.arange(sizes_chain.size(0),
+                                 device=sizes_chain.device), indexing_labels]
+            else:
+                sizes_chain = sizes_chain_preds.reshape(-1, 3)
+            loss_size_chain = self.loss_sizes(
+                sizes_chain, sizes_targets, sizes_weights,
+                avg_factor=num_total_pos) * self.cop_loss_weights['size']
+
+            if self.classwise_rotation:
+                rot_chain = rotation_chain_preds.reshape(
+                    -1, self.num_classes, self.rot_dim)
+                rot_chain = rot_chain[
+                    torch.arange(rot_chain.size(0),
+                                 device=rot_chain.device), indexing_labels]
+            else:
+                rot_chain = rotation_chain_preds.reshape(-1, self.rot_dim)
+            loss_rotation_chain = self.loss_rotation(
+                rot_chain, rotation_targets, rotation_weights,
+                labels=labels, avg_factor=num_total_pos) * self.cop_loss_weights['rotation']
+
+            z_chain = z_chain_preds.reshape(-1, 1)
+            loss_z_chain = self.loss_z(
+                z_chain, z_targets, z_weights,
+                avg_factor=num_total_pos) * self.cop_loss_weights['z']
+        else:
+            loss_size_chain = loss_rotation_chain = loss_z_chain = \
+                z_preds.new_tensor(0.0)
+
+        return (loss_cls, loss_bbox, loss_iou, loss_centers_2d, loss_z,
+                loss_rotation, loss_sizes, loss_size_chain,
+                loss_rotation_chain, loss_z_chain)
 
     def get_targets(self, cls_scores_list: List[Tensor], bbox_preds_list: List[Tensor],
                     centers_2d_preds_list: List[Tensor], z_preds_list: List[Tensor],

@@ -124,6 +124,19 @@
 11. **full training 起動：** 統合 config（適切な batch / accumulation / AMP / encoder lr×0.5 / Muon or ScheduleFree）で `tools/train.py` を `nohup` または tmux でバックグラウンド起動し、ログを保存。epoch 進行と loss を監視（TR-6）。
 12. **監視と記録：** 初回 epoch の正常進行（loss 減少・checkpoint 生成・VRAM 余裕）を確認し、§7 に記録。問題があれば修正して再起動。
 
+### フェーズ 4: CoP（Chain-of-Prediction）auxiliary head 実装（見積: 2.0h）
+
+> 背景: 20 epoch 完了後 loss は ~151 でほぼ頭打ち（epoch21 が 150.93 で最小）。より良い収束と精度向上のため、引論文 (arXiv:2505.04594 MonoCoP) の **Chain-of-Prediction** を auxiliary head として実装する。論文のコアは「size→orientation→depth の順に feature を chain 伝搬＋残差集約すること」であり、既存の 9D head（centers_2d / z / rotation / size を並列分岐）に、chain 版の aux 出力を並置する。
+
+13. **AttributeNet / CoP chain 実装:**
+    *   `yopo/models/dense_pose_heads/dino_9d_center2d_posehead.py` に `use_cop_chain: bool = False` を追加。
+    *   有効時、各 decoder layer で `f_s = A_s(h; q)` → `f̃_s = f_s + q` → `f_a = A_a(f̃_s)` → `f̃_a = f_a + f̃_s` → `f_d = A_d(f̃_a)` → `f̃_d = f_d + f̃_a` を計算し、chain 版 z / rotation / size を **追加出力**として返す（`z_chain`, `rot_chain`, `size_chain`）。
+    *   各 `A_*` は 2層 Linear+ReLU（論文 Eq.6 相当）で構成。既存の並列 branch は変更しない。
+14. **CoP aux loss:** `loss_by_feat` で chain 版出力にも既存 loss（loss_z / loss_rotation / loss_sizes）を適用し、`*_chain` として損失辞書に追加。既存 loss と相加。
+15. **config:** `nocs_custom_real_hgnetv2_rgbd_deim.py` に `use_cop_chain: True` + chain用 loss weight を追加。`validation`: 1-2 epoch smoke で NaN なし + loss が従来並みに低下することを確認。
+16. **commit & push:** 実装と config を `rgb-d` へ反映。
+17. **再訓練:** 前回終端（loss 約155）から resume、周辺 loss より有利なことを確認しながら 2 時間追加実行。
+
 ---
 
 ## 3. 作業チェックリスト
@@ -195,6 +208,32 @@
 - [x] 🔎 **確認**: 20 epoch 継続予定、checkpoint 生成、VRAM 余裕（10.3/20GB）。
 - [x] 🧪 **テスト**: `nvidia-smi` で VRAM 10.3GB/20GB（余裕）。
 - [x] 🛠 **エラー時対処**: 本 run 継続。NaN/OOM 発生時はログから原因特定 → config 修正 → 再起動。
+
+### フェーズ 4: CoP（Chain-of-Prediction）auxiliary head
+
+### 手順 11: AttributeNet / CoP chain 実装
+- [x] 🖐 **操作**: `dino_9d_center2d_posehead.py` に `use_cop_chain`、AttributeNet（2層 Linear+ReLU）、chain 版 `f_s→f_a→f_d` の残差伝搬を追加。
+- [x] 🔎 **確認**: 既存の並列分支（centers_2d/z/rot/size）は変更していない。
+- [x] 🧪 **テスト**: `MODELS.build` + forward テストで chain shape が (6, B, N, 3/6/1) になることを確認。
+- [x] 🛠 **エラー時対処**: 変数名 `tmp_rot_chain`→`tmp_rotation_chain` の typo を修正（UnboundLocalError 解消）。
+
+### 手順 12: CoP aux loss 追加
+- [x] 🖐 **操作**: `loss_by_feat_simple` / `loss_by_feat_single` に chain 版の loss_size/rotation/z を追加し `*_chain` キーで返す。
+- [x] 🔎 **確認**: 既存 loss と相加され、loss 辞書に `loss_z_chain` 等が現れる（smoke ログで確認）。
+- [x] 🧪 **テスト**: CoP smoke（20 epoch）で NaN なし、chain loss が減少（size_chain 48.5→0.13, rot_chain 20.6→19.3, z_chain 1.38→1.33）。
+- [x] 🛠 **エラー時対処**: enc 側では chain=None を渡し chain loss 計算をスキップ（`sizes_chain_preds is not None` ガード）。
+
+### 手順 13: config 有効化 & smoke
+- [x] 🖐 **操作**: `use_cop_chain: True` を bbox_head に設定（`nocs_custom_real_hgnetv2_rgbd_deim_cop.py` 新設）。`load_from=epoch_100.pth` で既存 head 重みを継承。
+- [x] 🔎 **確認**: config build OK。
+- [x] 🧪 **テスト**: smoke 20 epoch 完走・NaN なし・CoP loss 正常減少。
+- [x] 🛠 **エラー時対処**: loss 発散時は chain loss weight を下げる（今回発散せず）。
+
+### 手順 14: commit & push + 再訓練
+- [ ] 🖐 **操作**: 実装と config を commit & push。
+- [ ] 🔎 **確認**: 前回終端 checkpoint（`work_dirs/full_run/epoch_100.pth`）から resume 締切。
+- [ ] 🧪 **テスト**: 2 時間追加トレーニング実施、loss 収束・下回りを確認。
+- [ ] 🛠 **エラー時対処**: 発散・NaN はログから原因特定し修正して再起動。
 
 ---
 
@@ -282,6 +321,8 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 | `2026-08-23` | `17:28 UTC` | opencode | 収束まで延長（100 epoch + cosine annealing） | config `max_epochs=100`、`MultiStepLR[60,80]`→`CosineAnnealingLR(T_max=100, eta_min=1e-6)`（Linear warmup 200 iter 付き）へ変更。commit `9469447`→`0d2226a`。~75分/100 epoch で 1時間以上の連続訓練。 |
 | `2026-08-23` | `17:31 UTC` | opencode | 延長 training resume 起動 | epoch_20.pth から `--resume` で100 epoch 再開（log は追記）。loss 完全収束まで監視。 |
 | `2026-08-23` | `17:33 UTC` | opencode | resume 確認 | PID 733393 生存。epoch 21 loss=150.93（epoch20 の 151.57 から継続）。cosine lr=2.62e-06 で正常復元。バックグラウンドで commit & push を実施。 |
+| `2026-08-23` | `18:26 UTC` | opencode | 100 epoch 延長 training 完了 | epoch100 まで完走。loss は epoch21 の 150.93 が最小、以降 151〜157 で頭打ち（cosine 終盤で収束）。→ CoP 精度向上のためフェーズ4 へ。 |
+| `2026-08-23` | `19:30~19:47 UTC` | opencode | フェーズ4: 手順11-13（CoP 実装+smoke） | `use_cop_chain` を実装（AttributeNet 3つ、size→rot→z の残差伝搬、aux loss）。shape テスト OK、CoP smoke 20 epoch を NaN なしで完走（chain_loss: size 48.5→0.13, rot 20.6→19.3, z 1.38→1.33）。`use_cop_chain=True` を `nocs_...deim_cop.py` config で有効化。 |
 
 ---
 
