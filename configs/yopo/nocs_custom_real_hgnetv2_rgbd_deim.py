@@ -63,8 +63,11 @@ optim_wrapper = dict(
     accumulative_counts=3,
     clip_grad=dict(max_norm=0.1, norm_type=2))
 
-# ── Learning policy (moderate schedule for fine-tuning) ────────────────────
-max_epochs = 20
+# ── Learning policy (train until loss converges) ──────────────────────────
+# 20 epochs was not enough (loss 682->151 still slowly decreasing). Extended to
+# 100 epochs with later MultiStep milestones so the learning rate stays high
+# long enough for the loss to fully converge; resume from the 20-epoch ckpt.
+max_epochs = 100
 train_cfg = dict(
     type='EpochBasedTrainLoop', max_epochs=max_epochs, val_interval=1)
 
@@ -86,7 +89,7 @@ param_scheduler = [
         begin=0,
         end=max_epochs,
         by_epoch=True,
-        milestones=[12, 16],
+        milestones=[60, 80],
         gamma=0.1),
 ]
 
