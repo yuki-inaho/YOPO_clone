@@ -1586,9 +1586,9 @@ class SimpleDINO9DPoseHead(DeformableDETRHead):
         # r1 = R_pred[:, [0, 2, 4]]
         # r2 = R_pred[:, [1, 3, 5]]
         r1, r2 = torch.split(rotation_pred, 3, dim=1)
-        r1 = r1 / torch.norm(r1, dim=1, keepdim=True)
+        r1 = r1 / torch.norm(r1, dim=1, keepdim=True).clamp_min(1e-6)
         r2 = r2 - torch.sum(r1 * r2, dim=1, keepdim=True) * r1
-        r2 = r2 / torch.norm(r2, dim=1, keepdim=True)
+        r2 = r2 / torch.norm(r2, dim=1, keepdim=True).clamp_min(1e-6)
         r3 = torch.cross(r1, r2, dim=1)
         R = torch.stack([r1, r2, r3], dim=-1)
 

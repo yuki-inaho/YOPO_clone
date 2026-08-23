@@ -45,6 +45,11 @@ dependencies = [
     #     yopo/evaluation/metrics) ---
     "plyfile",
     "scikit-learn",
+    # --- Optimizers (Muon + Schedule-Free, from the DEIM training stack) ---
+    "muon-optimizer",
+    "schedulefree==1.4.1",
+    # --- Experiment monitoring (TensorBoard via mmengine TensorboardVisBackend) ---
+    "tensorboard",
 ]
 
 [dependency-groups]
@@ -58,6 +63,7 @@ dev = [
 package = false
 
 [tool.uv.sources]
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon.git", rev = "f98f1cacc0263b04290753e32be8d498c1efc806" }
 # Prebuilt mmcv 2.2.0 manylinux wheel for torch 2.4.0 + cu121 (no source build;
 # runs on the L4 sm_89 GPU). From the official OpenMMLab wheel index.
 mmcv = { url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.4.0/mmcv-2.2.0-cp310-cp310-manylinux1_x86_64.whl" }

@@ -84,7 +84,11 @@ model = dict(
         loss_iou=dict(type='GIoULoss', loss_weight=2.0),
         loss_centers_2d = dict(type='L1PoseLoss', loss_weight=5.0),
         loss_z = dict(type='L2PoseLoss', loss_weight=50.0),
-        loss_rotation = dict(type='Rotation3DLoss', loss_weight=5.0),
+        loss_rotation = dict(
+            type='Rotation3DLoss',
+            loss_weight=5.0,
+            symmetric_classes=[0, 1, 3],
+            num_angles=16),
         loss_sizes = dict(type='L2PoseLoss', loss_weight=50.0),
         ),
     dn_cfg=dict(  # TODO: Move to model.train_cfg ?

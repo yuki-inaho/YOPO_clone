@@ -658,10 +658,10 @@ class ADDCost(BaseMatchCost):
         pred_z = pred_instances.z
 
         r1, r2 = torch.split(pred_R, 3, dim=-1)
-        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True)
+        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True).clamp_min(1e-6)
         r2 = r2 - torch.bmm(r1.unsqueeze(1),
             r2.unsqueeze(-1)).squeeze(-1) * r1
-        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True)
+        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True).clamp_min(1e-6)
         r3 = torch.cross(r1, r2, dim=-1)
         pred_R = torch.stack((r1, r2, r3), dim=-1)
 
@@ -910,10 +910,10 @@ class IoU3DCost(BaseMatchCost):
 
         # Reconstruct predicted rotation matrix to be orthonormal
         r1, r2 = torch.split(pred_R, 3, dim=-1)
-        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True)
+        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True).clamp_min(1e-6)
         r2 = r2 - torch.bmm(r1.unsqueeze(1),
                             r2.unsqueeze(-1)).squeeze(-1) * r1
-        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True)
+        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True).clamp_min(1e-6)
         r3 = torch.cross(r1, r2, dim=-1)
         pred_R = torch.stack((r1, r2, r3), dim=-1)
 
@@ -1059,9 +1059,9 @@ class RotationCost(BaseMatchCost):
         # create the transformation matrix
         if rot_dim == 6:
             r1, r2 = torch.split(pred_rotations, 3, dim=1)
-            r1 = r1 / torch.norm(r1, dim=1, keepdim=True)
+            r1 = r1 / torch.norm(r1, dim=1, keepdim=True).clamp_min(1e-6)
             r2 = r2 - torch.sum(r1 * r2, dim=1, keepdim=True) * r1
-            r2 = r2 / torch.norm(r2, dim=1, keepdim=True)
+            r2 = r2 / torch.norm(r2, dim=1, keepdim=True).clamp_min(1e-6)
             r3 = torch.cross(r1, r2, dim=1)
             pred_rotations = torch.stack([r1, r2, r3], dim=-1)
         elif rot_dim == 9:
@@ -1164,10 +1164,10 @@ class ADD9DCost(BaseMatchCost):
 
         # Convert pred_rotations to rotation matrices
         r1, r2 = torch.split(pred_rotations, 3, dim=-1)
-        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True)
+        r1 = r1 / torch.norm(r1, dim=-1, keepdim=True).clamp_min(1e-6)
         r2 = r2 - torch.bmm(r1.unsqueeze(1),
             r2.unsqueeze(-1)).squeeze(-1) * r1
-        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True)
+        r2 = r2 / torch.norm(r2, dim=-1, keepdim=True).clamp_min(1e-6)
         r3 = torch.cross(r1, r2, dim=-1)
         pred_rotations = torch.stack((r1, r2, r3), dim=-1)
 

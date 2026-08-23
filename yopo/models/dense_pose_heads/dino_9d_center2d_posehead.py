@@ -508,7 +508,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             rotation_preds = rotation_preds[torch.arange(rotation_preds.size(0)), indexing_labels]
         else:
             rotation_preds = dn_rotation_preds.reshape(-1, self.rot_dim)
-        loss_rotation = self.loss_rotation(rotation_preds, rotation_targets, rotation_weights, avg_factor=num_total_pos)
+        loss_rotation = self.loss_rotation(rotation_preds, rotation_targets, rotation_weights, labels=labels, avg_factor=num_total_pos)
 
         # sizes loss
         # sizes_preds = dn_sizes_preds.reshape(-1, 3)
@@ -698,7 +698,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             rotation_preds = rotation_preds[torch.arange(rotation_preds.size(0), device=rotation_preds.device), indexing_labels]
         else:
             rotation_preds = rotation_preds.reshape(-1, self.rot_dim)
-        loss_rotation = self.loss_rotation(rotation_preds, rotation_targets, rotation_weights, avg_factor=num_total_pos)
+        loss_rotation = self.loss_rotation(rotation_preds, rotation_targets, rotation_weights, labels=labels, avg_factor=num_total_pos)
 
         # sizes loss
         # sizes_preds = sizes_preds.reshape(-1, 3)
@@ -1006,9 +1006,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # create the transformation matrix
         if self.rot_dim == 6:
             r1, r2 = torch.split(rotation_pred, 3, dim=1)
-            r1 = r1 / torch.norm(r1, dim=1, keepdim=True)
+            r1 = r1 / torch.norm(r1, dim=1, keepdim=True).clamp_min(1e-6)
             r2 = r2 - torch.sum(r1 * r2, dim=1, keepdim=True) * r1
-            r2 = r2 / torch.norm(r2, dim=1, keepdim=True)
+            r2 = r2 / torch.norm(r2, dim=1, keepdim=True).clamp_min(1e-6)
             r3 = torch.cross(r1, r2, dim=1)
             R = torch.stack([r1, r2, r3], dim=-1)
         elif self.rot_dim == 9:

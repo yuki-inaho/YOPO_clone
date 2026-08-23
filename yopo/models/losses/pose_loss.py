@@ -282,9 +282,9 @@ class ADDLoss(nn.Module):
         R_pred = pred
         R_gt = target
         r1_p, r2_p = torch.split(R_pred, 3, dim=1)
-        r1_p = r1_p / torch.norm(r1_p, dim=1, keepdim=True)
+        r1_p = r1_p / torch.norm(r1_p, dim=1, keepdim=True).clamp_min(self.eps)
         r2_p = r2_p - torch.sum(r1_p * r2_p, dim=1, keepdim=True) * r1_p
-        r2_p = r2_p / torch.norm(r2_p, dim=1, keepdim=True)
+        r2_p = r2_p / torch.norm(r2_p, dim=1, keepdim=True).clamp_min(self.eps)
         r3_p = torch.cross(r1_p, r2_p, dim=1)
         R_pred = torch.stack([r1_p, r2_p, r3_p], dim=1)
 
@@ -942,20 +942,98 @@ def _geodesic_angle(R1: Tensor, R2: Tensor, eps: float = 1e-6) -> Tensor:
     cos = cos.clamp(-1.0 + eps, 1.0 - eps)
     return torch.acos(cos)
 
+
+def _rot_y_tensor(angles: Tensor) -> Tensor:
+    """Build rotation matrices around the y-axis for a batch of angles.
+
+    Args:
+        angles (Tensor): (K,). Angles in radians.
+
+    Returns:
+        Tensor: (K, 3, 3) rotation matrices.
+    """
+    cos = torch.cos(angles)
+    sin = torch.sin(angles)
+    rot = angles.new_zeros((angles.size(0), 3, 3))
+    rot[:, 0, 0] = cos
+    rot[:, 0, 2] = sin
+    rot[:, 1, 1] = 1.0
+    rot[:, 2, 0] = -sin
+    rot[:, 2, 2] = cos
+    return rot
+
+
+def _symmetry_min_geodesic(R_pred: Tensor,
+                           R_target: Tensor,
+                           num_angles: int = 16,
+                           eps: float = 1e-6) -> Tensor:
+    """Minimum geodesic angle over a discrete set of y-axis rotations.
+
+    For y-axis symmetric objects (bottle, bowl, can, etc.) the object's OBB
+    is unchanged by rotating it around its own y-axis, so an equivalent
+    observation is R_target @ Ry(alpha). This returns, per sample, the
+    geodesic angle between ``R_pred`` and the *closest* such equivalent
+    target rotation, handling the rotational-ambiguity of symmetric objects.
+
+    Args:
+        R_pred (Tensor): Prediction rotation matrices, shape (N, 3, 3).
+        R_target (Tensor): Target rotation matrices, shape (N, 3, 3).
+        num_angles (int): Number of discrete y-axis rotations to probe.
+            Defaults to 16.
+        eps (float): Numerical epsilon. Defaults to 1e-6.
+
+    Returns:
+        Tensor: (N,) min-over-symmetry geodesic angle in radians.
+    """
+    angles = torch.linspace(
+        0.0, 2.0 * math.pi, num_angles, device=R_target.device,
+        dtype=R_target.dtype).view(-1, 1).expand(-1, 1)
+    # Ry: (K, 3, 3)
+    rot_y = _rot_y_tensor(angles[:, 0])
+    # R_target_aug: (N, K, 3, 3) = R_target @ Ry(k)
+    R_target_aug = torch.einsum('nij,kjl->nikl', R_target, rot_y)
+    # R_err: (N, K, 3, 3) = R_pred @ (R_target @ Ry)^T
+    R_err = torch.matmul(R_pred.unsqueeze(1), R_target_aug.transpose(-1, -2))
+    trace = torch.einsum('...ii->...', R_err)
+    cos = (trace - 1.0) * 0.5
+    cos = cos.clamp(-1.0 + eps, 1.0 - eps)
+    angle_all = torch.acos(cos)  # (N, K)
+    min_angle, _ = angle_all.min(dim=1)
+    return min_angle
+
+
 @weighted_loss
-def so3_loss(pred: Tensor, target: Tensor, eps: float = 1e-7) -> Tensor:
+def so3_loss(pred: Tensor,
+             target: Tensor,
+             labels: Optional[Tensor] = None,
+             symmetric_classes: Optional[list] = None,
+             num_angles: int = 16,
+             eps: float = 1e-7) -> Tensor:
     """Computes the geodesic distance loss for 3D rotations.
     The loss is the angle of the error rotation matrix, which is inspired by
     "On the Continuity of Rotation Representations in Neural Networks".
 
+    For samples whose ``labels`` fall in ``symmetric_classes`` (y-axis
+    symmetric objects), the loss is the minimum geodesic over a discrete set
+    of y-axis rotations of the target, so the rotational ambiguity of
+    symmetric objects does not inflate the loss.
+
     Args:
         pred (Tensor): Predicted rotations as 6D vectors (first two columns
-            of the rotation matrix), shape (n, 6).
-        target (Tensor): The learning target of the prediction, shape (n, 6).
+            of the rotation matrix), shape (n, 6) or (n, 9).
+        target (Tensor): The learning target of the prediction, shape (n, 6)
+            or (n, 9).
+        labels (Tensor, optional): Class label (0-indexed) of each sample,
+            shape (n,). Only used when ``symmetric_classes`` is set.
+            Defaults to None.
+        symmetric_classes (list[int], optional): Class ids (0-indexed) whose
+            objects are y-axis symmetric. Defaults to None.
+        num_angles (int): Number of discrete y-axis rotations for the
+            symmetric minimum. Defaults to 16.
         eps (float): Epsilon to avoid numerical issues. Defaults to 1e-7.
 
     Returns:
-        Tensor: The geodesic distance loss.
+        Tensor: The geodesic distance loss (N,).
     """
     assert pred.size(0) == target.size(0), f"Batch size mismatch: {pred.size()[0]} vs {target.size()[0]}"
 
@@ -966,6 +1044,16 @@ def so3_loss(pred: Tensor, target: Tensor, eps: float = 1e-7) -> Tensor:
         R_pred = _to_rotation_matrix_9d(pred)
 
     angle = _geodesic_angle(R_pred, R_target, eps)
+
+    if symmetric_classes is not None and labels is not None:
+        sym_tensor = pred.new_tensor(symmetric_classes, dtype=torch.long)
+        sym_mask = labels.isin(sym_tensor)  # (N,)
+        if sym_mask.any():
+            sym_angle = _symmetry_min_geodesic(
+                R_pred[sym_mask], R_target[sym_mask],
+                num_angles=num_angles, eps=eps)
+            angle = torch.where(sym_mask, sym_angle, angle)
+
     # l2 distance between the two rotation matrices
     # angle = torch.norm(R_pred - R_target, p='fro', dim=(1, 2)) # / np.sqrt(2)
     # angle = angle.clamp(min=eps)
@@ -989,12 +1077,16 @@ class Rotation3DLoss(nn.Module):
                  distance_type: str = 'geodesic',
                  eps: float = 1e-6,
                  reduction: str = 'mean',
-                 loss_weight: float = 1.0) -> None:
+                 loss_weight: float = 1.0,
+                 symmetric_classes: Optional[list] = None,
+                 num_angles: int = 16) -> None:
         super().__init__()
         self.distance_type = distance_type
         self.eps = eps
         self.reduction = reduction
         self.loss_weight = loss_weight
+        self.symmetric_classes = symmetric_classes
+        self.num_angles = num_angles
 
     def forward(self,
                 pred: Tensor,
@@ -1038,6 +1130,9 @@ class Rotation3DLoss(nn.Module):
             pred,
             target,
             weight,
+            labels=kwargs.pop('labels', None),
+            symmetric_classes=self.symmetric_classes,
+            num_angles=self.num_angles,
             eps=self.eps,
             reduction=reduction,
             avg_factor=avg_factor,
