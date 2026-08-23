@@ -278,6 +278,10 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 | `2026-08-23` | `16:50 UTC` | opencode | ストレージ整理 | work_dirs の不要 smoke run（計 ~7GB）を削除。モデルファイル(.pth)は保持。 |
 | `2026-08-23` | `16:55 UTC` | opencode | フェーズ3: 手順9（full training 起動） | PID 715176、`work_dirs/full_run`、log `/tmp/opencode/full_train.log`。20 epoch / 実効 batch 24 / fp32。 |
 | `2026-08-23` | `16:57 UTC` | opencode | フェーズ3: 手順10（監視） | epoch1→2 進行、loss 682→488 減少、NaN なし、VRAM 実測 10.3GB/20GB、Saving checkpoint OK。 |
+| `2026-08-23` | `17:26 UTC` | opencode | full training 完走（20 epoch） | 20 epoch 完走、loss 682→151.6（NaN 0回、VRAM ~8.7GB）。loss は epoch16以降も毎epoch +1 微減 → 完全収束には不十分と判断。 |
+| `2026-08-23` | `17:28 UTC` | opencode | 収束まで延長（100 epoch + cosine annealing） | config `max_epochs=100`、`MultiStepLR[60,80]`→`CosineAnnealingLR(T_max=100, eta_min=1e-6)`（Linear warmup 200 iter 付き）へ変更。commit `9469447`→`0d2226a`。~75分/100 epoch で 1時間以上の連続訓練。 |
+| `2026-08-23` | `17:31 UTC` | opencode | 延長 training resume 起動 | epoch_20.pth から `--resume` で100 epoch 再開（log は追記）。loss 完全収束まで監視。 |
+| `2026-08-23` | `17:33 UTC` | opencode | resume 確認 | PID 733393 生存。epoch 21 loss=150.93（epoch20 の 151.57 から継続）。cosine lr=2.62e-06 で正常復元。バックグラウンドで commit & push を実施。 |
 
 ---
 
