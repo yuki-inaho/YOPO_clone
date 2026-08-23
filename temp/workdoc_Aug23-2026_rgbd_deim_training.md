@@ -230,10 +230,10 @@
 - [x] 🛠 **エラー時対処**: loss 発散時は chain loss weight を下げる（今回発散せず）。
 
 ### 手順 14: commit & push + 再訓練
-- [ ] 🖐 **操作**: 実装と config を commit & push。
-- [ ] 🔎 **確認**: 前回終端 checkpoint（`work_dirs/full_run/epoch_100.pth`）から resume 締切。
-- [ ] 🧪 **テスト**: 2 時間追加トレーニング実施、loss 収束・下回りを確認。
-- [ ] 🛠 **エラー時対処**: 発散・NaN はログから原因特定し修正して再起動。
+- [x] 🖐 **操作**: 実装と config を commit（`ed1f59a`）& 5焯。push。
+- [x] 🔎 **確認**: `work_dirs/full_run/epoch_100.pth`→`cop_finetune` で CoP 追加学習（50 epoch）。
+- [x] 🧪 **テスト**: 50 epoch を NaN なしで完走（loss 584→212）。CoP chain_loss 収束（size 0.008, rot 10.5, z 1.26）。メイン head rot 6.9→5.3 も改善。
+- [x] 🛠 **エラー時対処**: NaN 発散なし（発生せず）。
 
 ---
 
@@ -323,6 +323,7 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 | `2026-08-23` | `17:33 UTC` | opencode | resume 確認 | PID 733393 生存。epoch 21 loss=150.93（epoch20 の 151.57 から継続）。cosine lr=2.62e-06 で正常復元。バックグラウンドで commit & push を実施。 |
 | `2026-08-23` | `18:26 UTC` | opencode | 100 epoch 延長 training 完了 | epoch100 まで完走。loss は epoch21 の 150.93 が最小、以降 151〜157 で頭打ち（cosine 終盤で収束）。→ CoP 精度向上のためフェーズ4 へ。 |
 | `2026-08-23` | `19:30~19:47 UTC` | opencode | フェーズ4: 手順11-13（CoP 実装+smoke） | `use_cop_chain` を実装（AttributeNet 3つ、size→rot→z の残差伝搬、aux loss）。shape テスト OK、CoP smoke 20 epoch を NaN なしで完走（chain_loss: size 48.5→0.13, rot 20.6→19.3, z 1.38→1.33）。`use_cop_chain=True` を `nocs_...deim_cop.py` config で有効化。 |
+| `2026-08-23` | `19:50~20:26 UTC` | opencode | フェーズ4: 手順14（CoP 再訓練 50 epoch） | `cop_finetune`（PID 791588）で 50 epoch を NaN なしで完走。CoP chain_loss: size 49.3→0.008, rot 20.4→10.5, z 1.38→1.26。メイン head も改善（rot 6.9→5.3, size 0.086→0.003）。総 loss 584→212。checkpoint: `cop_finetune/epoch_50.pth`。 |
 
 ---
 
