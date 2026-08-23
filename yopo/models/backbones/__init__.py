@@ -9,6 +9,7 @@ from .dinov3_convnext import DinoConvNeXt
 from .efficientnet import EfficientNet
 from .hourglass import HourglassNet
 from .hrnet import HRNet
+from .hgnetv2 import HGNetV2
 from .mobilenet_v2 import MobileNetV2
 from .pvt import PyramidVisionTransformer, PyramidVisionTransformerV2
 from .regnet import RegNet
@@ -26,5 +27,5 @@ __all__ = [
     'DetectoRS_ResNeXt', 'Darknet', 'ResNeSt', 'TridentResNet', 'CSPDarknet',
     'SwinTransformer', 'PyramidVisionTransformer',
     'PyramidVisionTransformerV2', 'EfficientNet', 'CSPNeXt',
-    'DinoConvNeXt'
+    'DinoConvNeXt', 'HGNetV2'
 ]
