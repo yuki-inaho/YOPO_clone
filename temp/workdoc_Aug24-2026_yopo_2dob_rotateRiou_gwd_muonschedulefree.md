@@ -239,22 +239,22 @@
 ### フェーズ 4: 反映・記録
 
 ### 手順 11: commit & push（ユーザー指示時のみ）
-- [ ] 🖐 **操作**: `git add`（対象ファイルのみ）→ commit → `git push origin rgb-d`（指示時のみ）。
-- [ ] 🔎 **確認**: `work_dirs/ data/ *.log` が含まれないこと。
-- [ ] 🧪 **テスト**: `git log --oneline -1`。
-- [ ] 🛠 **エラー時対処**: 不要物混入を防ぐため `git status` を確認し、明示対象だけ add。
+- [x] 🖐 **操作**: `git add`（対象ファイルのみ）→ commit → `git push origin rgb-d`（指示時のみ）。
+- [x] 🔎 **確認**: `work_dirs/ data/ *.log` が含まれないこと。
+- [x] 🧪 **テスト**: `git log --oneline -1`。
+- [x] 🛠 **エラー時対処**: 不要物混入を防ぐため `git status` を確認し、明示対象だけ add。
 
 ### 手順 12: claude-mem 更新
-- [ ] 🖐 **操作**: 2D OBB 学習完了（rotate IoU / GWD / Muon+ScheduleFree / FULL 収束）を observation に追加。
-- [ ] 🔎 **確認**: 新 id が追加される。
-- [ ] 🧪 **テスト**: `SELECT MAX(id) FROM observations` が増える。
-- [ ] 🛠 **エラー時対処**: created_at_epoch 等 NOT NULL 制約に注意（INSERT カラム充足）。
+- [x] 🖐 **操作**: 2D OBB 学習完了（rotate IoU / GWD / Muon+ScheduleFree / FULL 収束）を observation に追加。
+- [x] 🔎 **確認**: 新 id が追加される。
+- [x] 🧪 **テスト**: `SELECT MAX(id) FROM observations` が増える。
+- [x] 🛠 **エラー時対処**: created_at_epoch 等 NOT NULL 制約に注意（INSERT カラム充足）。
 
 ### 手順 13: 作業記録の締め
-- [ ] 🖐 **操作**: 本章の作業記録テーブルに全フェーズの開始・完了・結果を追記。
-- [ ] 🔎 **確認**: 注意事項（時刻・両端記録・結果備考）を遵守。
-- [ ] 🧪 **テスト**: 全チェックリストが `[x]`。
-- [ ] 🛠 **エラー時対処**: 未記録項目は完了後すぐ補完。
+- [x] 🖐 **操作**: 本章の作業記録テーブルに全フェーズの開始・完了・結果を追記。
+- [x] 🔎 **確認**: 注意事項（時刻・両端記録・結果備考）を遵守。
+- [x] 🧪 **テスト**: 全チェックリストが `[x]`。
+- [x] 🛠 **エラー時対処**: 未記録項目は完了後すぐ補完。
 
 ---
 
@@ -341,11 +341,11 @@ python3 -c "import sqlite3; c=sqlite3.connect('/home/kasm-user/.claude-mem/claud
 
 *作業が最後まで完了したら `[ ]` を `[x]` にしつつ、作業が本当に完了したかをチェックします*
 
-- [ ] 観点1: 2D OBB（共通 encoder + head）が build でき、rotate IoU / GWD 両方で loss_bbox が減少（成功条件1,2,3）。
-- [ ] 観点2: Muon + ScheduleFree（MuonScheduleFreeOptimizer）が build でき、学習が回る（成功条件4、ブロッカー解消）。
-- [ ] 観点3: FULL 学習（50 epoch、HGNetV2-B2 + GWD + MuonScheduleFree）で loss が収束し、`epoch_50.pth` が保存される（成功条件5）。
-- [ ] 観点4: 全 Trace ID（TR-1..6）に対応する証跡が作業記録（§7）に残っている。
-- [ ] 観点5: 暗黙 fallback を使わず、例外・未対応事項（例: ブロッカー、Muon 実装の制限）は明示的に記録されている。
+- [x] 観点1: 2D OBB（共通 encoder + head）が build でき、rotate IoU / GWD 両方で loss_bbox が減少（成功条件1,2,3）。
+- [x] 観点2: Muon + ScheduleFree（MuonScheduleFreeOptimizer）が build でき、学習が回る（成功条件4、ブロッカー解消）。
+- [x] 観点3: FULL 学習（50 epoch、HGNetV2-B2 + GWD + MuonScheduleFree）で loss が収束し、`epoch_50.pth` が保存される（成功条件5）。
+- [x] 観点4: 全 Trace ID（TR-1..6）に対応する証跡が作業記録（§7）に残っている。
+- [x] 観点5: 暗黙 fallback を使わず、例外・未対応事項（例: ブロッカー、Muon 実装の制限）は明示的に記録されている。
 
 ---
 
@@ -414,6 +414,7 @@ python3 -c "import sqlite3; c=sqlite3.connect('/home/kasm-user/.claude-mem/claud
 | `2026-08-24` | `09:41:42 UTC` | Codex | 定期記録: AMP 幾何演算の修正検証 | fp16 autocast で失敗した `torch.det`/LU のため、GDLoss と Hungarian GDCost を局所 fp32 化。実 CUDA test で GWD loss=float32・有限、pred gradient=有限、GDCost=float32・有限を確認。backbone/transformer は AMP のまま維持する。 |
 | `2026-08-24` | `09:51 UTC` | Codex | AMP/evaluator smoke の中間結果 | fp16 AMP batch24、static loss scale=1.0、局所 fp32 GWD/GDCost、AMP target dtype 修正により 1 epoch を finite grad_norm（23.56→16.41）で完走。VRAM は 17.4〜17.8 GiB / 20.0 GiB。valid 330枚の実評価は `rbbox_mAP_50=0.0032`、recall=0.0466、precision=0.0391、matched rIoU=0.5738（epoch1 初期値）を出力し、metric key の供給を確認。 |
 | `2026-08-24` | `10:00 UTC` | Codex | AMP/evaluator 5 epoch smoke 完了 | fp16 AMP batch24（VRAM 17.4 GiB、static loss scale=1.0）で 5 epoch を NaN/OOM/例外なく完走。epoch5終盤は loss_bbox=0.8340、GWD loss_iou=0.7983、grad_norm=20.0931。valid 330枚で `rbbox_mAP_50=0.0126`、recall=0.1040、precision=0.0874、matched rIoU=0.5902。`best_rbbox_mAP_50_epoch_5.pth`、`topk_epoch_6_greater0.0126.pth`、`epoch_5.pth`（各約72MB）が保存され、TopK pool=1/2 を確認。 |
+| `2026-08-24` | `10:00 UTC` | Codex | 手順9・FULL 再開: AMP/evaluator 構成 | 旧 FP32 run と成果物を混同しないよう、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 付きで PID 1473165 を `work_dirs/rddetr_tomato_gwd_amp_eval_full` に起動。fp16 AMP batch24、static loss scale=1.0、5 epoch ごと valid 実 rIoU、Top-2＋最終 checkpoint（weights-only）で 50 epoch を実行する。 |
 | `2026-08-24` | `10:24:50 UTC` | Codex | 定期記録: FULL AMP/evaluator epoch15 | `work_dirs/rddetr_tomato_gwd_amp_eval_full` の50 epoch本走行は epoch17 に進行。実 rIoU validation は epoch5: mAP@0.50=0.0093 / matched rIoU=0.5872、epoch10: **0.0158** / **0.5949**（現best）、epoch15: 0.0114 / 0.5897。epoch15終盤の loss_bbox=0.7527、GWD loss_iou=0.7561、grad_norm=34.2974 は有限。Top-K は epoch5 の低値を削除し epoch10・15の2本だけを保持、GPU使用量は17,429 MiB。 |
 | `2026-08-24` | `10:43:12 UTC` | Codex | 定期記録: FULL AMP/evaluator epoch29 | FULL run は epoch29 を完了し、NaN/Traceback/RuntimeError/OOM は0件、GPU使用量は17,429 MiBで安定。epoch20 の mAP@0.50=0.0086 / matched rIoU=0.5815 は一時低下したが、epoch25 は **mAP@0.50=0.0191、matched rIoU=0.6011** に上昇してbestを更新。訓練損失と実検出品質の非単調性を踏まえ、Top-K は `rbbox_mAP_50` で選別し、容量上限を維持している。 |
 | `2026-08-24` | `11:02:05 UTC` | Codex | 定期記録: epoch43 とユーザー追加要件 | FULL AMP/evaluator run は epoch43 に進行し、NaN/OOM/例外0件。ユーザー要請により手順10-Aを追加し、50 epoch完了後に今回の `rbbox_mAP_50` 最高 checkpoint を流用して validation RGB 画像へ予測2D OBB（回転矩形・score）を重畳した PNG を少なくとも3枚出力・検証する。旧full runの削除済み path は現行 `rddetr_tomato_gwd_amp_eval_full` に訂正。 |
@@ -428,11 +429,23 @@ python3 -c "import sqlite3; c=sqlite3.connect('/home/kasm-user/.claude-mem/claud
 | `2026-08-24` | `11:15:40 UTC` | Codex | 手順10-A・確認完了: RGB上の回転OBB可視確認 | 出力3枚を実表示で確認。いずれもトマト棚のRGB画像を背景に、果実位置・傾きに追従する緑の回転矩形とscoreを描画できた。score≥0.05・上位15件のため密集果実ではラベルが一部重なるが、座標系・angle(rad)→四隅変換は視覚的に整合。 |
 | `2026-08-24` | `11:17:53 UTC` | Codex | 手順10-A・テスト完了: PNG/manifest 検証 | `obb_overlays/manifest.json` を検証し、PNGは3枚、manifest画像数も3、全出力ファイルが存在することを確認。各画像は15予測を描画し、出力元は絶対pathで `best_rbbox_mAP_50_epoch_50.pth`（mAP@0.50=0.0242）と明記されている。 |
 | `2026-08-24` | `11:18:11 UTC` | Codex | 手順10-A・エラー時対処確認完了 | `py_compile` 成功、manifestの各 `boxes_xywha_rad` / `scores` 件数は `num_drawn` と一致。実行時のconfig/checkpoint class不一致・rbox tensor/angle単位エラーは発生しなかった。 |
-| `2026-08-24` | `10:00 UTC` | Codex | 手順9・FULL 再開: AMP/evaluator 構成 | 旧 FP32 run と成果物を混同しないよう、`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 付きで PID 1473165 を `work_dirs/rddetr_tomato_gwd_amp_eval_full` に起動。fp16 AMP batch24、static loss scale=1.0、5 epoch ごと valid 実 rIoU、Top-2＋最終 checkpoint（weights-only）で 50 epoch を実行する。 |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ1開始: `[タスク名]` | 作業計画書確認完了、`[タスク]`の要件を把握 |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ2開始: `[タスク名]` | `[実行コマンド]` で build / smoke 検証 |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ3開始: `[FULL 学習]` | NaN 有無・loss_bbox 推移・memory |
-| `YYYY-MM-DD` | `HH:MM:SS TZ` | `作業者名` | フェーズ4: `[commit・push・記録]` | コミット hash・claude-mem id・checkpoint パス |
+| `2026-08-24` | `11:32:25 UTC` | Codex | 手順11・操作完了: 限定commit/push | 2D OBB関連21ファイルのみを commit `887001d feat: add rotated OBB training and visualization` として作成し、`origin/rgb-d` へ `c2fc664..887001d` をpush。別件のRGB-D/NOCS変更（backbones/detectors init、NOCS config、MAE等）はstage/commitせず保持。 |
+| `2026-08-24` | `11:33:40 UTC` | Codex | 手順11・確認完了: 不要物除外 | `git show --name-only 887001d` は2D OBB実装・config・可視化・作業書の21ファイルだけ。`work_dirs/`、データ、学習ログは含まれない。statusの未コミットRGB-D/NOCS変更も明示的に除外済み。 |
+| `2026-08-24` | `11:33:54 UTC` | Codex | 手順11・テスト完了: remote整合 | `git log --oneline -1` は `887001d feat: add rotated OBB training and visualization`。`git ls-remote --heads origin rgb-d` も同一SHAを返し、push先との整合を確認。 |
+| `2026-08-24` | `11:34:11 UTC` | Codex | 手順11・エラー時対処確認完了 | staged領域は空。作業記録以外に残る変更はすべて別件RGB-D/NOCSであり、今回のadd対象を限定した結果、不要物混入・巻き込みは発生していない。 |
+| `2026-08-24` | `11:34:28 UTC` | Codex | 手順12・操作完了: claude-mem observation | worker稼働（PID 1360879）を確認後、`/home/kasm-user/.claude-mem/claude-mem.db`へ observation id=18 を追加。GWD 50epoch/AMP/実rIoU/RGB overlay/commit `887001d` と、次のrotate IoU比較学習の要求を記録した。 |
+| `2026-08-24` | `11:35:51 UTC` | Codex | 手順12・確認完了: observation id | DB queryで id=18、project=`/home/kasm-user/Desktop/YOPO_clone`、GWD 50 epoch完了タイトル、created_at_epochを確認。 |
+| `2026-08-24` | `11:36:05 UTC` | Codex | 手順12・テスト完了: MAX(id) 増加 | 登録前に確認した最大id=17から、`SELECT MAX(id) FROM observations` は18へ増加。 |
+| `2026-08-24` | `11:36:21 UTC` | Codex | 手順12・エラー時対処確認完了 | id=18で `memory_session_id`、`project`、`type`、`created_at`、`created_at_epoch` はすべて非NULL。NOT NULL制約に必要なINSERTカラムを充足し、DB整合性を確認。 |
+| `2026-08-24` | `11:37:05 UTC` | Codex | 手順13・操作完了／定期記録 | 作業記録は移植/registry、optimizerブロッカー解消、rotate IoU・GWD smoke、AMP/evaluator FULL 50epoch、RGB OBB overlay、限定commit/push、claude-mem id=18を時刻・証跡付きで網羅。次は記録形式と全チェック完了を確認し、その後ユーザー要請のrotate IoU追加学習を別作業書で開始する。 |
+| `2026-08-24` | `11:38:14 UTC` | Codex | 手順13・確認完了: 記録形式・証跡 | 時刻付き実記録75行を機械検証し、全行が5列形式、テンプレート残りなし。移植、FULL、overlay、commit、claude-memの主要証跡が各々作業記録に存在することを確認。 |
+| `2026-08-24` | `11:38:39 UTC` | Codex | 手順13・テスト完了: 実行チェック網羅 | 完了定義の観点を除き、当テスト行と直後の対処行以外の未完了実行チェックは0件であることを機械検証。手順1〜12と手順13の操作・確認は全て完了。 |
+| `2026-08-24` | `11:38:58 UTC` | Codex | 手順13・エラー時対処確認完了 | 手順1〜12、手順10-A、手順13の各完了記録が存在することを機械検証。未記録項目は無く、補完不要。 |
+| `2026-08-24` | `11:39:30 UTC` | Codex | 完了定義・観点1 | 両configを再読込し、HGNetV2-B2＋RotatedDeformableDETRHead、lossがrotate IoU/GWDで分岐することを確認。5epoch smoke の主loss_bboxは rotate IoU=2.9420→2.7385、GWD=1.0512→0.8377と両方低下。rotate IoUの `loss_iou` はlog lossで単調性を保証しない点も既知として記録済み。 |
+| `2026-08-24` | `11:40:03 UTC` | Codex | 完了定義・観点2 | 現行GWD configから `AmpScheduleFreeOptimWrapper` と `MuonScheduleFreeOptimizer` を実build。public param_groups=2、`use_muon=[True, False]`、train_mode=Trueを確認し、FULL50epochの実行証跡と合わせてoptimizerブロッカー解消を再確認。 |
+| `2026-08-24` | `11:40:25 UTC` | Codex | 完了定義・観点3 | `epoch_50.pth` は73,031,570 bytes。最終学習行はloss_bbox=0.6537/GWD=0.6975、validationはmAP@0.50=0.0242、matched rIoU=0.6031。FULL50epoch完走・保存・収束を再確認。 |
+| `2026-08-24` | `11:40:48 UTC` | Codex | 完了定義・観点4 | TR-1=rotated head/smoke、TR-2=rotate IoU/GWD各5epoch smoke、TR-3=MuonScheduleFree build、TR-4=HGNetV2-B2 config、TR-5=YOPO移植/import、TR-6=commit remote整合＋claude-mem MAX(id)を対応付け、全6 Trace IDの証跡行を機械照合。初回検査はTR-4文字列を厳密にし過ぎたため、対応する作業記録markerへ訂正後に合格。 |
+| `2026-08-24` | `11:41:32 UTC` | Codex | 完了定義・観点5 | DefaultOptimWrapperConstructorのTypeError、bf16 CUDA演算子非対応、fp16高batch OOM、旧runのFileNotFoundErrorを明示記録。局所fp32 GWD/GDCost、fp16 static scale=1.0、batch24という採用理由を残し、現行FULLログには致命語0件。暗黙fallbackは無い。 |
 
 ---
 
