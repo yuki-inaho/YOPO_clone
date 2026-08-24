@@ -116,12 +116,14 @@ def render_instances(
         center2d = project(t[None], K)[0]
 
         # (a) 3D wireframe with implicit front/back depth cueing.
+        # Front edges thick, back/struts thin -> reads as a solid box.
         if draw_wire:
-            draw_edges(img, corners2d, FRONT_EDGES, WIRE_COLOR, 2)
-            draw_edges(img, corners2d, STRUT_EDGES, WIRE_COLOR, 1)
+            draw_edges(img, corners2d, FRONT_EDGES, WIRE_COLOR, 3)
+            draw_edges(img, corners2d, STRUT_EDGES, WIRE_COLOR, 2)
             draw_edges(img, corners2d, BACK_EDGES, WIRE_COLOR, 1)
 
-        # (b) coordinate axes (x=red, y=green, z=blue)
+        # (b) coordinate axes (x=red, y=green, z=blue) - thin so they don't
+        # fight the box outline.
         if draw_axis:
             axis_len = 0.5 * min(width, height, depth) + 0.01
             for name, col in (("x", 0), ("y", 1), ("z", 2)):
@@ -132,7 +134,7 @@ def render_instances(
                     tuple(center2d.astype(int)),
                     tuple(tip2d.astype(int)),
                     AXIS_COLORS[name],
-                    2,
+                    1,
                 )
 
         # (c) 2D OBB: rotated rect enclosing the projected cuboid corners
@@ -212,36 +214,48 @@ def main() -> None:
         [rotations.reshape(n, 3, 3), translations.reshape(n, 3, 1)], axis=2
     )
 
-    # rendering panels: original (top), GT overlay (bottom)
-    panel_pose = render_instances(
+    # Panel 1 (top): 2D OBB only (+ reference AABB) - shows the 2D rotated
+    # boxes on the original image.
+    panel_obb = render_instances(
         rgb,
         Ts[:n_show],
         sizes[:n_show],
         intrinsic,
         draw_obb=not args.no_obb,
         draw_aabb=not args.no_aabb,
+        draw_wire=False,
+        draw_axis=False,
+        draw_id=False,
+    )
+    # Panel 2 (bottom): 3D BBOX wireframe + thin coordinate axes.
+    panel_3d = render_instances(
+        rgb,
+        Ts[:n_show],
+        sizes[:n_show],
+        intrinsic,
+        draw_obb=False,
+        draw_aabb=False,
         draw_wire=not args.no_wire,
         draw_axis=not args.no_axis,
+        draw_id=False,
     )
 
     label = np.zeros((26, rgb.shape[1], 3), dtype=np.uint8)
     label[:] = (30, 30, 30)
-    text = f"{args.split} {args.frame}: top=original | bottom=GT 2D-OBB+3D-wire+axes (#best {n_show})"
+    text = f"{args.split} {args.frame}: top=2D OBB | bottom=3D BBOX (#inst {n_show})"
     cv2.putText(label, text, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    canvas = np.vstack([label, rgb, panel_pose])
+    canvas = np.vstack([label, panel_obb, panel_3d])
 
     if args.crop:
         x1, y1, x2, y2 = map(int, args.crop.split(","))
-        # crop both colour panels independently (keep label row full-width or
-        # cropped too -- cropping the label bar keeps the title readable)
-        c_rgb = rgb[y1:y2, x1:x2]
-        c_pose = panel_pose[y1:y2, x1:x2]
+        c_obb = panel_obb[y1:y2, x1:x2]
+        c_3d = panel_3d[y1:y2, x1:x2]
         c_label = np.zeros((26, x2 - x1, 3), dtype=np.uint8)
         c_label[:] = (30, 30, 30)
-        text = f"{args.split} {args.frame} crop[{x1},{y1}->{x2},{y2}] (top=orig, bottom=GT)"
+        text = f"{args.split} {args.frame} crop[{x1},{y1}->{x2},{y2}] (top=2D OBB, bottom=3D BBOX)"
         cv2.putText(c_label, text, (6, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        canvas = np.vstack([c_label, c_rgb, c_pose])
+        canvas = np.vstack([c_label, c_obb, c_3d])
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(args.out), canvas[:, :, ::-1])
