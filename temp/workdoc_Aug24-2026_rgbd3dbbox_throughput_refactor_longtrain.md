@@ -75,6 +75,13 @@
 * **品質保護:** quality gateはepoch5で初回実評価し、以後5epochごとにbest `3d_iou_0.50` を判定する。validationを省略するepochもtrain loss/grad/finite-cost gateを全step監視し、NaN/Inf/OOMなら直ちにlong run不採用とする。
 * **リファクタリング境界:** benchmark hookはopt-inで通常/long configに入れない。config共通化は次手順で解決済みdict同値testを通過した場合だけ採用する。
 
+### 2.5 最終結果と未達（2026-08-24）
+
+* **速度/VRAM:** interval5の5epoch実測は190秒で、毎epoch評価baseline推定235秒比19.15%短縮。80epoch本走は3,196秒（53分16秒、39.95秒/epoch）、peak 19,326MiB/20,475MiBで完走。benchmark v3はbatch26/seed3407、warm-up 2除外10 stepでcompute中央値2.63411秒、data中央値0.06185秒、peak 19,327MiB。
+* **provenance:** benchmark JSONのconfig SHA256 `2aa70a2c…eff06758`はrun時保存snapshotと完全一致。現行sourceは後続DRY整理で継承形式となりhashは異なるため、run provenanceは保存snapshotを正本とする。解決済みcontract同値はconfig regression testで保護する。
+* **品質:** source baseline best IoU@.50=.169004に対しlong best epoch10=.1694（+.000396）。final epoch80=.0757まで悪化したためbest-only epoch10を採用。AP50はbest=.0000/final=.0010で、thresholdなしtop-1 overlayも極小・位置ずれの箱を含む。学習はfiniteで完走したが、実用3D detection精度は明確に未達。
+* **再開条件:** 追加長時間学習ではなく、validationラベル/座標系とmatching/loss balanceを切り分け、同一seedの短期quality gateでbaseline .169004を十分に超える単一変更だけを再開候補とする。epoch10後の継続だけで改善する根拠はない。
+
 ---
 
 ## 3. 作業チェックリスト
@@ -142,22 +149,22 @@
 - [x] 🛠 **エラー時対処**: metricが短期に悪化しても単発値で停止せず、定義済みwindow/best metricで判断する。baselineより明確に不安定ならLR/loader変更を一つずつ戻す。
 
 ### 手順 10: 長時間fine-tuneと実evaluatorを完走する（SG-4/TR-4）
-- [ ] 🖐 **操作**: 手順9成功後のみ隔離work_dirで長時間fine-tuneを一度起動し、定期NOCS validation、best-only weights、throughput/GPU/finite監視を保存する。
-- [ ] 🔎 **確認**: 全validationが50 imageを処理し、best metric/epoch、総wall time、実効epoch時間、AP50/3D IoU、NaN/Inf/OOM不在がlog/scalarsに残る。
-- [ ] 🧪 **テスト**: `test_rgbd_3dbbox_longrun_e2e`でrun record、best checkpoint、metric finite、baseline比較fieldを確認する。
-- [ ] 🛠 **エラー時対処**: 中断/例外時は無断resumeせず、checkpoint/optimizer保存有無・再開可否・再開configを記録する。品質未改善でもcheckpointを削除せず数値を報告する。
+- [x] 🖐 **操作**: 手順9成功後のみ隔離work_dirで長時間fine-tuneを一度起動し、定期NOCS validation、best-only weights、throughput/GPU/finite監視を保存する。
+- [x] 🔎 **確認**: 全validationが50 imageを処理し、best metric/epoch、総wall time、実効epoch時間、AP50/3D IoU、NaN/Inf/OOM不在がlog/scalarsに残る。
+- [x] 🧪 **テスト**: `test_rgbd_3dbbox_longrun_e2e`でrun record、best checkpoint、metric finite、baseline比較fieldを確認する。
+- [x] 🛠 **エラー時対処**: 中断/例外時は無断resumeせず、checkpoint/optimizer保存有無・再開可否・再開configを記録する。品質未改善でもcheckpointを削除せず数値を報告する。
 
 ### 手順 11: 最良モデルのRGB overlayを再確認する（SG-5/TR-4,TR-5）
-- [ ] 🖐 **操作**: long runのbest checkpointでthresholdなしtop-1 RGB 3D BBOX overlay 3枚とmanifestを再生成し、baseline overlayと併記する。
-- [ ] 🔎 **確認**: K/T/m単位/corner projection、checkpoint path、score、選択規則、画像サイズをmanifestに記録し、目視で鏡映/軸/尺度を確認する。
-- [ ] 🧪 **テスト**: `test_rgbd_3dbbox_overlay_artifact.py`と`test_rgbd_3dbbox_projection_guard.py`を実行する。
-- [ ] 🛠 **エラー時対処**: projection errorはK→unit→T→corner orderingで検証し、閾値変更で隠さない。品質がbaselineより悪くても比較画像を削除しない。
+- [x] 🖐 **操作**: long runのbest checkpointでthresholdなしtop-1 RGB 3D BBOX overlay 3枚とmanifestを再生成し、baseline overlayと併記する。
+- [x] 🔎 **確認**: K/T/m単位/corner projection、checkpoint path、score、選択規則、画像サイズをmanifestに記録し、目視で鏡映/軸/尺度を確認する。
+- [x] 🧪 **テスト**: `test_rgbd_3dbbox_overlay_artifact.py`と`test_rgbd_3dbbox_projection_guard.py`を実行する。
+- [x] 🛠 **エラー時対処**: projection errorはK→unit→T→corner orderingで検証し、閾値変更で隠さない。品質がbaselineより悪くても比較画像を削除しない。
 
 ### 手順 12: 再現性・品質・worktreeを最終監査する（SG-5/TR-1–TR-5）
-- [ ] 🖐 **操作**: benchmark、config、tests、long-run log/scalars/checkpoint/overlay、`git status --short`を照合し、速度/品質/未達を本書へ追記する。
-- [ ] 🔎 **確認**: すべてのTrace IDに証跡、user-owned dirtyとの分離、無断stage/reset/commit/pushなし、受入できない精度は未達として明記される。
-- [ ] 🧪 **テスト**: `rgbd_3dbbox_throughput_longrun_audit`を作成し、必須artifact・finite metrics・config provenance・workdoc未完了ゼロを検証する。
-- [ ] 🛠 **エラー時対処**: artifact欠落/未解決例外/metric schema差があれば完了にせず、該当手順を四項目へ細分化してlast safe stateと再開条件を記録する。
+- [x] 🖐 **操作**: benchmark、config、tests、long-run log/scalars/checkpoint/overlay、`git status --short`を照合し、速度/品質/未達を本書へ追記する。
+- [x] 🔎 **確認**: すべてのTrace IDに証跡、user-owned dirtyとの分離、無断stage/reset/commit/pushなし、受入できない精度は未達として明記される。
+- [x] 🧪 **テスト**: `rgbd_3dbbox_throughput_longrun_audit`を作成し、必須artifact・finite metrics・config provenance・workdoc未完了ゼロを検証する。
+- [x] 🛠 **エラー時対処**: artifact欠落/未解決例外/metric schema差があれば完了にせず、該当手順を四項目へ細分化してlast safe stateと再開条件を記録する。
 
 ---
 
@@ -184,10 +191,10 @@ nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noh
 
 *作業が最後まで完了したら `[ ]` を `[x]` にしつつ、作業が本当に完了したかをチェックします。*
 
-- [ ] 観点1: baselineと高速化後の速度・VRAM・数値contractが同一条件で比較され、採否が定量根拠で説明されている。
-- [ ] 観点2: config/tool refactorはDRYで、RGB freeze、strict transfer、raw-depth/MAE、AMP、NOCS evaluatorの意味を変えずtestsで守られている。
-- [ ] 観点3: long fine-tuneはquality gate後に実行され、real validation、best checkpoint、metrics、thresholdなしoverlay、有限性を確認している。
-- [ ] 観点4: 全Trace IDの証跡、uv tests、worktree/authority audit、未達精度と再開条件が作業記録にある。
+- [x] 観点1: baselineと高速化後の速度・VRAM・数値contractが同一条件で比較され、採否が定量根拠で説明されている。
+- [x] 観点2: config/tool refactorはDRYで、RGB freeze、strict transfer、raw-depth/MAE、AMP、NOCS evaluatorの意味を変えずtestsで守られている。
+- [x] 観点3: long fine-tuneはquality gate後に実行され、real validation、best checkpoint、metrics、thresholdなしoverlay、有限性を確認している。
+- [x] 観点4: 全Trace IDの証跡、uv tests、worktree/authority audit、未達精度と再開条件が作業記録にある。
 
 ---
 
@@ -260,4 +267,25 @@ nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noh
 | 2026-08-24 | 16:28:11 UTC | Codex | 定期状況（行動カウント reset） | 本走はepoch33以降も継続中。epoch10 best=.1694を保持し、epoch20/25/30の単発低下はcheckpointへ採用しない。NaN/Inf/OOM/finite-cost例外は0で、次のvalidationはepoch35。 | 進行中 |
 | 2026-08-24 | 16:38:10 UTC | Codex | 定期状況（行動カウント reset） | 本走はepoch49へ進行中。epoch35/40/45 IoU@.50=.1282/.1206/.1178でepoch10 best=.1694を更新しないが、best-only重みは保持。NaN/Inf/OOM/finite-cost例外0。次のepoch50 validationを監視する。 | 進行中 |
 | 2026-08-24 | 19:42:49 UTC | Codex | 手順10・80epoch完走確認 | `rgbd3d_long_ft80_lr1e6`は80epoch/960 train update/16回のcustom_val 50/50を完走。train初回からepoch80 metricまで3,196秒（53分16秒、39.95秒/epoch）、GPU peak=19,326MiB、error marker=0。bestはepoch10 AP50=.0000/IoU@.10/.25/.50/.75=.6300/.4352/.1694/.0215、最終epoch80はAP50=.0010/IoU@.50=.0757。後半品質低下を隠さず、`best_3d_iou_0.50_epoch_10.pth`を保持。 | 完走・bestのみ採用 |
+| 2026-08-24 | 20:03:22 UTC | Codex | 手順10・操作完了 | 現在状態を再監査し、train process不在、epoch80 12/12、960 train record、16回のcustom_val 50/50、best-only `best_3d_iou_0.50_epoch_10.pth`（140,680,671 bytes）を確認。隔離work_dirで長時間fine-tuneとartifact保存が完了している。 | 成功 |
+| 2026-08-24 | 20:03:22 UTC | Codex | 手順10・確認完了 | log再解析で80epoch/960 update、validation=16（epoch5〜80、各50/50）、wall=3,196秒、39.95秒/epoch、peak=19,326MiB。best epoch10はAP50=.0000/IoU@.50=.1694、final epoch80はAP50=.0010/IoU@.50=.0757。Traceback/RuntimeError/ValueError/FloatingPointError/OOM=0、全metric finite。 | 成功 |
+| 2026-08-24 | 20:05:04 UTC | Codex | 手順10・テスト完了 | `longrun_summary.json`と`test_rgbd_3dbbox_longrun_e2e.py`を追加。実logのepoch80/12、epoch5〜80の16回50/50、全metric finite/error不在、best epoch10=.1694、baseline=.169004以上、final=.0757、best checkpoint存在を検証。long config/quality gate testと合わせて8 passed。 | 成功 |
+| 2026-08-24 | 20:05:04 UTC | Codex | 定期状況（行動カウント reset） | 学習完了をprocess/log/checkpoint/transfer reportで再確認し、手順10の操作・確認・テストを完了。残りは中断時対処の記録、best overlay 3枚、最終監査。 | 進行中 |
+| 2026-08-24 | 20:05:04 UTC | Codex | 手順10・エラー時対処完了 | 中断/例外は0のためresume不要。checkpoint policyはsave_optimizer=False/save_last=False/best-onlyで、再開する場合もsource epoch14からfresh configを使う契約。epoch10=.1694後にepoch80=.0757まで低下した事実をsummary/logへ保持し、epoch10 best checkpointを削除していない。 | 成功 |
+| 2026-08-24 | 20:08:26 UTC | Codex | 手順11・操作完了 | epoch10 bestを再評価し、prediction dumpとthresholdなしtop-1 overlay 3枚を`epoch10_overlays`へ生成。`comparison_manifest.json`にbaseline epoch14=.169004、long epoch10=.1694、差=.000396、両者のcheckpoint/manifest/3画像を併記。選出画像が異なるため虚偽の対応付けはしない。 | 成功 |
+| 2026-08-24 | 20:09:04 UTC | Codex | 手順11・確認完了 | long 3枚とbaseline 3枚を目視比較。manifestはK 3x3、object-to-camera T 4x4、size/cornersのm単位、projected px、checkpoint、score、thresholdなしtop-1、640x480を保持し、各画像8頂点がfinite/画面内。鏡映・発散はないが、箱は極小で果実から外れる例があり、実用精度未達を明記。 | 成（品質未達を確認） |
+| 2026-08-24 | 20:09:49 UTC | Codex | 手順11・テスト完了 | `uv run pytest -q tests/test_rgbd_3dbbox_overlay_artifact.py tests/test_rgbd_3dbbox_projection_guard.py`=4 passed。baseline/longの各3画像のdecode・黄色線・K/T/size/corner形状とfinite性・8頂点、比較metric、不正camera geometry拒否を確認。 | 成功 |
+| 2026-08-24 | 20:10:15 UTC | Codex | 手順11・エラー時対処完了 | projection guardは発火せず、K→m単位→T→corner orderingのmanifest contractと目視を一致確認。score thresholdは追加せず、箱が極小・対象から外れる比較画像も削除せず保持した。 | 成功（品質未達証跡を保持） |
+| 2026-08-24 | 20:10:44 UTC | Codex | 定期状況（行動カウント reset） | 手順11の4項目を完了。epoch10 bestのthresholdなしoverlay 3枚とbaseline比較を保存し、4 overlay/projection testsが成功。best IoU@.50の改善は+.000396に留まり、箱が極小・対象から外れる実用精度未達を保持。残りは手順12の最終監査とDoD、認可済みcommit/push。 | 進行中 |
+| 2026-08-24 | 20:12:00 UTC | Codex | 手順12・操作完了 | benchmark v3 JSON/run snapshot、現行DRY config、long log/summary/checkpoint、overlay/manifest、Git statusを照合し2.5節へ最終結果を追記。19.15%短縮、53分16秒、19,326MiB、best .1694（baseline比+.000396）、final .0757、実用精度未達と再開条件を明記。 | 成功（品質未達） |
+| 2026-08-24 | 20:12:55 UTC | Codex | 手順12・確認完了 | TR-1=benchmark、TR-2=数値contract、TR-3=DRY config、TR-4=quality gate/80epoch、TR-5=thresholdなしoverlay/worktreeの各証跡を照合。staged diffは空、現在の3差分は本作業由来でuser-owned dirtyの混入なし。stage/resetは未実施、commit/pushはユーザーの今回明示許可後のみ実施する。実用精度未達と再開条件は2.5節に明記。 | 成功 |
+| 2026-08-24 | 20:13:56 UTC | Codex | 手順12・テスト完了 | `test_rgbd_3dbbox_throughput_longrun_audit.py`を追加し、単体実行=3 passed（既知DeprecationWarning 1件）。benchmark run snapshot SHA256、seed/batch/timing finite、long config/summary/checkpoint、overlay比較、TR-1〜5、先行チェック未完了ゼロを検証。DoD後に作業書全体の`[ ]`ゼロを再監査する。 | 成功 |
+| 2026-08-24 | 20:14:29 UTC | Codex | 手順12・エラー時対処完了 | 専用監査でartifact欠落、未解決例外、metric schema差は0。精度未達のlast safe stateはepoch10 best（IoU@.50=.1694）。再開は追加epochではなく、ラベル/座標系・matching/lossを切り分けた単一変更が短期gateでbaselineを十分に超える場合に限定。 | 成功（品質再開条件あり） |
+| 2026-08-24 | 20:15:02 UTC | Codex | 完了の定義・観点1 | batch26の数値contractを維持し、5epoch baseline推定235秒対interval5実測190秒（19.15%短縮）、peak 19,326MiBを確認。data wait/compute比約2.3%のloader変更は10%採用基準未満で不採用とし、採否と数値証跡が一致。 | 充足 |
+| 2026-08-24 | 20:15:53 UTC | Codex | 完了の定義・観点2 | config equivalence、RGB transfer/freeze、sample/depth contract、long configの回帰は10 passed。DRY継承後もRGB freeze、300-key strict transfer、raw-depth valid-mask/MAE、FP16 AMP、NOCSMetricの解決済み意味を維持。既知警告8件のみ。 | 充足 |
+| 2026-08-24 | 20:15:53 UTC | Codex | 定期状況（行動カウント reset） | 手順12の4項目とDoD観点1・2を完了。専用audit=3 passed、DRY/transfer/depth/AMP/evaluator回帰=10 passed。残りはDoD観点3・4、全test、workdoc未完了ゼロ、明示許可済みcommit/push。 | 進行中 |
+| 2026-08-24 | 20:16:21 UTC | Codex | 完了の定義・観点3 | quality gate artifact、80epoch E2E、baseline/long overlayの回帰は7 passed。LR=1e-6 gate通過後に16回×50画像の実NOCS validationを実行、best epoch10 checkpoint、finite metrics/error 0、thresholdなしtop-1 overlay 3枚を確認。final悪化はbest-onlyで非採用。 | 充足 |
+| 2026-08-24 | 20:17:36 UTC | Codex | 最終suite初回failと修正 | `uv run pytest -q tests`初回は40 passed/1 failed。audit testが自身のworkdoc checkboxを`[ ]`固定文字列で分割し、`[x]`更新後にDoD観点4まで先行範囲と誤認した自己参照bug。checkboxに依存しない項目本文で分割するよう修正し、専用test再実行=3 passed。artifact/modelの欠陥ではない。 | fail→解決 |
+| 2026-08-24 | 20:18:05 UTC | Codex | 完了の定義・観点4 | 修正後`uv run pytest -q tests`=41 passed/22 known warnings。TR-1〜5の証跡、user-owned dirty非混入・明示commit/push許可のauthority audit、実用3D精度未達、last safe epoch10、単一変更quality gateの再開条件を照合。 | 充足 |
+| 2026-08-24 | 20:19:29 UTC | Codex | 最終監査完了 | 作業書の行頭未完了checkbox=0、`git diff --check`=成功、全suite=41 passed、全check完了後の監査/E2E/overlay=7 passed。commit対象は作業書とテスト3ファイルのみ。checkpoint/prediction/overlay/work_dirsはignore対象でstageしない。 | 完了・commit可 |
 | | | | | |

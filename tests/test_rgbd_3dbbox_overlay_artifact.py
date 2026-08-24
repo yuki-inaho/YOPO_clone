@@ -5,16 +5,27 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-OVERLAY_DIR = REPO_ROOT / "work_dirs/rgbd3d_amp26_lr2e4_20ep_eval/epoch14_overlays"
+BASELINE_OVERLAY_DIR = (
+    REPO_ROOT / "work_dirs/rgbd3d_amp26_lr2e4_20ep_eval/epoch14_overlays"
+)
+LONG_OVERLAY_DIR = REPO_ROOT / "work_dirs/rgbd3d_long_ft80_lr1e6/epoch10_overlays"
 
 
-def test_rgbd_3dbbox_overlay_artifact():
+@pytest.mark.parametrize(
+    ("overlay_dir", "checkpoint_name"),
+    [
+        (BASELINE_OVERLAY_DIR, "best_3d_iou_0.50_epoch_14.pth"),
+        (LONG_OVERLAY_DIR, "best_3d_iou_0.50_epoch_10.pth"),
+    ],
+)
+def test_rgbd_3dbbox_overlay_artifact(overlay_dir, checkpoint_name):
     """Three decoded RGB projections retain their model and camera evidence."""
-    manifest = json.loads((OVERLAY_DIR / "manifest.json").read_text())
-    assert Path(manifest["checkpoint"]).name == "best_3d_iou_0.50_epoch_14.pth"
+    manifest = json.loads((overlay_dir / "manifest.json").read_text())
+    assert Path(manifest["checkpoint"]).name == checkpoint_name
     assert manifest["selection_rule"] == "top-1 query per image, no confidence threshold"
     assert len(manifest["images"]) == 3
 
@@ -30,5 +41,29 @@ def test_rgbd_3dbbox_overlay_artifact():
         assert np.asarray(item["intrinsic_3x3"]).shape == (3, 3)
         assert np.asarray(item["object_to_camera_T_4x4"]).shape == (4, 4)
         assert np.asarray(item["size_m"]).shape == (3, )
-        assert np.asarray(item["projected_corners_xy_px"]).shape == (8, 2)
+        corners_camera = np.asarray(item["corners_camera_m"])
+        projected_corners = np.asarray(item["projected_corners_xy_px"])
+        assert corners_camera.shape == (8, 3)
+        assert projected_corners.shape == (8, 2)
+        assert np.isfinite(corners_camera).all()
+        assert np.isfinite(projected_corners).all()
         assert item["visible_projected_corners"] == 8
+
+
+def test_long_run_overlay_comparison_manifest():
+    """The visual report preserves the baseline and marginal metric delta."""
+    comparison = json.loads(
+        (LONG_OVERLAY_DIR / "comparison_manifest.json").read_text()
+    )
+    assert comparison["selection_rule"] == (
+        "top-1 query per image, no confidence threshold"
+    )
+    assert comparison["metric"] == "3d_iou_0.50"
+    assert comparison["baseline"]["epoch"] == 14
+    assert comparison["long_run"]["epoch"] == 10
+    assert comparison["baseline"]["value"] == pytest.approx(0.169004)
+    assert comparison["long_run"]["value"] == pytest.approx(0.1694)
+    assert comparison["delta"] == pytest.approx(0.000396)
+    assert len(comparison["baseline"]["overlays"]) == 3
+    assert len(comparison["long_run"]["overlays"]) == 3
+    assert "not practically accurate" in comparison["visual_review"]
