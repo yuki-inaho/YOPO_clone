@@ -47,9 +47,9 @@ CUBOID_UNIT = np.array(
     ]
 )
 
-# Cuboid face edges: front(0,1,3,2), back(4,5,7,6), struts(0-4,1-5,2-6,3-7)
-FRONT_EDGES = [(0, 1), (1, 3), (3, 2), (2, 0)]
-BACK_EDGES = [(4, 5), (5, 7), (7, 6), (6, 4)]
+# Cuboid face edges: front(z=-d/2: 0,1,2,3), back(z=+d/2: 4,5,6,7), struts.
+FRONT_EDGES = [(0, 1), (1, 2), (2, 3), (3, 0)]
+BACK_EDGES = [(4, 5), (5, 6), (6, 7), (7, 4)]
 STRUT_EDGES = [(0, 4), (1, 5), (2, 6), (3, 7)]
 
 WIRE_COLOR = (85, 221, 85)      # green wireframe
