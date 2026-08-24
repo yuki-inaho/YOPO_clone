@@ -48,6 +48,44 @@ class HungarianAssigner(BaseAssigner):
             TASK_UTILS.build(match_cost) for match_cost in match_costs
         ]
 
+    @staticmethod
+    def _tensor_summary(value: Tensor) -> str:
+        """Return compact finite-value diagnostics without materializing data."""
+        finite = torch.isfinite(value)
+        finite_count = int(finite.sum().item())
+        if finite_count:
+            finite_values = value[finite]
+            value_range = (
+                f'min={float(finite_values.min().item()):.4g},'
+                f'max={float(finite_values.max().item()):.4g}'
+            )
+        else:
+            value_range = 'min=NA,max=NA'
+        return (
+            f'shape={tuple(value.shape)},finite={finite_count}/{value.numel()},'
+            f'{value_range}'
+        )
+
+    @classmethod
+    def _instance_tensor_summaries(cls, instances: InstanceData) -> str:
+        summaries = []
+        for field in sorted(instances.keys()):
+            value = getattr(instances, field)
+            if isinstance(value, Tensor):
+                summaries.append(f'{field}({cls._tensor_summary(value)})')
+        return '; '.join(summaries) or 'none'
+
+    @classmethod
+    def _raise_nonfinite_cost(cls, cost_name: str, cost: Tensor,
+                              pred_instances: InstanceData,
+                              gt_instances: InstanceData) -> None:
+        """Fail before SciPy discards the source of a numerical error."""
+        raise FloatingPointError(
+            f'Hungarian match cost {cost_name} is non-finite: '
+            f'{cls._tensor_summary(cost)}; '
+            f'pred_fields={cls._instance_tensor_summaries(pred_instances)}; '
+            f'gt_fields={cls._instance_tensor_summaries(gt_instances)}')
+
     def assign(self,
                pred_instances: InstanceData,
                gt_instances: InstanceData,
@@ -119,8 +157,18 @@ class HungarianAssigner(BaseAssigner):
                 pred_instances=pred_instances,
                 gt_instances=gt_instances,
                 img_meta=img_meta)
+            if not torch.isfinite(cost).all():
+                self._raise_nonfinite_cost(
+                    type(match_cost).__name__, cost, pred_instances,
+                    gt_instances)
             cost_list.append(cost)
         cost = torch.stack(cost_list).sum(dim=0)
+        if not torch.isfinite(cost).all():
+            self._raise_nonfinite_cost(
+                'sum(' + ','.join(
+                    type(match_cost).__name__
+                    for match_cost in self.match_costs) + ')',
+                cost, pred_instances, gt_instances)
 
         # 3. do Hungarian matching on CPU using linear_sum_assignment
         cost = cost.detach().cpu()

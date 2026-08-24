@@ -28,6 +28,7 @@ from .grid_rcnn import GridRCNN
 from .grounding_dino import GroundingDINO
 from .kd_one_stage import KnowledgeDistillationSingleStageDetector
 from .lad import LAD
+from .mae_depth import MAEDepth
 from .nasfcos import NASFCOS
 from .paa import PAA
 from .reppoints_detector import RepPointsDetector
@@ -55,5 +56,5 @@ __all__ = [
     'AutoAssign', 'YOLOF', 'CenterNet', 'YOLOX', 'LAD', 'TOOD', 'DDOD',
     'SemiBaseDetector', 'SoftTeacher', 'RTMDet', 'Detectron2Wrapper',
     'CrowdDet', 'DetectionTransformer', 'ConditionalDETR', 'DINO',
-    'DABDETR', 'GLIP', 'DDQDETR', 'GroundingDINO'
+    'DABDETR', 'GLIP', 'DDQDETR', 'GroundingDINO', 'MAEDepth'
 ]

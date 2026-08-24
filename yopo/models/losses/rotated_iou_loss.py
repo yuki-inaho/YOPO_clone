@@ -127,10 +127,13 @@ class RotatedIoULoss(nn.Module):
             # iou_loss of shape (n,)
             assert weight.shape == pred.shape
             weight = weight.mean(-1)
-        with torch.cuda.amp.autocast(enabled=False):
+        # mmcv's differentiable rotated-IoU kernel accepts half inputs under
+        # AMP but can return NaN gradients.  Keep the surrounding detector in
+        # AMP while evaluating this geometry-sensitive operation in fp32.
+        with torch.autocast(device_type=pred.device.type, enabled=False):
             loss = self.loss_weight * rotated_iou_loss(
-                pred,
-                target,
+                pred.float(),
+                target.float(),
                 weight,
                 mode=self.mode,
                 eps=self.eps,
