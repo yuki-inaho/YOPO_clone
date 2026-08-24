@@ -162,6 +162,7 @@ def write_label_pkl(
             "rotations": empty.reshape(0, 3, 3),
             "sizes": empty.reshape(0, 3),
             "scales": np.zeros(0, dtype=np.float32),
+            "obb_cxcywha_rad": empty.reshape(0, 5),
         }
         with open(path, "wb") as f:
             pickle.dump(pkl, f)
@@ -175,6 +176,7 @@ def write_label_pkl(
     rotations = np.zeros((n, 3, 3), dtype=np.float32)
     sizes = np.zeros((n, 3), dtype=np.float32)
     scales = np.ones(n, dtype=np.float32)
+    obbs = np.zeros((n, 5), dtype=np.float32)
 
     for i, a in enumerate(anns):
         x, y, w, h = a["bbox"]
@@ -186,6 +188,7 @@ def write_label_pkl(
         )
         rotations[i] = R_align
         sizes[i] = dims_align
+        obbs[i] = a["obb_cxcywha_rad"]
 
     pkl = {
         "class_ids": class_ids,
@@ -195,6 +198,7 @@ def write_label_pkl(
         "rotations": rotations,
         "sizes": sizes,
         "scales": scales,
+        "obb_cxcywha_rad": obbs,
     }
     with open(path, "wb") as f:
         pickle.dump(pkl, f)

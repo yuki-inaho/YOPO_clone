@@ -95,6 +95,7 @@ def render_instances(
     Ts: np.ndarray,
     sizes: np.ndarray,
     intrinsic,
+    obbs: np.ndarray | None = None,
     draw_obb: bool = True,
     draw_aabb: bool = True,
     draw_wire: bool = True,
@@ -137,11 +138,16 @@ def render_instances(
                     1,
                 )
 
-        # (c) 2D OBB: rotated rect enclosing the projected cuboid corners
-        # (minAreaRect -> aligned with the dominant projected object axis).
+        # (c) 2D OBB: TPE detector OBB (cx,cy,w,h,angle in 800x600 px) scaled
+        # to 640x480, falling back to minAreaRect of the projected cuboid.
         if draw_obb:
-            rect = cv2.minAreaRect(corners2d.astype(np.float32))
-            box = cv2.boxPoints(rect).astype(int)
+            if obbs is not None and len(obbs) > tidx:
+                cx, cy, w, h, ang = obbs[tidx]
+                rect = ((cx * 0.8, cy * 0.8), (w * 0.8, h * 0.8), np.degrees(ang))
+                box = cv2.boxPoints(rect).astype(int)
+            else:
+                rect = cv2.minAreaRect(corners2d.astype(np.float32))
+                box = cv2.boxPoints(rect).astype(int)
             cv2.polylines(img, [box], True, OBB_COLOR, 2)
 
         # (d) reference axis-aligned bbox
@@ -181,7 +187,8 @@ def load_frame(
         raise SystemExit(f"cannot read {color}")
     with open(label, "rb") as f:
         pkl = pickle.load(f)
-    return rgb, pkl["translations"], pkl["rotations"], pkl["sizes"]
+    obbs = pkl.get("obb_cxcywha_rad")
+    return rgb, pkl["translations"], pkl["rotations"], pkl["sizes"], obbs
 
 
 def main() -> None:
@@ -200,7 +207,7 @@ def main() -> None:
     parser.add_argument("--no-axis", action="store_true")
     args = parser.parse_args()
 
-    rgb, translations, rotations, sizes = load_frame(
+    rgb, translations, rotations, sizes, obbs = load_frame(
         args.data_root, args.split, args.frame
     )
     intrinsic = [FX, FY, CX, CY]
@@ -221,8 +228,9 @@ def main() -> None:
         Ts[:n_show],
         sizes[:n_show],
         intrinsic,
+        obbs=obbs[:n_show] if obbs is not None else None,
         draw_obb=not args.no_obb,
-        draw_aabb=not args.no_aabb,
+        draw_aabb=False,
         draw_wire=False,
         draw_axis=False,
         draw_id=False,
