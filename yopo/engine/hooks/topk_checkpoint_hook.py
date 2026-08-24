@@ -54,6 +54,7 @@ class TopKCheckpointHook(CheckpointHook):
         super().__init__(
             interval=interval,
             by_epoch=by_epoch,
+            save_optimizer=save_optimizer,
             save_best=key_indicator,
             rule=rule,
             **kwargs)

@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import torch
+from mmcv.ops import box_iou_rotated
 
 
 def fp16_clamp(x, min=None, max=None):
@@ -197,3 +198,51 @@ def bbox_overlaps(bboxes1, bboxes2, mode='iou', is_aligned=False, eps=1e-6):
     enclose_area = torch.max(enclose_area, eps)
     gious = ious - (enclose_area - union) / enclose_area
     return gious
+
+
+def rbbox_overlaps(bboxes1,
+                   bboxes2,
+                   mode='iou',
+                   is_aligned=False,
+                   eps=1e-6):
+    """Calculate overlap between two set of rotated bboxes.
+
+    Args:
+        bboxes1 (Tensor): shape (m, 5) in <cx, cy, w, h, t> format or empty.
+        bboxes2 (Tensor): shape (n, 5) in <cx, cy, w, h, t> format or empty.
+        mode (str): 'iou' (intersection over union), 'iof' (intersection over
+            foreground). Defaults to 'iou'.
+        is_aligned (bool): If True, then m and n must be equal.
+            Defaults to False.
+        eps (float): A value added to the denominator for numerical
+            stability. Defaults to 1e-6.
+
+    Returns:
+        Tensor: shape (m, n) if ``is_aligned`` is False else shape (m,)
+    """
+    assert mode in ['iou', 'iof']
+    # Either the boxes are empty or the length of boxes' last dimension is 5
+    assert (bboxes1.size(-1) == 5 or bboxes1.size(0) == 0)
+    assert (bboxes2.size(-1) == 5 or bboxes2.size(0) == 0)
+
+    rows = bboxes1.size(0)
+    cols = bboxes2.size(0)
+    if is_aligned:
+        assert rows == cols
+
+    if rows * cols == 0:
+        return bboxes1.new(rows, 1) if is_aligned else bboxes1.new(
+            rows, cols)
+
+    # resolve `rbbox_overlaps` abnormal when input rbbox is too small.
+    clamped_bboxes1 = bboxes1.detach().clone()
+    clamped_bboxes2 = bboxes2.detach().clone()
+    clamped_bboxes1[:, 2:4].clamp_(min=1e-3)
+    clamped_bboxes2[:, 2:4].clamp_(min=1e-3)
+
+    # resolve `rbbox_overlaps` abnormal when coordinate value is too large.
+    clamped_bboxes1[:, :2].clamp_(min=-1e7, max=1e7)
+    clamped_bboxes2[:, :2].clamp_(min=-1e7, max=1e7)
+
+    return box_iou_rotated(
+        clamped_bboxes1, clamped_bboxes2, mode, is_aligned)

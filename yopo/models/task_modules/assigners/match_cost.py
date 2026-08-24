@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import math
 from abc import abstractmethod
 from typing import Optional, Union
 
@@ -8,7 +9,10 @@ from mmengine.structures import InstanceData
 from torch import Tensor
 
 from yopo.registry import TASK_UTILS
-from yopo.structures.bbox import bbox_overlaps, bbox_xyxy_to_cxcywh
+from yopo.structures.bbox import (BaseBoxes, bbox_overlaps,
+                                  bbox_xyxy_to_cxcywh, rbbox_overlaps)
+from yopo.models.losses.gaussian_dist_loss import (
+    postprocess, xy_stddev_pearson_2_xy_sigma, xy_wh_r_2_xy_sigma)
 
 
 class BaseMatchCost:
@@ -1229,3 +1233,222 @@ class ADD9DCost(BaseMatchCost):
                 cost = torch.where(sym_mask_expanded, torch.min(cost, cost_sym), cost)
 
         return cost * self.weight
+
+
+def box2multiple_corners(box, num_points):
+    B = box.size()[0]
+    x, y, w, h, alpha = box.split([1, 1, 1, 1, 1], dim=-1)
+    num_segments = num_points // 4
+
+    weights = torch.linspace(0, 1, num_segments + 1,
+                             device=box.device)[:-1]
+
+    x_coords = torch.cat([
+        -w / 2 + w * weights, w / 2 * torch.ones_like(weights),
+        w / 2 - w * weights, -w / 2 * torch.ones_like(weights)
+    ],
+                         dim=-1)
+    y_coords = torch.cat([
+        h / 2 * torch.ones_like(weights), h / 2 - h * weights,
+        -h / 2 * torch.ones_like(weights), -h / 2 + h * weights
+    ],
+                         dim=-1)
+    corners = torch.stack([x_coords, y_coords], dim=-1)
+
+    sin = torch.sin(alpha)
+    cos = torch.cos(alpha)
+    row1 = torch.cat([cos, sin], dim=-1)
+    row2 = torch.cat([-sin, cos], dim=-1)
+    rot_T = torch.stack([row1, row2], dim=-2)
+
+    N = box.size(1)
+    rotated = torch.bmm(
+        corners.view([-1, num_points, 2]),
+        rot_T.repeat(1, 1, 1, 1).view([-1, 2, 2]))
+    rotated = rotated.view([B, N, num_points, 2])
+    rotated[..., 0] += x
+    rotated[..., 1] += y
+    return rotated
+
+
+def kld_loss_for_cost(pred, target, fun='log1p', tau=1.0, alpha=1.,
+                      sqrt=True):
+    """KLD distance used by GDCost (gaussian based match cost)."""
+    xy_1, Sigma_1 = pred
+    xy_2, Sigma_2 = target
+    N, _ = xy_1.shape
+    M, _ = xy_2.shape
+    xy_1 = xy_1.unsqueeze(1).repeat(1, M, 1).view(-1, 2)
+    Sigma_1 = Sigma_1.unsqueeze(1).repeat(1, M, 1, 1).view(-1, 2, 2)
+    xy_2 = xy_2.unsqueeze(0).repeat(N, 1, 1).view(-1, 2)
+    Sigma_2 = Sigma_2.unsqueeze(0).repeat(N, 1, 1, 1).view(-1, 2, 2)
+    return_shape = [N, M]
+
+    Sigma_1_inv = torch.stack(
+        (Sigma_1[..., 1, 1], -Sigma_1[..., 0, 1],
+         -Sigma_1[..., 1, 0], Sigma_1[..., 0, 0]),
+        dim=-1).reshape(-1, 2, 2)
+    Sigma_1_inv = Sigma_1_inv / Sigma_1.det().unsqueeze(-1).unsqueeze(-1)
+    dxy = (xy_1 - xy_2).unsqueeze(-1)
+    xy_distance = 0.5 * dxy.permute(0, 2,
+                                    1).bmm(Sigma_1_inv).bmm(dxy).view(-1)
+
+    whr_distance = 0.5 * Sigma_1_inv.bmm(Sigma_2).diagonal(
+        dim1=-2, dim2=-1).sum(dim=-1)
+    Sigma_1_det_log = Sigma_1.det().log()
+    Sigma_2_det_log = Sigma_2.det().log()
+    whr_distance = whr_distance + 0.5 * (Sigma_1_det_log -
+                                         Sigma_2_det_log)
+    whr_distance = whr_distance - 1
+    distance = (xy_distance / (alpha * alpha) + whr_distance)
+
+    if sqrt:
+        distance = distance.clamp(1e-7).sqrt()
+    distance = distance.reshape(return_shape)
+    return postprocess(distance, fun=fun, tau=tau)
+
+
+@TASK_UTILS.register_module()
+class RBoxL1Cost(BBoxL1Cost):
+    """Rotated bbox L1 match cost (5-dim: cx, cy, w, h, rad)."""
+
+    def __init__(self,
+                 box_format: str = 'xywha',
+                 angle_factor=math.pi,
+                 weight: Union[float, int] = 1.) -> None:
+        super().__init__(weight=weight)
+        assert box_format == 'xywha'
+        self.box_format = box_format
+        self.angle_factor = angle_factor
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        pred_bboxes = pred_instances.bboxes
+        gt_bboxes = gt_instances.bboxes
+        if isinstance(gt_bboxes, BaseBoxes):
+            gt_bboxes = gt_bboxes.tensor
+
+        img_h, img_w = img_meta['img_shape']
+        factor = gt_bboxes.new_tensor(
+            [img_w, img_h, img_w, img_h,
+             self.angle_factor]).unsqueeze(0)
+        gt_bboxes = gt_bboxes / factor
+        pred_bboxes = pred_bboxes / factor
+
+        bbox_cost = torch.cdist(pred_bboxes, gt_bboxes, p=1)
+        return bbox_cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class CenterL1Cost(RBoxL1Cost):
+    """Center L1 match cost (cx, cy only)."""
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        pred_bboxes = pred_instances.bboxes
+        gt_bboxes = gt_instances.bboxes
+        if isinstance(gt_bboxes, BaseBoxes):
+            gt_bboxes = gt_bboxes.tensor
+
+        pred_bboxes = pred_bboxes[..., :2]
+        gt_bboxes = gt_bboxes[..., :2]
+
+        img_h, img_w = img_meta['img_shape']
+        factor = gt_bboxes.new_tensor([img_w, img_h]).unsqueeze(0)
+        gt_bboxes = gt_bboxes / factor
+        pred_bboxes = pred_bboxes / factor
+
+        bbox_cost = torch.cdist(pred_bboxes, gt_bboxes, p=1)
+        return bbox_cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class GDCost(BaseMatchCost):
+    """Gaussian distance (KLD) match cost for rotated bboxes."""
+
+    BAG_GD_COST = {
+        'gwd': None,
+        'kld': kld_loss_for_cost,
+        'jd': None,
+        'kld_symmax': None,
+        'kld_symmin': None,
+    }
+    BAG_PREP = {
+        'xy_stddev_pearson': xy_stddev_pearson_2_xy_sigma,
+        'xy_wh_r': xy_wh_r_2_xy_sigma,
+    }
+
+    def __init__(self,
+                 loss_type: str = 'kld',
+                 representation: str = 'xy_wh_r',
+                 fun: str = 'log1p',
+                 tau: float = 0.0,
+                 alpha: float = 1.0,
+                 sqrt: bool = True,
+                 weight: Union[float, int] = 1.):
+        super().__init__(weight=weight)
+        assert loss_type in self.BAG_GD_COST
+        assert representation in self.BAG_PREP
+        self.loss = self.BAG_GD_COST[loss_type]
+        self.preprocess = self.BAG_PREP[representation]
+        self.fun = fun
+        self.tau = tau
+        self.alpha = alpha
+        self.sqrt = sqrt
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        pred_bboxes = pred_instances.bboxes
+        gt_bboxes = gt_instances.bboxes
+        if isinstance(gt_bboxes, BaseBoxes):
+            gt_bboxes = gt_bboxes.tensor
+
+        # GDCost shares GDLoss's determinant/LU operation. It is used only by
+        # Hungarian matching, so an fp32 calculation is both safe and required
+        # when the detector forward uses fp16 autocast.
+        with torch.autocast(device_type=pred_bboxes.device.type, enabled=False):
+            pred_bboxes = self.preprocess(pred_bboxes.float())
+            gt_bboxes = self.preprocess(gt_bboxes.float())
+            gd_cost = self.loss(pred_bboxes, gt_bboxes, fun=self.fun,
+                                tau=self.tau, alpha=self.alpha,
+                                sqrt=self.sqrt)
+            return gd_cost * self.weight
+
+
+@TASK_UTILS.register_module()
+class RotatedIoUCost(BaseMatchCost):
+    """Rotated IoU match cost for rotated bboxes."""
+
+    def __init__(self,
+                 iou_mode: str = 'iou',
+                 weight: Union[float, int] = 1.):
+        super().__init__(weight=weight)
+        self.iou_mode = iou_mode
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        pred_bboxes = pred_instances.bboxes
+        gt_bboxes = gt_instances.bboxes
+        if isinstance(gt_bboxes, BaseBoxes):
+            gt_bboxes = gt_bboxes.tensor
+
+        if isinstance(pred_bboxes, BaseBoxes):
+            pred_bboxes = pred_bboxes.tensor
+
+        overlaps = rbbox_overlaps(
+            pred_bboxes.to(gt_bboxes.device),
+            gt_bboxes,
+            mode=self.iou_mode)
+        return (-overlaps) * self.weight
