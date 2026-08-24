@@ -65,6 +65,14 @@ class NOCSDataset(BaseDetDataset):
             label_path="segmentation_results/REAL275",
             intrinsic=[591.0125, 590.16775, 322.525, 244.11084],
         ),
+        custom_val=dict(
+            # Custom RGB-D dataset: same train-style _label.pkl layout as
+            # real_train, but evaluated on the val/test image list.
+            img_path="real/test_list.txt",
+            model_path=None,
+            label_path="real/",
+            intrinsic=[591.0125, 590.16775, 322.525, 244.11084],
+        ),
         overfit=dict(
             img_path="real/test_scene_1_list.txt",
             model_path=None,  # 'obj_models/overfit.pkl',
@@ -154,7 +162,9 @@ class NOCSDataset(BaseDetDataset):
             img_id = scene + "/" + frame_id
 
             # read label_info
-            if "train" not in self.split:
+            if "train" in self.split or self.split.startswith("custom"):
+                label_file = osp.join(img_file + "_label.pkl")
+            else:
                 label_path = dataset_info.get("label_path", None)
                 if label_path is None:
                     raise ValueError(f"No label_path found for split {self.split}")
@@ -164,8 +174,6 @@ class NOCSDataset(BaseDetDataset):
                     label_path,
                     f"results_{split}_{scene}_{frame_id}.pkl",
                 )
-            else:
-                label_file = osp.join(img_file + "_label.pkl")
 
             with open(label_file, "rb") as f:
                 gt_info = pickle.load(f)
@@ -228,7 +236,7 @@ class NOCSDataset(BaseDetDataset):
         Returns:
             List[dict]: List of instances.
         """
-        is_train = "train" in self.split
+        is_train = "train" in self.split or self.split.startswith("custom")
 
         if is_train:
             class_ids = gt_info["class_ids"]

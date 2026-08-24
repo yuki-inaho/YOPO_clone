@@ -339,9 +339,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         all_layers_outputs_z = torch.stack(all_layers_outputs_z)
         all_layers_outputs_rotations = torch.stack(all_layers_outputs_rotations)
         all_layers_outputs_sizes = torch.stack(all_layers_outputs_sizes)
-        all_layers_outputs_size_chain = torch.stack(all_layers_outputs_size_chain)
-        all_layers_outputs_rotation_chain = torch.stack(all_layers_outputs_rotation_chain)
-        all_layers_outputs_z_chain = torch.stack(all_layers_outputs_z_chain)
+        if self.use_cop_chain:
+            all_layers_outputs_size_chain = torch.stack(all_layers_outputs_size_chain)
+            all_layers_outputs_rotation_chain = torch.stack(all_layers_outputs_rotation_chain)
+            all_layers_outputs_z_chain = torch.stack(all_layers_outputs_z_chain)
+        else:
+            all_layers_outputs_size_chain = all_layers_outputs_rotation_chain = None
+            all_layers_outputs_z_chain = None
 
         return (all_layers_outputs_classes, all_layers_outputs_coords,
                 all_layers_outputs_centers_2d, all_layers_outputs_z,

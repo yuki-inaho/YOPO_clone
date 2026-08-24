@@ -1439,8 +1439,11 @@ class SimpleDINO9DPoseHead(DeformableDETRHead):
 
         outs = self(hidden_states, references)
 
+        # Subclasses (e.g. DINO9DCenter2DPoseHead) may return extra outputs
+        # (CoP chain predictions) after the first 6; the prediction head only
+        # consumes the core parallel outputs.
         predictions = self.predict_by_feat(
-            *outs, batch_img_metas=batch_img_metas, rescale=rescale)
+            *outs[:6], batch_img_metas=batch_img_metas, rescale=rescale)
         return predictions
 
 

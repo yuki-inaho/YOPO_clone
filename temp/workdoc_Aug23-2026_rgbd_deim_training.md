@@ -324,6 +324,7 @@ nohup .venv/bin/python tools/train.py configs/yopo/nocs_custom_real_hgnetv2_rgbd
 | `2026-08-23` | `18:26 UTC` | opencode | 100 epoch 延長 training 完了 | epoch100 まで完走。loss は epoch21 の 150.93 が最小、以降 151〜157 で頭打ち（cosine 終盤で収束）。→ CoP 精度向上のためフェーズ4 へ。 |
 | `2026-08-23` | `19:30~19:47 UTC` | opencode | フェーズ4: 手順11-13（CoP 実装+smoke） | `use_cop_chain` を実装（AttributeNet 3つ、size→rot→z の残差伝搬、aux loss）。shape テスト OK、CoP smoke 20 epoch を NaN なしで完走（chain_loss: size 48.5→0.13, rot 20.6→19.3, z 1.38→1.33）。`use_cop_chain=True` を `nocs_...deim_cop.py` config で有効化。 |
 | `2026-08-23` | `19:50~20:26 UTC` | opencode | フェーズ4: 手順14（CoP 再訓練 50 epoch） | `cop_finetune`（PID 791588）で 50 epoch を NaN なしで完走。CoP chain_loss: size 49.3→0.008, rot 20.4→10.5, z 1.38→1.26。メイン head も改善（rot 6.9→5.3, size 0.086→0.003）。総 loss 584→212。checkpoint: `cop_finetune/epoch_50.pth`。 |
+| `2026-08-23` | `24:26~24:56 UTC` | opencode | 精度評価＋結果画像生成 | NOCSMetric v1 は NOCS 6クラス前提でカスタム single-class と不一致（bottle のみ表示）→ 単クラス相当に。`copot/dump_nocs_custom_infer.py`（推論dump）と `cotemp/draw_nocs_custom_results.py`（描画）を分離実装。CoP epoch50 と Baseline epoch100 の両方で推論: **予測 center が画像右下に偏り、z=-0.09 (GT 0.58)、size が負値** → 推定 `_predict_by_feat_single` デコードに既存バグ（CoP 起因でない）。結果画像 50 枚を `work_dirs/cop_finetune/vis_all/` に出力。 |
 
 ---
 
