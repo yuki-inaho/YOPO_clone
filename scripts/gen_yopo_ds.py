@@ -40,12 +40,101 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pickle
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+
+def _normalize_pca_rotation(R: list[list[float]]) -> list[list[float]]:
+    """Normalize a PCA-derived rotation to a unique Euclidean sign frame.
+
+    PCA eigenvectors have arbitrary column signs. Two otherwise identical
+    fruits can therefore come out with mirrored rotation matrices (and mixed
+    signs), which makes a 9D pose model learn contradictory labels. We fix a
+    canonical sign per column and keep the frame right-handed:
+
+      * column 0: sign chosen so that the largest-magnitude entry is positive.
+      * column 1: same rule.
+      * column 2: recomputed as ``cross(col0, col1)`` to guarantee det=+1.
+
+    ``dimensions`` ([w, h, l]) is mapped to columns as before, so the extent
+    order is preserved.
+    """
+    M = np.asarray(R, dtype=np.float64)
+    col0 = M[:, 0].copy()
+    col1 = M[:, 1].copy()
+
+    def _canon_sign(v: np.ndarray) -> np.ndarray:
+        j = int(np.argmax(np.abs(v)))
+        return v if v[j] >= 0 else -v
+
+    col0 = _canon_sign(col0)
+    col1 = _canon_sign(col1)
+    col2 = np.cross(col0, col1)  # right-handed frame, det = +1
+    norm = np.linalg.norm(col2)
+    if norm > 0:
+        col2 = col2 / norm
+    M = np.stack([col0, col1, col2], axis=1)
+    return M.tolist()
+
+
+# Camera-frame world axes for this sideways rig:
+#   WORLD_UP  = cam +x  (image-right) is the zenith (gravity is -x).
+#   DEPTH_DIR = cam +z  is the viewing direction (into the scene).
+# We anchor the local frame so every fruit's Z (blue) points up (zenith) and
+# X (red) points toward the camera viewing (depth) direction; Y is the
+# remaining right-handed axis. This makes pose labels self-consistent.
+WORLD_UP = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+DEPTH_DIR = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+
+def _align_frame(R: list[list[float]], dims: list[float]) -> tuple[list[list[float]], list[float]]:
+    """Anchor the PCA frame to world-up (local Z) and depth (local X).
+
+    ``R`` columns are the PCA principal axes (after sign canonicalization).
+    ``dims`` is ``[w, h, l]``. We pick:
+      * local Z  = the column most aligned with ``WORLD_UP`` (zenith),
+      * local X  = the remaining column most aligned with ``DEPTH_DIR``,
+      * local Y  = cross(Z, X) (right-handed).
+    All chosen axes are sign-flipped toward their anchor direction. ``dims``
+    is re-ordered to follow the new column layout.
+    """
+    M = np.asarray(R, dtype=np.float64)
+
+    # 1) Z = zenith axis
+    up_dots = np.abs(M.T @ WORLD_UP)
+    z_idx = int(np.argmax(up_dots))
+    z_vec = M[:, z_idx].copy()
+    if z_vec @ WORLD_UP < 0:
+        z_vec = -z_vec
+
+    # 2) X = depth axis from the remaining two columns
+    remaining = [c for c in (0, 1, 2) if c != z_idx]
+    depth_dots = {c: abs(float(M[:, c] @ DEPTH_DIR)) for c in remaining}
+    x_idx = max(depth_dots, key=depth_dots.get)
+    x_vec = M[:, x_idx].copy()
+    if x_vec @ DEPTH_DIR < 0:
+        x_vec = -x_vec
+
+    # 3) Y = right-handed completion; its physical extent is taken from the
+    # leftover original column.
+    y_idx = remaining[0] if remaining[0] != x_idx else remaining[1]
+    y_vec = np.cross(z_vec, x_vec)
+    y_vec = y_vec / np.linalg.norm(y_vec)
+
+    # Permute dims: original col -> dim value. dims=[w,h,l] map to
+    # original columns as col0=length(dims[2]), col1=height(dims[1]),
+    # col2=width(dims[0]).
+    col_to_dim = {0: dims[2], 1: dims[1], 2: dims[0]}
+    z_dim = col_to_dim[z_idx]
+    x_dim = col_to_dim[x_idx]
+    y_dim = col_to_dim[y_idx]
+    new_dims = [y_dim, x_dim, z_dim]  # [w, h, l]: X shortest->w? keep order
+
+    new_R = np.stack([x_vec, y_vec, z_vec], axis=1)
+    return new_R.tolist(), new_dims
 
 SCENE = "scene_1"
 
@@ -91,8 +180,12 @@ def write_label_pkl(
         x, y, w, h = a["bbox"]
         bboxes[i] = (y, x, y + h, x + w)
         translations[i] = a["center_cam"]
-        rotations[i] = a["R_cam"]
-        sizes[i] = a["dimensions"]  # [w, h, l]
+        R_norm = _normalize_pca_rotation(a["R_cam"])
+        R_align, dims_align = _align_frame(
+            R_norm, a["dimensions"]
+        )
+        rotations[i] = R_align
+        sizes[i] = dims_align
 
     pkl = {
         "class_ids": class_ids,
