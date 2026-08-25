@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
@@ -35,10 +37,10 @@ def _head(mode, **kwargs):
     return DINO9DCenter2DPoseHead(**head_kwargs)
 
 
-def _forward(head):
+def _forward(head, **kwargs):
     hidden = torch.zeros(1, 1, 2, 8)
     references = [torch.full((1, 2, 4), 0.5)]
-    return head(hidden, references)
+    return head(hidden, references, **kwargs)
 
 
 def test_cop_prediction_mode_rejects_unknown_value():
@@ -150,6 +152,42 @@ def test_distillation_attributes_reject_unknown_value():
         _head("chain", distill_attributes=("unknown",))
 
 
+class _FailDistillationTeacher(nn.Module):
+    def forward(self, *_args, **_kwargs):
+        raise RuntimeError("distillation teacher was called")
+
+
+def test_distillation_teacher_is_skipped_by_normal_forward():
+    head = _head("chain")
+    head.distillation_teacher = _FailDistillationTeacher()
+
+    outputs = _forward(head)
+
+    assert head._last_distillation_targets == {}
+    assert head._last_distillation_scores is None
+    with pytest.raises(RuntimeError, match="targets are unavailable"):
+        head._distillation_losses(outputs, dn_meta=None)
+    with pytest.raises(RuntimeError, match="distillation teacher was called"):
+        _forward(head, compute_distillation_targets=True)
+
+    hidden = torch.zeros(1, 1, 2, 8)
+    references = [torch.full((1, 2, 4), 0.5)]
+    sample = SimpleNamespace(metainfo={}, gt_instances=None)
+    with pytest.raises(RuntimeError, match="distillation teacher was called"):
+        head.loss(
+            hidden,
+            references,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            batch_data_samples=[sample],
+            dn_meta=None,
+        )
+
+
 def test_frozen_teacher_adapters_emit_cumulative_targets(tmp_path):
     obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
     head = _head(
@@ -160,7 +198,7 @@ def test_frozen_teacher_adapters_emit_cumulative_targets(tmp_path):
         distill_loss_weights=dict(center=2.0, z=3.0, size=4.0),
     )
 
-    outputs = _forward(head)
+    outputs = _forward(head, compute_distillation_targets=True)
 
     assert set(head._last_distillation_targets) == {"center", "z", "size"}
     assert head._last_distillation_scores.shape == (1, 1, 2)
@@ -198,7 +236,7 @@ def test_pose_center_teacher_matches_checkpoint_initialized_student(tmp_path):
     }
     head.load_state_dict(head_state, strict=False)
 
-    outputs = _forward(head)
+    outputs = _forward(head, compute_distillation_targets=True)
 
     assert head.distillation_teacher_report["center"]["source"] == (
         "frozen_pose_center_head"
@@ -238,7 +276,7 @@ def test_center_distillation_masks_teacher_below_confidence_threshold(tmp_path):
         pose_teacher_checkpoint=pose_path,
         distill_score_threshold=0.9,
     )
-    outputs = _forward(head)
+    outputs = _forward(head, compute_distillation_targets=True)
     losses = head._distillation_losses(outputs, dn_meta=None)
     assert losses["loss_distill_center"].item() == 0.0
 
@@ -425,6 +463,27 @@ def test_main_curriculum_uses_safe_pose_center_teacher_and_keeps_obb_ablation():
         "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb_adapter_ablation.py"
     )
     assert ablation.model.bbox_head.center_teacher_source == "obb_adapter"
+
+
+def test_stage4_inference_config_has_no_teacher_checkpoint_dependency():
+    from yopo.registry import MODELS
+    from yopo.utils import register_all_modules
+
+    register_all_modules()
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage4_inference.py"
+    )
+    assert tuple(cfg.model.bbox_head.distill_attributes) == ()
+    assert cfg.model.bbox_head.obb_center_teacher_checkpoint is None
+    assert cfg.model.bbox_head.pose_teacher_checkpoint is None
+
+    model = MODELS.build(cfg.model)
+    assert model.bbox_head.distillation_teacher is None
+    assert model.bbox_head.cop_prediction_mode == "chain"
+    assert tuple(model.bbox_head.cop_chain_order) == (
+        "z", "size", "rotation"
+    )
 
 
 def test_chain_encoder_pose_disable_requires_explicit_2d_assigner():

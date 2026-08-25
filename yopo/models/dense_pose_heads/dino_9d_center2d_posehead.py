@@ -375,7 +375,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
     def forward(self, hidden_states: Tensor,
                 references: List[Tensor],
                 batch_img_metas=None,
-                depth_features=None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+                depth_features=None,
+                compute_distillation_targets: bool = False
+                ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Forward function for 9D pose estimation with separate centers_2d and z."""
         all_layers_outputs_classes = []
         all_layers_outputs_coords = []
@@ -526,7 +528,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             self.last_depth_context_shape = None
             self.last_dense_input_shape = None
 
-        if self.distillation_teacher is not None:
+        if (compute_distillation_targets and
+                self.distillation_teacher is not None):
             (self._last_distillation_targets,
              self._last_distillation_scores) = self.distillation_teacher(
                  hidden_states, references, all_layers_outputs_coords)
@@ -544,6 +547,11 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                              dn_meta: Dict[str, int]) -> Dict[str, Tensor]:
         if self.distillation_teacher is None:
             return {}
+        if (not self._last_distillation_targets or
+                self._last_distillation_scores is None):
+            raise RuntimeError(
+                'distillation targets are unavailable; generate them with '
+                'compute_distillation_targets=True through the loss path')
         student_outputs = {
             'center': outs[2],
             'z': outs[3],
@@ -573,7 +581,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             batch_gt_instances.append(data_sample.gt_instances)
 
         outs = self(
-            hidden_states, references, depth_features=depth_features)
+            hidden_states,
+            references,
+            depth_features=depth_features,
+            compute_distillation_targets=True)
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               enc_outputs_centers_2d, enc_outputs_z,
                               enc_outputs_rotation, enc_outputs_size,
