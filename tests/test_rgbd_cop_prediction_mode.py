@@ -311,6 +311,45 @@ def test_depth_query_sampler_preserves_layer_batch_query_shape_and_is_spatial():
     assert not torch.allclose(contexts[0, 0, 0], contexts[0, 0, 1])
 
 
+def test_depth_query_sampler_vectorizes_decoder_layers(monkeypatch):
+    from yopo.models.dense_pose_heads import depth_query_context
+
+    torch.manual_seed(11)
+    sampler = MultiScaleDepthQuerySampler(
+        embed_dims=8, num_levels=3, roi_size=3
+    )
+    depth_features = [
+        torch.randn(2, 8, height, width, requires_grad=True)
+        for height, width in ((8, 10), (4, 5), (2, 3))
+    ]
+    boxes = torch.rand(4, 2, 5, 4)
+    expected = torch.stack([
+        sampler(depth_features, layer_boxes) for layer_boxes in boxes
+    ])
+
+    original_grid_sample = depth_query_context.F.grid_sample
+    call_count = 0
+
+    def counted_grid_sample(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_grid_sample(*args, **kwargs)
+
+    monkeypatch.setattr(
+        depth_query_context.F, "grid_sample", counted_grid_sample)
+    actual = sampler.forward_layers(depth_features, boxes)
+
+    assert call_count == 3
+    assert actual.shape == expected.shape
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-5)
+    assert actual.is_contiguous()
+    sampler.vectorize_layers = False
+    fallback = sampler.forward_layers(depth_features, boxes)
+    assert torch.allclose(fallback, expected, atol=1e-6, rtol=1e-5)
+    actual.sum().backward()
+    assert all(feature.grad is not None for feature in depth_features)
+
+
 def test_cop_stage_fusion_modes_validate_depth_and_keep_query_shape():
     current = torch.randn(2, 5, 8)
     original = torch.randn(2, 5, 8)
@@ -366,10 +405,12 @@ def test_curriculum_depth_context_is_enabled_from_depth_stage():
     for filename, mode in expected_modes.items():
         cfg = Config.fromfile(f"configs/yopo/{filename}")
         assert cfg.model.bbox_head.cop_fusion_mode == mode
+        assert cfg.model.bbox_head.cop_depth_context.vectorize_layers is True
     standalone = Config.fromfile(
         "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_depth_size_rotation.py"
     )
     assert standalone.model.bbox_head.cop_fusion_mode == "depth_dense"
+    assert standalone.model.bbox_head.cop_depth_context.vectorize_layers is True
 
 
 def test_main_curriculum_uses_safe_pose_center_teacher_and_keeps_obb_ablation():

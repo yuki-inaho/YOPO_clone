@@ -18,7 +18,8 @@ class MultiScaleDepthQuerySampler(nn.Module):
     def __init__(self,
                  embed_dims: int = 256,
                  num_levels: int = 3,
-                 roi_size: int = 3) -> None:
+                 roi_size: int = 3,
+                 vectorize_layers: bool = True) -> None:
         super().__init__()
         if roi_size < 1 or roi_size % 2 == 0:
             raise ValueError(
@@ -28,6 +29,7 @@ class MultiScaleDepthQuerySampler(nn.Module):
         self.embed_dims = embed_dims
         self.num_levels = num_levels
         self.roi_size = roi_size
+        self.vectorize_layers = bool(vectorize_layers)
         self.output_projection = nn.Sequential(
             nn.Linear(embed_dims * num_levels, embed_dims),
             nn.LayerNorm(embed_dims),
@@ -105,9 +107,21 @@ class MultiScaleDepthQuerySampler(nn.Module):
             raise ValueError(
                 'layer boxes must have shape [L,B,Q,4], got '
                 f'{tuple(boxes.shape)}')
-        return torch.stack([
-            self(depth_features, layer_boxes) for layer_boxes in boxes
-        ])
+        if not self.vectorize_layers:
+            return torch.stack([
+                self(depth_features, layer_boxes) for layer_boxes in boxes
+            ])
+        num_layers, batch_size, num_queries, _ = boxes.shape
+        # Grid sampling is independent for each query. Fold the decoder layer
+        # axis into the query axis so every depth level needs one grid_sample
+        # call instead of one call per level and decoder layer. The feature
+        # maps stay [B,C,H,W] and are therefore never replicated L times.
+        flattened_boxes = boxes.permute(1, 0, 2, 3).reshape(
+            batch_size, num_layers * num_queries, 4)
+        contexts = self(depth_features, flattened_boxes)
+        return contexts.reshape(
+            batch_size, num_layers, num_queries, self.embed_dims
+        ).permute(1, 0, 2, 3).contiguous()
 
 
 class CoPStageFusion(nn.Module):

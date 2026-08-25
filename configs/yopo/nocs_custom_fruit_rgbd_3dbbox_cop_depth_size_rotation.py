@@ -13,7 +13,8 @@ model = dict(
         cop_chain_order=("z", "size", "rotation"),
         cop_use_bbox_conditioning=True,
         cop_fusion_mode="depth_dense",
-        cop_depth_context=dict(num_levels=3, roi_size=3),
+        cop_depth_context=dict(
+            num_levels=3, roi_size=3, vectorize_layers=True),
         cop_encoder_pose_supervision=False,
         test_cfg=dict(max_per_img=max_objects),
     ),

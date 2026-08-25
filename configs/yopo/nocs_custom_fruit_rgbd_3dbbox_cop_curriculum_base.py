@@ -25,7 +25,8 @@ model = dict(
         # Stage 1 has no 3D supervision yet.  The later stages switch this to
         # depth_dense and enable the explicit pre-fusion depth query.
         cop_fusion_mode="query_dense",
-        cop_depth_context=dict(num_levels=3, roi_size=3),
+        cop_depth_context=dict(
+            num_levels=3, roi_size=3, vectorize_layers=True),
         cop_encoder_pose_supervision=False,
         distill_attributes=(),
         # The head-only OBB adapter is retained as an explicit ablation but is
