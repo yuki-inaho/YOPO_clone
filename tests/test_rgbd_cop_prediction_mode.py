@@ -49,6 +49,37 @@ def test_cop_prediction_mode_rejects_unknown_value():
         _head("unknown")
 
 
+def test_auxiliary_loss_weights_are_configurable_and_validated():
+    legacy = _head("auxiliary")
+    balanced = _head(
+        "auxiliary",
+        cop_aux_loss_weights=dict(z=1.0, size=1.0, rotation=1.0),
+    )
+
+    assert legacy.cop_loss_weights == {
+        "z": 1.0,
+        "size": 3.0,
+        "rotation": 2.0,
+    }
+    assert balanced.cop_loss_weights == {
+        "z": 1.0,
+        "size": 1.0,
+        "rotation": 1.0,
+    }
+    with pytest.raises(ValueError, match="cop_aux_loss_weights"):
+        _head("auxiliary", cop_aux_loss_weights=dict(z=1.0, size=1.0))
+    with pytest.raises(ValueError, match="non-negative"):
+        _head(
+            "auxiliary",
+            cop_aux_loss_weights=dict(z=1.0, size=-1.0, rotation=1.0),
+        )
+    with pytest.raises(ValueError, match="finite"):
+        _head(
+            "auxiliary",
+            cop_aux_loss_weights=dict(z=float("nan"), size=1.0, rotation=1.0),
+        )
+
+
 def test_chain_mode_routes_chain_pose_to_primary_outputs():
     head = _head("chain")
     head.init_weights()
@@ -781,6 +812,52 @@ def test_curriculum_configs_are_chain_only_then_parallel_control():
     assert tuple(parallel.model.bbox_head.distill_attributes) == ()
 
 
+def test_joint_dual_path_config_trains_balanced_cop_and_parallel_heads():
+    cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_dual_pose_joint.py"
+    )
+    head = cfg.model.bbox_head
+
+    assert head.cop_prediction_mode == "auxiliary"
+    assert head.cop_encoder_pose_supervision is True
+    assert dict(head.cop_aux_loss_weights) == {
+        "z": 1.0,
+        "size": 1.0,
+        "rotation": 1.0,
+    }
+    assert tuple(head.distill_attributes) == ()
+    assert head.pose_teacher_checkpoint is None
+    assert head.loss_z.loss_weight == pytest.approx(25.0)
+    assert head.loss_sizes.loss_weight == pytest.approx(25.0)
+    assert head.loss_rotation.loss_weight == pytest.approx(2.5)
+    assert [cost.type for cost in cfg.model.train_cfg.assigner.match_costs] == [
+        "FocalLossCost",
+        "BBoxL1Cost",
+        "IoUCost",
+    ]
+    keys = cfg.optim_wrapper.paramwise_cfg.custom_keys
+    for name in (
+        "bbox_head.reg_z_branch",
+        "bbox_head.reg_size_branch",
+        "bbox_head.reg_rotation_branch",
+    ):
+        assert keys[name].lr_mult == pytest.approx(50.0)
+    assert keys["bbox_head.cop_"].lr_mult == pytest.approx(1.0)
+    assert keys["bbox_head.depth_query_sampler"].lr_mult == pytest.approx(1.0)
+
+    parallel = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_dual_pose_joint_parallel_inference.py"
+    )
+    cop = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_dual_pose_joint_cop_inference.py"
+    )
+    assert parallel.model.bbox_head.cop_prediction_mode == "auxiliary"
+    assert cop.model.bbox_head.cop_prediction_mode == "chain"
+    assert parallel.load_from is None
+    assert cop.load_from is None
+
+
 def test_q150_3d_curriculum_starts_from_2d_foundation_and_boosts_only_cop():
     expected = {
         "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage2_z.py": (
@@ -1196,6 +1273,7 @@ def test_encoder_loss_keys_follow_chain_and_parallel_supervision_modes():
         head.loss_by_feat_simple = lambda *_args, **_kwargs: {}
 
         def fake_loss_by_feat_single(cls_score, *_args, **_kwargs):
+            assert _kwargs["obb_aux_supervision"] is False
             zero = cls_score.sum() * 0
             return (zero,) * 12
 

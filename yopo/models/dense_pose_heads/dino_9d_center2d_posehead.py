@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
+import math
 from typing import Dict, List, Tuple
 
 import torch
@@ -222,6 +223,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             use_cop_chain: bool = False,
             cop_prediction_mode: str = None,
             cop_chain_order: Tuple[str, str, str] = ('size', 'rotation', 'z'),
+            cop_aux_loss_weights: ConfigType = None,
             cop_use_bbox_conditioning: bool = False,
             cop_fusion_mode: str = 'residual',
             cop_depth_context: ConfigType = None,
@@ -331,8 +333,25 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.last_depth_context_shape = None
         self.last_dense_input_shape = None
         if self.use_cop_chain:
-            self.cop_loss_weights = dict(
+            default_cop_loss_weights = dict(
                 size=3.0, rotation=2.0, z=1.0)
+            configured_cop_loss_weights = (
+                default_cop_loss_weights
+                if cop_aux_loss_weights is None
+                else dict(cop_aux_loss_weights))
+            if set(configured_cop_loss_weights) != expected_attributes:
+                raise ValueError(
+                    'cop_aux_loss_weights must contain z, size, and rotation '
+                    'exactly once')
+            if any(not math.isfinite(float(weight)) or float(weight) < 0.0
+                   for weight in configured_cop_loss_weights.values()):
+                raise ValueError(
+                    'cop_aux_loss_weights values must be finite and '
+                    'non-negative')
+            self.cop_loss_weights = {
+                attribute: float(configured_cop_loss_weights[attribute])
+                for attribute in ('z', 'size', 'rotation')
+            }
 
         self.distill_attributes = \
             StagedDistillationTeacher.validate_attributes(
@@ -1054,6 +1073,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                                        batch_img_metas=batch_img_metas,
                                        pose_supervision=(
                                            encoder_pose_supervision),
+                                       obb_aux_supervision=False,
                                        assigner=(
                                            self.encoder_assigner))
             loss_dict['enc_loss_cls'] = enc_loss_cls
@@ -1396,6 +1416,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                            batch_gt_instances: InstanceList,
                            batch_img_metas: List[dict],
                            pose_supervision: bool = True,
+                           obb_aux_supervision: bool = True,
                            assigner=None) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer."""
         if not pose_supervision:
@@ -1546,7 +1567,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         else:
             loss_projection = z_preds.new_tensor(0.0)
 
-        if self.loss_obb_aux is not None:
+        if self.loss_obb_aux is not None and obb_aux_supervision:
             if obb_aux_preds is None:
                 raise RuntimeError('loss_obb_aux requires OBB predictions')
             normalized_obb_targets = obb_gaussian_targets.clone()

@@ -248,7 +248,13 @@ def main() -> None:
         panel_2d = image.copy()
         panel_3d = image.copy()
         intrinsic = intrinsic_matrix(prediction["intrinsic"])
-        pred_obbs = _array(pred["obb_gaussians"])
+        # All-predictions mode intentionally omits query OBB ellipses because
+        # unmatched/background OBBs are not supervised.  Keep ordinary
+        # teacher-free dumps usable in that mode; matched rendering still
+        # requires the explicit diagnostic OBB output.
+        pred_obbs = (
+            None if args.all_predictions else _array(pred["obb_gaussians"])
+        )
         pred_scores = _array(pred["scores"])
         pred_sizes = _array(pred["sizes"])
         pred_transforms = _array(pred["T"])
