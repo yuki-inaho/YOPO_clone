@@ -16,6 +16,7 @@ pose_teacher_checkpoint = (
 )
 
 model = dict(
+    data_preprocessor=dict(non_blocking=True),
     num_queries=max_objects,
     test_cfg=dict(max_per_img=max_objects),
     bbox_head=dict(
@@ -56,6 +57,12 @@ model = dict(
         ),
     ),
 )
+
+# Pin host batches and let the data preprocessor enqueue asynchronous H2D
+# copies. These two settings are intentionally paired; either can be disabled
+# with a config override during the real-GPU quality gate.
+train_dataloader = dict(pin_memory=True)
+val_dataloader = dict(pin_memory=True)
 
 resume = False
 train_cfg = dict(max_epochs=stage_epochs, val_interval=stage_epochs)

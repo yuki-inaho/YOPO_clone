@@ -451,6 +451,24 @@ def test_curriculum_depth_context_is_enabled_from_depth_stage():
     assert standalone.model.bbox_head.cop_depth_context.vectorize_layers is True
 
 
+def test_curriculum_pairs_pinned_batches_with_nonblocking_transfers():
+    cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage4_full.py"
+    )
+    assert cfg.train_dataloader.pin_memory is True
+    assert cfg.val_dataloader.pin_memory is True
+    assert cfg.model.data_preprocessor.non_blocking is True
+
+    cfg.merge_from_dict({
+        "train_dataloader.pin_memory": False,
+        "val_dataloader.pin_memory": False,
+        "model.data_preprocessor.non_blocking": False,
+    })
+    assert cfg.train_dataloader.pin_memory is False
+    assert cfg.val_dataloader.pin_memory is False
+    assert cfg.model.data_preprocessor.non_blocking is False
+
+
 def test_main_curriculum_uses_safe_pose_center_teacher_and_keeps_obb_ablation():
     stage1 = Config.fromfile(
         "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py"
