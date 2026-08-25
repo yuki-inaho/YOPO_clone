@@ -177,10 +177,10 @@ MMEngine safe-global登録helperを適用した。
 - [x] 🛠 **エラー時対処**: 表示が混雑する場合もcoverage証跡は保持し、用途別表示はthreshold/max-detsをCLIで変更する。
 
 ### 手順 12: 回帰test・Git・hashを監査する
-- [ ] 🖐 **操作**: 対象pytest/ruffを実行し、tracked差分だけをcommitして`origin/rgb-d`へpushする。
-- [ ] 🔎 **確認**: test/lint成功、dataset/checkpoint/work_dirsをcommitしていない、local HEADとoriginが一致する。
-- [ ] 🧪 **テスト**: `uv run pytest -q tests/test_dota_obb_dataset.py`と関連OBB test、`uv run ruff check`を実行する。
-- [ ] 🛠 **エラー時対処**: unrelated user変更はstageせず、push競合時はfetch後に履歴を確認して非破壊的に解決する。
+- [x] 🖐 **操作**: 対象pytest/ruffを実行し、tracked差分だけをcommitして`origin/rgb-d`へpushする。
+- [x] 🔎 **確認**: test/lint成功、dataset/checkpoint/work_dirsをcommitしていない、local HEADとoriginが一致する。
+- [x] 🧪 **テスト**: `uv run pytest -q tests/test_dota_obb_dataset.py`と関連OBB test、`uv run ruff check`を実行する。
+- [x] 🛠 **エラー時対処**: HTTPS pushの非対話認証失敗後、originのpush URLだけを既存SSH認証へ戻して再実行した。
 
 ---
 
@@ -224,7 +224,7 @@ uv run python tools/test.py \
 - [x] 観点3（SG-3/TR-2/3）: RGB-onlyかつRotated IoU→GWDのscope/load順がconfigとdocsで一致。
 - [x] 観点4（SG-4/TR-4/5）: batch 32でfinite/OOMなし、mAP50が0.0732から0.0960へ改善。
 - [x] 観点5（SG-5/TR-6）: checkpoint/prediction/PNG/manifest/hash/再実行コマンドが記録済み。
-- [ ] 観点6（SG-5/TR-6）: 最終回帰test・lint・commit・pushが完了しoriginと一致。
+- [x] 観点6（SG-5/TR-6）: 最終回帰test・lint・commit・pushが完了しoriginと一致。
 
 ---
 
@@ -254,3 +254,6 @@ uv run python tools/test.py \
 | 2026-08-25 | 19:15 JST | Codex | 可視化初回失敗 | PyTorch weights-onlyで`HistoryBuffer`未allowlist。可視化CLIへ既存safe-global helperを追加。 |
 | 2026-08-25 | 19:16 JST | Codex | 可視化再実行 | score 0.05、最大150で6 PNGとmanifest生成。1枚を原寸目視し、画像座標でOBBが描かれることを確認。 |
 | 2026-08-25 | 19:16 JST | Codex | workdoc作成開始 | `write-workdoc-uv`のtemplate、repository/justfile/uv構成を確認し、本書へ証跡を集約。 |
+| 2026-08-25 | 19:20 JST | Codex | validation結果画像を追加 | ユーザー確認用にscore 0.20版を6枚生成。先頭画像は82 predictionsで、coverage向上とfalse positive残存を原寸表示して報告。manifest SHA-256は`7d1d027f...05e6`。 |
+| 2026-08-25 | 19:21 JST | Codex | 最終回帰・品質gate | loader/query expansion/projected GWDの22 testsがpassed。変更Python 9 filesの`ruff check`もAll checks passed、`git diff --check`成功。 |
+| 2026-08-25 | 19:22 JST | Codex | implementation commit/push | commit `bd3abc9`（`feat: add reusable corrected DOTA OBB curriculum`）。初回HTTPS pushはusername非対話読込不能で失敗し、push URLのみSSHへ戻して`origin/rgb-d`へpush成功。 |
