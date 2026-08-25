@@ -636,6 +636,7 @@ class Pack9DPoseInputs(Pack6DPoseInputs):
         'size': 'sizes',
         'translation': 'translations',
         'center_2d': 'centers_2d',
+        'obb_gaussian': 'obb_gaussians',
         'T': 'T',
         'z': 'z'
     }

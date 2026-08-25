@@ -430,6 +430,41 @@ class RandomTranslatePixels(BaseTransform):
                f'filter_thr_px={self.filter_thr_px})'
 
 @TRANSFORMS.register_module()
+class ResizeOBBGaussians(BaseTransform):
+    """Apply the current image resize affine map to OBB Gaussians.
+
+    This transform must run immediately after the image/bbox ``Resize``. The
+    compact Gaussian layout is ``(cx, cy, covariance_xx, covariance_xy,
+    covariance_yy)``.
+    """
+
+    def transform(self, results: dict) -> dict:
+        if 'obb_gaussian' not in results:
+            return results
+        if 'scale_factor' not in results:
+            raise KeyError(
+                'ResizeOBBGaussians requires scale_factor from Resize')
+        scale_factor = np.asarray(results['scale_factor'], dtype=np.float32)
+        if scale_factor.size < 2:
+            raise ValueError(
+                f'scale_factor must contain x/y scales, got {scale_factor}')
+        scale_x, scale_y = float(scale_factor[0]), float(scale_factor[1])
+        gaussians = np.asarray(
+            results['obb_gaussian'], dtype=np.float32).copy()
+        if gaussians.ndim != 2 or gaussians.shape[1] != 5:
+            raise ValueError(
+                'obb_gaussian must have shape (N, 5), got '
+                f'{gaussians.shape}')
+        gaussians[:, 0] *= scale_x
+        gaussians[:, 1] *= scale_y
+        gaussians[:, 2] *= scale_x * scale_x
+        gaussians[:, 3] *= scale_x * scale_y
+        gaussians[:, 4] *= scale_y * scale_y
+        results['obb_gaussian'] = gaussians
+        return results
+
+
+@TRANSFORMS.register_module()
 class RandomFlipFor9DPose(BaseTransform):
     """Flip the image and 9D pose annotations.
 
@@ -524,6 +559,13 @@ class RandomFlipFor9DPose(BaseTransform):
         # flip center_2d
         if 'center_2d' in results and len(results['center_2d']) > 0:
             results['center_2d'][:, 0] = img_w - 1 - results['center_2d'][:, 0]
+
+        # Reflect the OBB Gaussian. F=diag(-1, 1) preserves xx/yy and
+        # negates only the xy covariance, avoiding angle-wrap conventions.
+        if 'obb_gaussian' in results and len(results['obb_gaussian']) > 0:
+            results['obb_gaussian'][:, 0] = (
+                img_w - 1 - results['obb_gaussian'][:, 0])
+            results['obb_gaussian'][:, 3] *= -1
 
         # flip T (4x4 transformation matrix)
         if 'T' in results and len(results['T']) > 0:
@@ -892,4 +934,3 @@ class PadAndResizeForPoseTest(Resize):
     def __repr__(self) -> str:
         repr_str = super().__repr__()
         return repr_str
-

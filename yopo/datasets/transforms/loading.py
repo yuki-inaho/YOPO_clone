@@ -1157,10 +1157,12 @@ class Load9DPoseAnnotations(LoadPoseAnnotations):
     def __init__(self,*args, 
                 with_centers_2d: bool = False,
                 with_z: bool = False,
+                with_obb_gaussian: bool = False,
                 **kwargs):
         super(Load9DPoseAnnotations, self).__init__(*args, **kwargs)
         self.with_centers_2d = with_centers_2d
         self.with_z = with_z
+        self.with_obb_gaussian = with_obb_gaussian
 
     def _load_pose(self, results: dict) -> None:
         """Private function to load mask and semantic segmentation annotations.
@@ -1214,6 +1216,11 @@ class Load9DPoseAnnotations(LoadPoseAnnotations):
         if len(gt_handle_visibilities) > 0:
             results['gt_handle_visibility'] = np.array(
                 gt_handle_visibilities, dtype=np.float32).reshape(n, -1)
+        if self.with_obb_gaussian:
+            results['obb_gaussian'] = np.asarray(
+                [instance['obb_gaussian'] for instance in instances],
+                dtype=np.float32,
+            ).reshape(n, 5)
 
 @TRANSFORMS.register_module()
 class LoadDepthImageFromFile(BaseTransform):

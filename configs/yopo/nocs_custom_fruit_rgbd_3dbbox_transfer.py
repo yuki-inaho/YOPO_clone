@@ -9,6 +9,7 @@ custom_imports = dict(
         "yopo.models.backbones.frozen_rgbd",
         "yopo.engine.hooks.rgb_backbone_transfer",
         "yopo.models.losses.stable_rotation",
+        "yopo.models.losses.projected_ellipsoid_loss",
     ],
     allow_failed_imports=False,
 )
@@ -24,9 +25,16 @@ scale = (640, 480)
 train_pipeline = [
     dict(type="LoadImageFromFile", backend_args=backend_args),
     dict(type="LoadRawDepthImageWithValidMask"),
-    dict(type="Load9DPoseAnnotations", with_bbox=True, with_centers_2d=True, with_z=True),
+    dict(
+        type="Load9DPoseAnnotations",
+        with_bbox=True,
+        with_centers_2d=True,
+        with_z=True,
+        with_obb_gaussian=True,
+    ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
     dict(type="Resize", scale=scale, keep_ratio=True),
+    dict(type="ResizeOBBGaussians"),
     dict(type="RandomFlipFor9DPose", prob=0.5),
     dict(type="FilterAnnotations", min_gt_bbox_wh=(1e-2, 1e-2)),
     dict(type="Pack9DPoseInputs"),
@@ -35,9 +43,16 @@ train_pipeline = [
 val_pipeline = [
     dict(type="LoadImageFromFile", backend_args=backend_args),
     dict(type="LoadRawDepthImageWithValidMask"),
-    dict(type="Load9DPoseAnnotations", with_bbox=True, with_centers_2d=True, with_z=True),
+    dict(
+        type="Load9DPoseAnnotations",
+        with_bbox=True,
+        with_centers_2d=True,
+        with_z=True,
+        with_obb_gaussian=True,
+    ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
     dict(type="Resize", scale=scale, keep_ratio=True),
+    dict(type="ResizeOBBGaussians"),
     dict(
         type="Pack9DPoseInputs",
         meta_keys=(
@@ -57,6 +72,7 @@ train_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         split="real_train",
+        obb_coordinate_scale=0.8,
         intrinsic=custom_intrinsic,
         pipeline=train_pipeline,
         backend_args=backend_args,
@@ -74,6 +90,7 @@ val_dataloader = dict(
         type=dataset_type,
         data_root=data_root,
         split="custom_val",
+        obb_coordinate_scale=0.8,
         intrinsic=custom_intrinsic,
         pipeline=val_pipeline,
         backend_args=backend_args,

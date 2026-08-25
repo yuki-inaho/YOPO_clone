@@ -1,10 +1,9 @@
 # ============================================================================
-# YOPO — uv / cu121 (torch 2.4.0 + cu121, mmcv 2.2.0) workflow.
+# YOPO — uv / RTX 5090 cu128 (torch 2.8.0 + cu128, mmcv 2.2.0) workflow.
 #
-# End goal: category-level 9D pose training AND inference progress on a CUDA 12
-# GPU under a repo-local uv venv. Mirrors the inaho_repos OpenMMLab-on-uv
-# pattern: package=false, torch from the pinned cu121 index, mmcv as the
-# prebuilt cu121 2.2.0 manylinux wheel, numpy<2, and the `yopo` package made
+# End goal: category-level 9D pose training AND inference progress on an RTX
+# 5090 under a repo-local uv venv. The active project uses cu128 Torch and the
+# prebuilt sm_120 MMCV wheel, numpy<2, and the `yopo` package made
 # importable develop-style via a .pth (it is a renamed MMDetection fork, not a
 # pip-installed package).
 # ============================================================================
@@ -28,21 +27,21 @@ list:
 check-venv:
     @if [ ! -x "{{ PYTHON_EXEC }}" ]; then \
         echo "Error: usable Python not found at {{ PYTHON_EXEC }}."; \
-        echo "Provision the cu121 venv with: just sync"; \
+        echo "Provision the RTX 5090 / cu128 venv with: just sync"; \
         exit 1; \
     fi
 
 # Full one-time setup: deps + `yopo` on the import path. Run once after cloning.
 setup: sync
-    @echo "cu121 setup complete. Try: just env-doctor"
+    @echo "RTX 5090 / cu128 setup complete. Try: just env-doctor"
 
-# Provision the cu121 venv from pyproject.toml and put the `yopo` package (the
-# repo root) on the venv import path via a .pth, develop-style. mmcv is the
-# prebuilt cu121 2.2.0 manylinux wheel; mmengine comes from PyPI.
+# Provision the RTX 5090 / cu128 venv from pyproject.toml and put the `yopo`
+# package (the repo root) on the venv import path via a .pth, develop-style.
+# mmcv is the prebuilt sm_120 wheel; mmengine comes from PyPI.
 sync:
     uv sync
     printf '%s\n' "{{ invocation_directory() }}" > "{{ SITE_PACKAGES }}/_yopo_src.pth"
-    @echo "cu121 deps synced; yopo package on import path (.pth)."
+    @echo "RTX 5090 / cu128 deps synced; yopo package on import path (.pth)."
 
 # Read-only environment triage: Python, package imports, GPU.
 env-doctor: check-venv

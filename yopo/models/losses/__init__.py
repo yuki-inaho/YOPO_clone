@@ -10,6 +10,7 @@ from .dice_loss import DiceLoss
 from .eqlv2_loss import EQLV2Loss
 from .focal_loss import FocalCustomLoss, FocalLoss, sigmoid_focal_loss
 from .gaussian_dist_loss import GDLoss
+from .projected_ellipsoid_loss import GaussianGWDLoss, ProjectedEllipsoidGWDLoss
 from .gaussian_focal_loss import GaussianFocalLoss
 from .gfocal_loss import DistributionFocalLoss, QualityFocalLoss
 from .ghm_loss import GHMC, GHMR
@@ -44,4 +45,5 @@ __all__ = [
     'MarginL2Loss', 'MultiPosCrossEntropyLoss', 'L2Loss', 'TripletLoss',
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
     'ADDLoss', 'PositionalFocalLoss', 'RotatedIoULoss', 'GDLoss',
+    'GaussianGWDLoss', 'ProjectedEllipsoidGWDLoss',
 ]

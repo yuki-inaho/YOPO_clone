@@ -7,7 +7,8 @@ from mmengine.config import Config, DictAction
 from mmengine.registry import RUNNERS
 from mmengine.runner import Runner
 
-from yopo.utils import setup_cache_size_limit_of_dynamo
+from yopo.utils import (register_mmengine_checkpoint_safe_globals,
+                        setup_cache_size_limit_of_dynamo)
 
 
 def parse_args():
@@ -63,6 +64,7 @@ def main():
     # Reduce the number of repeated compilations and improve
     # training speed.
     setup_cache_size_limit_of_dynamo()
+    register_mmengine_checkpoint_safe_globals()
 
     # load config
     cfg = Config.fromfile(args.config)

@@ -38,23 +38,25 @@ Current YOPO entry points are in:
 |---|---|---:|---:|---:|---|
 | YOPO Swin-L | [file](configs/yopo/housecat6d_yopo_swinl.py) | 71.3 | 34.8 | 33.3 | [link](https://github.com/pitin-ev/YOPO/releases/download/v1.0.0/housecat6d_yopo_swinl.pth) |
 
-## Quickstart (uv + cu121)
+## Quickstart (uv + RTX 5090 / cu128)
 
-The recommended setup uses **uv** with a repo-local venv and the cu121 stack.
-No Docker required.
+The `rgb-d` branch uses **uv** with a repo-local Python 3.10 venv, PyTorch
+2.8.0 + CUDA 12.8, and the prebuilt `sm_120` MMCV CUDA-ops wheel for RTX 5090.
+No Docker or local MMCV source build is required.
 
 ```bash
-# Clone and switch to the cu121 branch
-git clone git@github.com:yuki-inaho/YOPO.git
-cd YOPO
-git checkout cu121
+# Clone and switch to the RGB-D branch
+git clone https://github.com/yuki-inaho/YOPO_clone.git
+cd YOPO_clone
+git checkout rgb-d
 
 # One-time setup
 just setup
 
 # Verify the environment
 just env-doctor
-# Expected: torch 2.4.0+cu121 / mmcv 2.2.0 / mmengine 0.10.7 / cuda_available True
+# Expected: torch 2.8.0+cu128 / mmcv 2.2.0 / mmengine 0.10.7 /
+#           cuda_available True / NVIDIA GeForce RTX 5090
 
 # Generate synthetic data for smoke tests
 just gen-synthetic
@@ -69,8 +71,9 @@ just smoke-train
 just smoke-infer
 ```
 
-See [docs/CU121_TRAINING.md](docs/CU121_TRAINING.md) for full details on the
-stack, smoke configs, known gotchas, and non-goals.
+See [docs/CU128_RTX5090.md](docs/CU128_RTX5090.md) for environment details.
+The legacy L4/cu121 smoke-test guide remains at
+[docs/CU121_TRAINING.md](docs/CU121_TRAINING.md).
 
 ## Environment (Docker)
 

@@ -10,6 +10,7 @@ from mmengine.config import Config
 from mmengine.runner import Runner
 
 from yopo.evaluation import DumpDetResults
+from yopo.utils import register_mmengine_checkpoint_safe_globals
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,6 +24,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    register_mmengine_checkpoint_safe_globals()
     output = Path(args.output)
     if output.suffix not in {".pkl", ".pickle"}:
         raise ValueError(f"output must be .pkl or .pickle, got {output}")

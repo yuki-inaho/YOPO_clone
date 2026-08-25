@@ -1,21 +1,22 @@
 [project]
 name = "yopo"
 version = "3.3.0"
-description = "YOPO: You Only Pose Once — monocular RGB category-level 9D pose (MMDetection-based, uv/cu121 stack)"
+description = "YOPO: You Only Pose Once — RGB-D category-level 9D pose (MMDetection-based, RTX 5090 / CUDA 12.8 stack)"
 readme = "README.md"
 requires-python = ">=3.10,<3.11"
-# cu121 (torch 2.4.0 + cu121) dependency stack, matching YOPO's documented base
-# image `pytorch/pytorch:2.4.0-cuda12.1-cudnn9-devel`.
+# RTX 5090 (sm_120) stack. PyTorch 2.8.0's cu128 wheels provide Blackwell
+# support. MMCV is the prebuilt sm_120 wheel from yuki-inaho/mmcv, compiled
+# against the same Torch/CUDA ABI.
 #
 # The `yopo` package itself is NOT pip-installed (it is the repo root, a renamed
 # MMDetection fork). It is made importable develop-style by `just sync` (a .pth
-# file pointing at the repo root). mmcv is the prebuilt cu121 manylinux 2.2.0
+# file pointing at the repo root). mmcv is the prebuilt RTX 5090 / sm_120 2.2.0
 # wheel (no source build); mmengine comes from PyPI. Because the package is not
 # built, YOPO's own setup.py `install_requires` (requirements/runtime.txt) are
 # NOT applied — so every MMDet/YOPO runtime dep is listed explicitly below.
 dependencies = [
-    "torch==2.4.0",
-    "torchvision==0.19.0",
+    "torch==2.8.0",
+    "torchvision==0.23.0",
     "numpy<2",
     "mmcv==2.2.0",
     "mmengine>=0.7.1,<1.0.0",
@@ -64,15 +65,16 @@ package = false
 
 [tool.uv.sources]
 muon-optimizer = { git = "https://github.com/KellerJordan/Muon.git", rev = "f98f1cacc0263b04290753e32be8d498c1efc806" }
-# Prebuilt mmcv 2.2.0 manylinux wheel for torch 2.4.0 + cu121 (no source build;
-# runs on the L4 sm_89 GPU). From the official OpenMMLab wheel index.
-mmcv = { url = "https://download.openmmlab.com/mmcv/dist/cu121/torch2.4.0/mmcv-2.2.0-cp310-cp310-manylinux1_x86_64.whl" }
-torch = { index = "pytorch-cu121" }
-torchvision = { index = "pytorch-cu121" }
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+# Prebuilt full MMCV (with CUDA ops) for RTX 5090 / sm_120, built against
+# torch 2.8.0 + CUDA 12.8. The specialized wheel avoids an unsupported
+# source build and is required by the RGB-D and rotated-box code paths.
+mmcv = { url = "https://github.com/yuki-inaho/mmcv/releases/download/cu128-wheels-v0.1/mmcv-2.2.0-0sm120t280-cp310-cp310-linux_x86_64.whl" }
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.ruff]

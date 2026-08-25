@@ -7,6 +7,7 @@ from mmengine.config import Config
 
 from yopo.models.dense_pose_heads.dino_9d_center2d_posehead import (
     DINO9DCenter2DPoseHead,
+    compact_gaussian_orientation_descriptor,
 )
 from yopo.models.dense_pose_heads.depth_query_context import (
     CoPStageFusion,
@@ -64,7 +65,7 @@ def test_chain_mode_routes_chain_pose_to_primary_outputs():
     assert torch.all(outputs[3] == 2.0)
     assert torch.all(outputs[4] == 2.0)
     assert torch.all(outputs[5] == 2.0)
-    assert outputs[6:] == (None, None, None)
+    assert outputs[6:] == (None, None, None, None)
     assert head.cop_chain_order == ("z", "size", "rotation")
 
 
@@ -107,6 +108,207 @@ def test_auxiliary_mode_preserves_parallel_primary_and_chain_auxiliary():
     assert torch.all(outputs[8] == 2.0)
 
 
+def test_query_obb_auxiliary_is_spd_and_reaches_rotation_stage():
+    head = _head(
+        "chain",
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=5.0,
+            include_center=False,
+        ),
+    )
+    head.init_weights()
+    hidden = torch.randn(1, 1, 2, 8, requires_grad=True)
+    references = [torch.full((1, 2, 4), 0.5)]
+    outputs = head(hidden, references)
+    compact = outputs[9]
+    sigma = torch.stack(
+        (compact[..., 2], compact[..., 3],
+         compact[..., 3], compact[..., 4]), dim=-1).reshape(*compact.shape[:-1], 2, 2)
+
+    assert compact.shape == (1, 1, 2, 5)
+    assert torch.linalg.eigvalsh(sigma).min() > 0
+    compact[..., 2:].sum().backward()
+    assert hidden.grad is not None and hidden.grad.norm() > 0
+
+
+def test_obb_orientation_descriptor_is_scale_invariant_spin2_encoding():
+    compact = torch.tensor([
+        [0.0, 0.0, 3.0, 0.0, 1.0],
+        [0.0, 0.0, 12.0, 0.0, 4.0],
+        [0.0, 0.0, 2.0, 1.0, 2.0],
+    ])
+
+    descriptor = compact_gaussian_orientation_descriptor(compact)
+
+    assert torch.allclose(descriptor[0], torch.tensor([0.5, 0.0]))
+    assert torch.allclose(descriptor[1], descriptor[0])
+    assert torch.allclose(descriptor[2], torch.tensor([0.0, 0.5]))
+
+
+def test_obb_rotation_conditioning_routes_rotation_gradient_to_obb_predictor():
+    head = _head(
+        "chain",
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=1.0,
+            include_center=False,
+        ),
+        cop_obb_rotation_conditioning=True,
+    )
+    head.init_weights()
+    with torch.no_grad():
+        head.cop_rotation_out[0].weight.fill_(0.1)
+    outputs = _forward(head)
+
+    outputs[4].sum().backward()
+
+    assert any(
+        parameter.grad is not None and parameter.grad.norm() > 0
+        for parameter in head.cop_obb_out.parameters()
+    )
+    assert any(
+        parameter.grad is not None and parameter.grad.norm() > 0
+        for parameter in head.cop_obb_rotation_embed.parameters()
+    )
+
+
+def test_post_rotation_obb_refinement_preserves_legacy_obb_predictor_location():
+    common = dict(
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=1.0,
+            include_center=False,
+        ),
+    )
+    torch.manual_seed(7)
+    legacy = _head("chain", **common)
+    legacy.init_weights()
+    refinement = _head(
+        "chain", cop_obb_rotation_refinement=True, **common)
+    refinement.load_state_dict(legacy.state_dict(), strict=False)
+    with torch.no_grad():
+        refinement.cop_obb_rotation_embed[0].weight.zero_()
+        refinement.cop_obb_rotation_embed[0].bias.zero_()
+
+    legacy_outputs = _forward(legacy)
+    refinement_outputs = _forward(refinement)
+
+    assert torch.equal(legacy_outputs[9], refinement_outputs[9])
+    assert torch.equal(legacy_outputs[4], refinement_outputs[4])
+
+
+def test_post_rotation_obb_refinement_routes_rotation_gradient_to_obb_predictor():
+    head = _head(
+        "chain",
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=1.0,
+            include_center=False,
+        ),
+        cop_obb_rotation_refinement=True,
+    )
+    head.init_weights()
+    with torch.no_grad():
+        head.cop_rotation_out[0].weight.fill_(0.1)
+    outputs = _forward(head)
+
+    outputs[4].sum().backward()
+
+    assert any(
+        parameter.grad is not None and parameter.grad.norm() > 0
+        for parameter in head.cop_obb_out.parameters()
+    )
+
+
+def test_obb_conditioning_and_refinement_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _head(
+            "chain",
+            loss_obb_aux=dict(
+                type="GaussianGWDLoss",
+                loss_weight=1.0,
+                include_center=False,
+            ),
+            cop_obb_rotation_conditioning=True,
+            cop_obb_rotation_refinement=True,
+        )
+
+
+def test_legacy_obb_aux_does_not_route_rotation_gradient_to_obb_predictor():
+    head = _head(
+        "chain",
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=1.0,
+            include_center=False,
+        ),
+    )
+    head.init_weights()
+    outputs = _forward(head)
+
+    outputs[4].sum().backward()
+
+    assert all(parameter.grad is None for parameter in head.cop_obb_out.parameters())
+
+
+def test_obb_rotation_conditioning_requires_obb_loss_and_rotation_last():
+    with pytest.raises(ValueError, match="requires loss_obb_aux"):
+        _head("chain", cop_obb_rotation_conditioning=True)
+    with pytest.raises(ValueError, match="rotation to be the final"):
+        _head(
+            "chain",
+            cop_chain_order=("z", "rotation", "size"),
+            loss_obb_aux=dict(
+                type="GaussianGWDLoss",
+                loss_weight=1.0,
+                include_center=False,
+            ),
+            cop_obb_rotation_conditioning=True,
+        )
+
+
+def test_obb_diagnostic_predictions_are_opt_in_and_spd():
+    common = dict(
+        loss_obb_aux=dict(
+            type="GaussianGWDLoss",
+            loss_weight=1.0,
+            include_center=False,
+        ),
+        test_cfg=dict(max_per_img=2),
+    )
+    hidden = torch.zeros(1, 1, 2, 8)
+    references = [torch.full((1, 2, 4), 0.5)]
+    sample = SimpleNamespace(metainfo=dict(
+        img_shape=(32, 32),
+        scale_factor=(1.0, 1.0),
+        intrinsic=(10.0, 10.0, 16.0, 16.0),
+    ))
+
+    ordinary = _head("chain", **common)
+    ordinary.init_weights()
+    ordinary_result = ordinary.predict(
+        hidden, references, [sample], rescale=False)[0]
+    assert "obb_gaussians" not in ordinary_result
+
+    diagnostic = _head(
+        "chain", expose_obb_aux_predictions=True, **common)
+    diagnostic.init_weights()
+    diagnostic_result = diagnostic.predict(
+        hidden, references, [sample], rescale=False)[0]
+    compact = diagnostic_result.obb_gaussians
+    sigma = torch.stack(
+        (compact[:, 2], compact[:, 3], compact[:, 3], compact[:, 4]),
+        dim=-1).reshape(-1, 2, 2)
+    assert compact.shape == (2, 5)
+    assert torch.linalg.eigvalsh(sigma).min() > 0
+
+
+def test_obb_diagnostic_predictions_require_obb_head():
+    with pytest.raises(ValueError, match="requires loss_obb_aux"):
+        _head("chain", expose_obb_aux_predictions=True)
+
+
 def test_legacy_use_cop_chain_maps_to_auxiliary_mode():
     head = _head(None)
     assert head.cop_prediction_mode == "auxiliary"
@@ -122,6 +324,265 @@ def test_chain_config_exposes_one_max_objects_knob():
     assert cfg.model.bbox_head.cop_prediction_mode == "chain"
     assert tuple(cfg.model.bbox_head.cop_chain_order) == ("z", "size", "rotation")
     assert cfg.model.bbox_head.cop_use_bbox_conditioning is True
+
+
+def test_q150_projection_gwd_config_is_rotation_only_and_stage4_initialized():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd.py"
+    )
+    projection = cfg.model.bbox_head.loss_projection
+
+    assert projection.type == "ProjectedEllipsoidGWDLoss"
+    assert cfg.model.bbox_head.projection_geometry_source == "target"
+    assert projection.loss_weight == 1.0
+    assert projection.detach_center is True
+    assert projection.detach_depth is True
+    assert projection.detach_size is True
+    assert projection.fail_on_invalid is True
+    assert cfg.load_from.endswith("best_3d_iou_0.50_epoch_5.pth")
+    assert cfg.train_dataloader.dataset.obb_coordinate_scale == 0.8
+    assert any(
+        step.type == "ResizeOBBGaussians"
+        for step in cfg.train_dataloader.dataset.pipeline
+    )
+
+
+def test_q150_obb_aux_config_regularizes_rotation_stage_with_gwd():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd_obb_aux.py"
+    )
+    auxiliary = cfg.model.bbox_head.loss_obb_aux
+    assert auxiliary.type == "GaussianGWDLoss"
+    assert auxiliary.loss_weight == 5.0
+    assert auxiliary.include_center is False
+    assert cfg.model.bbox_head.projection_geometry_source == "target"
+
+
+def test_q150_obb_aux_w1_config_changes_only_auxiliary_weight():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd_obb_aux_w1.py"
+    )
+    auxiliary = cfg.model.bbox_head.loss_obb_aux
+    assert auxiliary.type == "GaussianGWDLoss"
+    assert auxiliary.loss_weight == 1.0
+    assert cfg.model.bbox_head.loss_projection.loss_weight == 1.0
+
+
+def test_q150_obb_aux_w1_inference_is_teacher_free():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd_obb_aux_w1_inference.py"
+    )
+    head = cfg.model.bbox_head
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert head.loss_obb_aux.loss_weight == 1.0
+    assert cfg.load_from is None
+
+
+def test_q150_projection_anisotropy_config_changes_only_observability_weighting():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd_anisotropy.py"
+    )
+    head = cfg.model.bbox_head
+    assert head.loss_projection.type == "ProjectedEllipsoidGWDLoss"
+    assert head.loss_projection.loss_weight == 1.0
+    assert head.loss_projection.target_anisotropy_power == 1.0
+    assert head.projection_geometry_source == "target"
+    assert head.get("loss_obb_aux") is None
+
+
+def test_q150_projection_anisotropy_inference_is_teacher_free():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_projection_gwd_anisotropy_inference.py"
+    )
+    head = cfg.model.bbox_head
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert head.loss_projection.target_anisotropy_power == 1.0
+    assert cfg.load_from is None
+
+
+def test_q150_obb_rotation_conditioning_config_is_explicit():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_obb_rotation_conditioning.py"
+    )
+    head = cfg.model.bbox_head
+    assert head.cop_obb_rotation_conditioning is True
+    assert head.loss_obb_aux.type == "GaussianGWDLoss"
+    assert head.loss_obb_aux.loss_weight == 1.0
+    assert tuple(head.cop_chain_order)[-1] == "rotation"
+    assert cfg.load_from.endswith("best_3d_iou_0.50_epoch_5.pth")
+
+
+def test_q150_obb_rotation_conditioning_inference_is_teacher_free():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_obb_rotation_conditioning_inference.py"
+    )
+    head = cfg.model.bbox_head
+    assert head.cop_obb_rotation_conditioning is True
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert cfg.load_from is None
+
+
+def test_q150_post_rotation_obb_refinement_config_is_single_change():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_obb_rotation_refinement.py"
+    )
+    head = cfg.model.bbox_head
+    assert head.cop_obb_rotation_refinement is True
+    assert head.get("cop_obb_rotation_conditioning", False) is False
+    assert head.loss_obb_aux.loss_weight == 1.0
+    assert tuple(head.cop_chain_order)[-1] == "rotation"
+    assert cfg.load_from.endswith("best_3d_iou_0.50_epoch_5.pth")
+
+
+def test_q150_2d_obb_foundation_disables_3d_objectives_for_full_training():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_full.py"
+    )
+    head = cfg.model.bbox_head
+    assert cfg.train_cfg.max_epochs == 20
+    assert cfg.train_cfg.val_interval == 5
+    assert head.loss_obb_aux.type == "GaussianGWDLoss"
+    assert head.loss_obb_aux.loss_weight == 5.0
+    assert head.loss_projection is None
+    assert head.loss_z.loss_weight == 0.0
+    assert head.loss_sizes.loss_weight == 0.0
+    assert head.loss_rotation.loss_weight == 0.0
+    assert tuple(head.distill_attributes) == ()
+    assert head.loss_cls.loss_weight > 0.0
+    assert head.loss_bbox.loss_weight > 0.0
+    assert cfg.load_from.endswith("best_3d_iou_0.50_epoch_5.pth")
+
+
+def test_q150_2d_obb_foundation_diagnostic_is_teacher_free_and_exposed():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_diagnostic.py"
+    )
+    head = cfg.model.bbox_head
+    assert head.expose_obb_aux_predictions is True
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert cfg.load_from is None
+
+
+def test_q150_obb_foundation_stage4_control_restores_3d_without_projection():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_control.py"
+    )
+    head = cfg.model.bbox_head
+    assert cfg.train_cfg.max_epochs == 5
+    assert cfg.train_cfg.val_interval == 5
+    assert cfg.load_from.endswith("2d_obb_foundation_full/epoch_20.pth")
+    assert head.loss_projection is None
+    assert head.loss_obb_aux.loss_weight == 1.0
+    assert head.loss_z.loss_weight == 50.0
+    assert head.loss_sizes.loss_weight == 50.0
+    assert head.loss_rotation.loss_weight == 5.0
+    assert tuple(head.distill_attributes) == (
+        "center", "z", "size", "rotation")
+    assert head.get("cop_obb_rotation_refinement", False) is False
+
+
+def test_q150_obb_foundation_stage4_refinement_is_single_matched_change():
+    control = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_control.py"
+    )
+    refinement = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_refinement.py"
+    )
+    control_head = control.model.bbox_head
+    refinement_head = refinement.model.bbox_head
+    assert refinement.load_from == control.load_from
+    assert refinement_head.cop_obb_rotation_refinement is True
+    assert refinement_head.get("cop_obb_rotation_conditioning", False) is False
+    for field in (
+            "loss_projection", "loss_obb_aux", "loss_z", "loss_sizes",
+            "loss_rotation", "distill_attributes"):
+        assert refinement_head[field] == control_head[field]
+
+
+@pytest.mark.parametrize("variant", ["control", "refinement"])
+def test_q150_obb_foundation_stage4_inference_is_teacher_free(variant):
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        f"nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_{variant}_inference.py"
+    )
+    head = cfg.model.bbox_head
+    assert cfg.load_from is None
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert head.loss_projection is None
+    assert head.get("cop_obb_rotation_refinement", False) is (
+        variant == "refinement")
+
+
+def test_q150_obb_refinement_recovery_schedule_keeps_accepted_path():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_refinement_continue15.py"
+    )
+    head = cfg.model.bbox_head
+    assert cfg.load_from.endswith(
+        "2d_obb_foundation_stage4_refinement/"
+        "best_3d_iou_0.50_epoch_5.pth")
+    assert cfg.train_cfg.max_epochs == 15
+    assert cfg.train_cfg.val_interval == 5
+    assert cfg.param_scheduler[0].T_max == 15
+    assert cfg.default_hooks.checkpoint.interval == 5
+    assert cfg.default_hooks.checkpoint.save_best == "3d_iou_0.50"
+    assert head.cop_obb_rotation_refinement is True
+    assert head.loss_projection is None
+    assert head.loss_obb_aux.loss_weight == 1.0
+
+
+def test_q150_obb_refinement_recovery_diagnostic_is_teacher_free():
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_2d_obb_foundation_stage4_refinement_continue15_diagnostic.py"
+    )
+    head = cfg.model.bbox_head
+    assert cfg.load_from is None
+    assert head.expose_obb_aux_predictions is True
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert head.cop_obb_rotation_refinement is True
+
+
+@pytest.mark.parametrize("config_name", [
+    "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_obb_aux_w1_diagnostic.py",
+    "nocs_custom_fruit_rgbd_3dbbox_cop_q150_stage4_obb_rotation_conditioning_diagnostic.py",
+])
+def test_obb_diagnostic_configs_explicitly_expose_teacher_free_gaussians(
+        config_name):
+    cfg = Config.fromfile(f"configs/yopo/{config_name}")
+    head = cfg.model.bbox_head
+    assert head.expose_obb_aux_predictions is True
+    assert tuple(head.distill_attributes) == ()
+    assert head.obb_center_teacher_checkpoint is None
+    assert head.pose_teacher_checkpoint is None
+    assert cfg.load_from is None
 
 
 def _write_teacher_checkpoints(tmp_path):
@@ -320,6 +781,46 @@ def test_curriculum_configs_are_chain_only_then_parallel_control():
     assert tuple(parallel.model.bbox_head.distill_attributes) == ()
 
 
+def test_q150_3d_curriculum_starts_from_2d_foundation_and_boosts_only_cop():
+    expected = {
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage2_z.py": (
+            "center", "z"
+        ),
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage3_size.py": (
+            "center", "z", "size"
+        ),
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage4_full.py": (
+            "center", "z", "size", "rotation"
+        ),
+    }
+    foundation = (
+        "work_dirs/nocs_custom_fruit_rgbd_2d_foundation_full/"
+        "best_AP50_epoch_50.pth"
+    )
+    for filename, attributes in expected.items():
+        cfg = Config.fromfile(f"configs/yopo/{filename}")
+        assert cfg.max_objects == 150
+        assert cfg.model.num_queries == 150
+        assert cfg.model.test_cfg.max_per_img == 150
+        assert cfg.model.bbox_head.test_cfg.max_per_img == 150
+        assert cfg.model.bbox_head.pose_teacher_checkpoint == foundation
+        assert tuple(cfg.model.bbox_head.distill_attributes) == attributes
+        assert cfg.train_dataloader.batch_size == 22
+        keys = cfg.optim_wrapper.paramwise_cfg.custom_keys
+        assert keys["bbox_head.cop_"].lr_mult == 50.0
+        assert keys["bbox_head.depth_query_sampler"].lr_mult == 50.0
+        assert cfg.optim_wrapper.optimizer.lr == pytest.approx(1e-6)
+
+    stage2 = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage2_z.py"
+    )
+    assert stage2.load_from == foundation
+    assert stage2.model.bbox_head.loss_z.loss_weight == 50.0
+    assert stage2.model.bbox_head.loss_sizes.loss_weight == 0.0
+    assert stage2.model.bbox_head.loss_rotation.loss_weight == 0.0
+
+
 def test_depth_query_sampler_preserves_layer_batch_query_shape_and_is_spatial():
     sampler = MultiScaleDepthQuerySampler(
         embed_dims=8, num_levels=3, roi_size=3
@@ -469,6 +970,46 @@ def test_curriculum_pairs_pinned_batches_with_nonblocking_transfers():
     assert cfg.model.data_preprocessor.non_blocking is False
 
 
+def test_curriculum_uses_fp32_schedulefree_for_deformable_attention():
+    for filename in (
+        "nocs_custom_fruit_rgbd_3dbbox_parallel_control.py",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage4_full.py",
+    ):
+        cfg = Config.fromfile(f"configs/yopo/{filename}")
+        assert cfg.optim_wrapper.type == "ScheduleFreeOptimWrapper"
+        assert "dtype" not in cfg.optim_wrapper
+        assert "loss_scale" not in cfg.optim_wrapper
+        assert cfg.optim_wrapper.optimizer.type == "AdamWScheduleFreeOptimizer"
+        assert cfg.optim_wrapper.optimizer.lr == 1e-6
+
+
+def test_2d_foundation_config_removes_3d_objectives_and_covers_dense_images():
+    cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_2d_foundation_full.py"
+    )
+    assert cfg.max_objects == 150
+    assert cfg.model.num_queries == 150
+    assert cfg.model.test_cfg.max_per_img == 150
+    assert cfg.model.bbox_head.test_cfg.max_per_img == 150
+    assert tuple(cfg.model.bbox_head.distill_attributes) == ()
+    assert cfg.model.bbox_head.obb_center_teacher_checkpoint is None
+    assert cfg.model.bbox_head.pose_teacher_checkpoint is None
+    assert cfg.model.bbox_head.loss_z.loss_weight == 0
+    assert cfg.model.bbox_head.loss_sizes.loss_weight == 0
+    assert cfg.model.bbox_head.loss_rotation.loss_weight == 0
+    assert [cost.type for cost in cfg.model.train_cfg.assigner.match_costs] == [
+        "FocalLossCost",
+        "BBoxL1Cost",
+        "IoUCost",
+    ]
+    assert cfg.optim_wrapper.type == "ScheduleFreeOptimWrapper"
+    assert cfg.optim_wrapper.optimizer.lr == 5e-5
+    assert cfg.train_cfg.max_epochs == 50
+    assert cfg.train_cfg.val_interval == 5
+    assert cfg.default_hooks.checkpoint.save_best == "AP50"
+
+
 def test_main_curriculum_uses_safe_pose_center_teacher_and_keeps_obb_ablation():
     stage1 = Config.fromfile(
         "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py"
@@ -502,6 +1043,28 @@ def test_stage4_inference_config_has_no_teacher_checkpoint_dependency():
     assert tuple(model.bbox_head.cop_chain_order) == (
         "z", "size", "rotation"
     )
+
+
+def test_q150_stage4_inference_is_teacher_free_and_keeps_capacity():
+    from yopo.registry import MODELS
+    from yopo.utils import register_all_modules
+
+    register_all_modules()
+    cfg = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_q150_from_2d_stage4_inference.py"
+    )
+    assert cfg.load_from is None
+    assert cfg.model.num_queries == 150
+    assert cfg.model.test_cfg.max_per_img == 150
+    assert cfg.model.bbox_head.test_cfg.max_per_img == 150
+    assert tuple(cfg.model.bbox_head.distill_attributes) == ()
+    assert cfg.model.bbox_head.obb_center_teacher_checkpoint is None
+    assert cfg.model.bbox_head.pose_teacher_checkpoint is None
+
+    model = MODELS.build(cfg.model)
+    assert model.bbox_head.distillation_teacher is None
+    assert model.bbox_head.cop_prediction_mode == "chain"
 
 
 def test_chain_encoder_pose_disable_requires_explicit_2d_assigner():
@@ -579,7 +1142,7 @@ def test_chain_loss_accepts_absent_auxiliary_prediction_tensors():
 
     def fake_loss_by_feat_single(cls_scores, *_args, **_kwargs):
         zero = cls_scores.sum() * 0
-        return (zero,) * 10
+        return (zero,) * 12
 
     head.loss_by_feat_single = fake_loss_by_feat_single
     cls_scores = torch.zeros(2, 1, 3, 1)
@@ -596,6 +1159,7 @@ def test_chain_loss_accepts_absent_auxiliary_prediction_tensors():
         z_preds,
         rotation_preds,
         size_preds,
+        None,
         None,
         None,
         None,
@@ -633,7 +1197,7 @@ def test_encoder_loss_keys_follow_chain_and_parallel_supervision_modes():
 
         def fake_loss_by_feat_single(cls_score, *_args, **_kwargs):
             zero = cls_score.sum() * 0
-            return (zero,) * 10
+            return (zero,) * 12
 
         head.loss_by_feat_single = fake_loss_by_feat_single
         losses = head.loss_by_feat(
@@ -643,6 +1207,7 @@ def test_encoder_loss_keys_follow_chain_and_parallel_supervision_modes():
             z_preds,
             rotation_preds,
             size_preds,
+            None,
             None,
             None,
             None,

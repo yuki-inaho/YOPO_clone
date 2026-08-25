@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from .collect_env import collect_env
+from .checkpoint_compat import register_mmengine_checkpoint_safe_globals
 from .compat_config import compat_cfg
 from .dist_utils import (all_reduce_dict, allreduce_grads, reduce_mean,
                          sync_random_seed)
@@ -24,5 +25,6 @@ __all__ = [
     'sync_random_seed', 'ConfigType', 'InstanceList', 'MultiConfig',
     'OptConfigType', 'OptInstanceList', 'OptMultiConfig', 'OptPixelList',
     'PixelList', 'RangeType', 'get_test_pipeline_cfg',
-    'setup_cache_size_limit_of_dynamo'
+    'setup_cache_size_limit_of_dynamo',
+    'register_mmengine_checkpoint_safe_globals'
 ]

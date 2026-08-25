@@ -64,6 +64,33 @@ model = dict(
 train_dataloader = dict(pin_memory=True)
 val_dataloader = dict(pin_memory=True)
 
+# Fresh FP16 training makes the 9D transformer predictions non-finite before
+# Hungarian matching.  BF16 avoids the overflow but MMCV 2.2's CUDA
+# multi-scale deformable-attention kernel does not implement BF16.  Keep this
+# short curriculum on the verified FP32 ScheduleFree path; batch 26 fits the
+# 32 GiB RTX 5090 used for these runs.
+optim_wrapper = dict(
+    _delete_=True,
+    type="ScheduleFreeOptimWrapper",
+    optimizer=dict(
+        type="AdamWScheduleFreeOptimizer",
+        lr=1e-6,
+        weight_decay=1e-4,
+        warmup_steps=0,
+    ),
+    clip_grad=dict(max_norm=0.1, norm_type=2),
+    paramwise_cfg=dict(
+        custom_keys=dict(
+            backbone=dict(lr_mult=0.1),
+            encoder=dict(lr_mult=0.5),
+            rgb_backbone=dict(lr_mult=0.1),
+            depth_backbone=dict(lr_mult=0.1),
+        ),
+    ),
+    constructor="DefaultOptimWrapperConstructor",
+    accumulative_counts=1,
+)
+
 resume = False
 train_cfg = dict(max_epochs=stage_epochs, val_interval=stage_epochs)
 param_scheduler = [
