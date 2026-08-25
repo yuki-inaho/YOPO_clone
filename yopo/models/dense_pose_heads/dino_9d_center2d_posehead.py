@@ -20,7 +20,9 @@ from yopo.utils import (InstanceList, OptInstanceList, reduce_mean,
 from ..layers import inverse_sigmoid
 from ..losses import QualityFocalLoss
 from ..utils import multi_apply
+from .depth_query_context import CoPStageFusion, MultiScaleDepthQuerySampler
 from .simple_dino_9dposehead import SimpleDINO9DPoseHead
+from .staged_distillation import StagedDistillationTeacher
 
 @MODELS.register_module()
 class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
@@ -50,6 +52,18 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             use_bbox_for_size : bool = False,
             use_log_z: bool = False,
             use_cop_chain: bool = False,
+            cop_prediction_mode: str = None,
+            cop_chain_order: Tuple[str, str, str] = ('size', 'rotation', 'z'),
+            cop_use_bbox_conditioning: bool = False,
+            cop_fusion_mode: str = 'residual',
+            cop_depth_context: ConfigType = None,
+            cop_encoder_pose_supervision: bool = True,
+            distill_attributes: Tuple[str, ...] = (),
+            center_teacher_source: str = 'pose_center',
+            obb_center_teacher_checkpoint: str = None,
+            pose_teacher_checkpoint: str = None,
+            distill_loss_weights: ConfigType = None,
+            distill_score_threshold: float = 0.0,
             loss_bbox: ConfigType = dict(type='L1Loss', loss_weight=5.0),
             loss_iou: ConfigType = dict(type='GIoULoss', loss_weight=2.0),
             loss_centers_2d: ConfigType = dict(type='L1PoseLoss', loss_weight=5.0),
@@ -98,10 +112,69 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         self.use_log_z = use_log_z
 
-        self.use_cop_chain = use_cop_chain
-        if use_cop_chain:
+        if cop_prediction_mode is None:
+            cop_prediction_mode = 'auxiliary' if use_cop_chain else 'parallel'
+        valid_cop_modes = {'parallel', 'auxiliary', 'chain'}
+        if cop_prediction_mode not in valid_cop_modes:
+            raise ValueError(
+                f'cop_prediction_mode must be one of {sorted(valid_cop_modes)}, '
+                f'got {cop_prediction_mode!r}')
+        expected_attributes = {'z', 'size', 'rotation'}
+        if len(cop_chain_order) != 3 or set(cop_chain_order) != expected_attributes:
+            raise ValueError(
+                'cop_chain_order must contain z, size, and rotation exactly once, '
+                f'got {cop_chain_order!r}')
+        self.cop_prediction_mode = cop_prediction_mode
+        self.cop_chain_order = tuple(cop_chain_order)
+        self.cop_use_bbox_conditioning = cop_use_bbox_conditioning
+        if cop_fusion_mode not in CoPStageFusion.VALID_MODES:
+            raise ValueError(
+                'cop_fusion_mode must be one of '
+                f'{CoPStageFusion.VALID_MODES}, got {cop_fusion_mode!r}')
+        self.cop_fusion_mode = cop_fusion_mode
+        self.use_cop_chain = cop_prediction_mode != 'parallel'
+        self._uses_auxiliary_chain = cop_prediction_mode == 'auxiliary'
+        self.cop_encoder_pose_supervision = (
+            cop_prediction_mode != 'chain' or
+            bool(cop_encoder_pose_supervision))
+        if not self.cop_encoder_pose_supervision:
+            if train_cfg is None or train_cfg.get('encoder_assigner') is None:
+                raise ValueError(
+                    'encoder_assigner is required when chain mode disables '
+                    'encoder pose supervision')
+            self.encoder_assigner = TASK_UTILS.build(
+                train_cfg['encoder_assigner'])
+        else:
+            self.encoder_assigner = getattr(self, 'assigner', None)
+        self.requires_depth_features = (
+            self.use_cop_chain and cop_fusion_mode == 'depth_dense')
+        self.cop_depth_context_cfg = dict(cop_depth_context or {})
+        self.last_depth_context_shape = None
+        self.last_dense_input_shape = None
+        if self.use_cop_chain:
             self.cop_loss_weights = dict(
                 size=3.0, rotation=2.0, z=1.0)
+
+        self.distill_attributes = \
+            StagedDistillationTeacher.validate_attributes(
+                distill_attributes)
+        if center_teacher_source not in \
+                StagedDistillationTeacher.VALID_CENTER_SOURCES:
+            raise ValueError(
+                'center_teacher_source must be one of '
+                f'{StagedDistillationTeacher.VALID_CENTER_SOURCES}, got '
+                f'{center_teacher_source!r}')
+        self.center_teacher_source = center_teacher_source
+        configured_distill_weights = distill_loss_weights or {}
+        self.distill_loss_weights = {
+            attribute: float(configured_distill_weights.get(attribute, 1.0))
+            for attribute in self.distill_attributes
+        }
+        if not 0.0 <= distill_score_threshold <= 1.0:
+            raise ValueError('distill_score_threshold must be in [0, 1]')
+        self.distill_score_threshold = float(distill_score_threshold)
+        self.obb_center_teacher_checkpoint = obb_center_teacher_checkpoint
+        self.pose_teacher_checkpoint = pose_teacher_checkpoint
 
         self.loss_centers_2d = MODELS.build(loss_centers_2d)
         self.loss_z = MODELS.build(loss_z)
@@ -122,6 +195,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
 
         self._init_layers()
+        self._init_distillation_teachers()
 
     def replicate(self, layer, num_layers):
         """Replicate a layer using shared instances or deep copies based on self.share_pred_layer."""
@@ -179,13 +253,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.reg_rotation_branch = self.replicate(all_branches[2], self.num_pred_layer)
         self.reg_size_branch = self.replicate(all_branches[3], self.num_pred_layer)
 
-        # ── CoP (Chain-of-Prediction) auxiliary nets ──────────────────────
+        # ── CoP (Chain-of-Prediction) attribute nets ────────────────────
         # AttributeNet A(·) per attribute (MonoCoP Eq.6): two Linear layers
-        # with ReLU between. The chain follows the best prediction order
-        # size -> rotation -> depth, with residual aggregation (Eq.8):
-        #   f_s  = A_s(q);          f̃_s = f_s + q
-        #   f_a  = A_a(f̃_s);       f̃_a = f_a + f̃_s
-        #   f_d  = A_d(f̃_a);       f̃_d = f_d + f̃_a
+        # with ReLU between. ``cop_chain_order`` controls the order and each
+        # step uses residual aggregation. ``auxiliary`` keeps the historical
+        # parallel primary path; ``chain`` routes these outputs into matching,
+        # losses, denoising losses, and inference.
         if self.use_cop_chain:
 
             def _attr_net():
@@ -207,6 +280,57 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 nn.Linear(self.embed_dims, r_dim), self.num_pred_layer)
             self.cop_z_out = self.replicate(
                 nn.Linear(self.embed_dims, 1), self.num_pred_layer)
+            if self.cop_use_bbox_conditioning:
+                self.cop_bbox_embed = self.replicate(
+                    nn.Linear(4, self.embed_dims), self.num_pred_layer)
+            self.cop_stage_fusions = nn.ModuleDict({
+                attribute: self.replicate(
+                    CoPStageFusion(
+                        embed_dims=self.embed_dims,
+                        mode=self.cop_fusion_mode,
+                    ),
+                    self.num_pred_layer,
+                )
+                for attribute in ('z', 'size', 'rotation')
+            })
+            if self.requires_depth_features:
+                self.depth_query_sampler = MultiScaleDepthQuerySampler(
+                    embed_dims=self.embed_dims,
+                    **self.cop_depth_context_cfg,
+                )
+
+    def _init_distillation_teachers(self) -> None:
+        """Delegate frozen teacher adaptation to the distillation module."""
+        self._last_distillation_targets = {}
+        self._last_distillation_scores = None
+        self.distillation_teacher_report = {}
+        self.distillation_teacher = None
+        if not self.distill_attributes:
+            return
+        self.distillation_teacher = StagedDistillationTeacher(
+            attributes=self.distill_attributes,
+            embed_dims=self.embed_dims,
+            num_reg_fcs=self.num_reg_fcs,
+            num_pred_layer=self.num_pred_layer,
+            student_center_branches=self.reg_centers_2d_branch,
+            student_cls_branches=self.cls_branches,
+            student_pose_branches={
+                'z': self.reg_z_branch,
+                'size': self.reg_size_branch,
+                'rotation': self.reg_rotation_branch,
+            },
+            center_uses_bbox=self.use_bbox_for_centers_2d,
+            pose_uses_bbox={
+                'z': self.use_bbox_for_z,
+                'size': self.use_bbox_for_size,
+                'rotation': self.use_bbox_for_rotation,
+            },
+            center_teacher_source=self.center_teacher_source,
+            obb_checkpoint=self.obb_center_teacher_checkpoint,
+            pose_checkpoint=self.pose_teacher_checkpoint,
+            loss_weights=self.distill_loss_weights,
+            score_threshold=self.distill_score_threshold)
+        self.distillation_teacher_report = self.distillation_teacher.report
 
     def init_weights(self) -> None:
         """Initialize weights of the DINO 9D pose head."""
@@ -250,7 +374,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
     def forward(self, hidden_states: Tensor,
                 references: List[Tensor],
-                batch_img_metas=None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+                batch_img_metas=None,
+                depth_features=None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Forward function for 9D pose estimation with separate centers_2d and z."""
         all_layers_outputs_classes = []
         all_layers_outputs_coords = []
@@ -261,6 +386,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         all_layers_outputs_size_chain = []
         all_layers_outputs_rotation_chain = []
         all_layers_outputs_z_chain = []
+        depth_context_shapes = []
+
+        if self.requires_depth_features and depth_features is None:
+            raise ValueError(
+                'depth_features are required when '
+                'cop_fusion_mode="depth_dense"')
 
         if self.use_cuboid_conditioning:
             if batch_img_metas is None:
@@ -281,6 +412,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 assert reference.shape[-1] == 2
                 tmp_reg_bbox_preds[..., :2] += reference
             outputs_coord = tmp_reg_bbox_preds.sigmoid()
+            if self.requires_depth_features:
+                depth_query = self.depth_query_sampler(
+                    depth_features, outputs_coord)
+                depth_context_shapes.append(tuple(depth_query.shape))
+            else:
+                depth_query = None
 
             if self.use_bbox_for_centers_2d:
                 tmp_centers_2d_input = torch.cat((hidden_state, outputs_coord), dim=-1)
@@ -303,22 +440,42 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
             tmp_reg_centers_2d_preds = self.reg_centers_2d_branch[layer_id](tmp_centers_2d_input)
             tmp_reg_centers_2d_preds = tmp_reg_centers_2d_preds.sigmoid() + outputs_coord[..., :2] - 0.5
-            tmp_reg_z_preds = self.reg_z_branch[layer_id](tmp_z_input)
-            tmp_rotation_preds = self.reg_rotation_branch[layer_id](tmp_rotation_input)
-            tmp_sizes = self.reg_size_branch[layer_id](tmp_size_input)
+            if self.cop_prediction_mode != 'chain':
+                tmp_reg_z_preds = self.reg_z_branch[layer_id](tmp_z_input)
+                tmp_rotation_preds = self.reg_rotation_branch[layer_id](tmp_rotation_input)
+                tmp_sizes = self.reg_size_branch[layer_id](tmp_size_input)
+            else:
+                tmp_reg_z_preds = tmp_rotation_preds = tmp_sizes = None
 
             if self.use_cop_chain:
-                # CoP chain: size -> rotation -> depth with residual aggregation.
-                f_s = self.cop_size_net[layer_id](hidden_state)
-                f_s_a = f_s + hidden_state
-                f_a = self.cop_rotation_net[layer_id](f_s_a)
-                f_a_a = f_a + f_s_a
-                f_d = self.cop_z_net[layer_id](f_a_a)
-                f_d_a = f_d + f_a_a
-                # Classwise indexing is applied later in loss (same as parallel).
-                tmp_sizes_chain = self.cop_size_out[layer_id](f_s_a)
-                tmp_rotation_chain = self.cop_rotation_out[layer_id](f_a_a)
-                tmp_z_chain = self.cop_z_out[layer_id](f_d_a)
+                chain_feature = hidden_state
+                if self.cop_use_bbox_conditioning:
+                    chain_feature = chain_feature + self.cop_bbox_embed[layer_id](
+                        outputs_coord)
+                chain_outputs = {}
+                nets = {
+                    'z': self.cop_z_net[layer_id],
+                    'size': self.cop_size_net[layer_id],
+                    'rotation': self.cop_rotation_net[layer_id],
+                }
+                outs = {
+                    'z': self.cop_z_out[layer_id],
+                    'size': self.cop_size_out[layer_id],
+                    'rotation': self.cop_rotation_out[layer_id],
+                }
+                for attribute in self.cop_chain_order:
+                    stage_input = self.cop_stage_fusions[attribute][layer_id](
+                        chain_feature, hidden_state, depth_query)
+                    chain_feature = nets[attribute](stage_input) + stage_input
+                    chain_outputs[attribute] = outs[attribute](chain_feature)
+                tmp_z_chain = chain_outputs['z']
+                tmp_sizes_chain = chain_outputs['size']
+                tmp_rotation_chain = chain_outputs['rotation']
+                if self.cop_prediction_mode == 'chain':
+                    tmp_reg_z_preds = tmp_z_chain
+                    tmp_sizes = tmp_sizes_chain
+                    tmp_rotation_preds = tmp_rotation_chain
+                    tmp_sizes_chain = tmp_rotation_chain = tmp_z_chain = None
             else:
                 tmp_sizes_chain = tmp_rotation_chain = tmp_z_chain = None
 
@@ -339,7 +496,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         all_layers_outputs_z = torch.stack(all_layers_outputs_z)
         all_layers_outputs_rotations = torch.stack(all_layers_outputs_rotations)
         all_layers_outputs_sizes = torch.stack(all_layers_outputs_sizes)
-        if self.use_cop_chain:
+        if self._uses_auxiliary_chain:
             all_layers_outputs_size_chain = torch.stack(all_layers_outputs_size_chain)
             all_layers_outputs_rotation_chain = torch.stack(all_layers_outputs_rotation_chain)
             all_layers_outputs_z_chain = torch.stack(all_layers_outputs_z_chain)
@@ -347,17 +504,67 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             all_layers_outputs_size_chain = all_layers_outputs_rotation_chain = None
             all_layers_outputs_z_chain = None
 
+        if depth_context_shapes:
+            first_shape = depth_context_shapes[0]
+            if any(shape != first_shape for shape in depth_context_shapes):
+                raise RuntimeError(
+                    f'depth context shape changed by layer: '
+                    f'{depth_context_shapes}')
+            self.last_depth_context_shape = (
+                len(depth_context_shapes), *first_shape)
+            dense_shapes = [
+                self.cop_stage_fusions[self.cop_chain_order[0]][layer_id]
+                .last_dense_input_shape
+                for layer_id in range(len(depth_context_shapes))
+            ]
+            if any(shape != dense_shapes[0] for shape in dense_shapes):
+                raise RuntimeError(
+                    f'dense CoP input shape changed by layer: {dense_shapes}')
+            self.last_dense_input_shape = (
+                len(dense_shapes), *dense_shapes[0])
+        else:
+            self.last_depth_context_shape = None
+            self.last_dense_input_shape = None
+
+        if self.distillation_teacher is not None:
+            (self._last_distillation_targets,
+             self._last_distillation_scores) = self.distillation_teacher(
+                 hidden_states, references, all_layers_outputs_coords)
+        else:
+            self._last_distillation_targets = {}
+            self._last_distillation_scores = None
+
         return (all_layers_outputs_classes, all_layers_outputs_coords,
                 all_layers_outputs_centers_2d, all_layers_outputs_z,
                 all_layers_outputs_rotations, all_layers_outputs_sizes,
                 all_layers_outputs_size_chain, all_layers_outputs_rotation_chain,
                 all_layers_outputs_z_chain)
 
+    def _distillation_losses(self, outs: tuple,
+                             dn_meta: Dict[str, int]) -> Dict[str, Tensor]:
+        if self.distillation_teacher is None:
+            return {}
+        student_outputs = {
+            'center': outs[2],
+            'z': outs[3],
+            'rotation': outs[4],
+            'size': outs[5],
+        }
+        first_matching_query = 0
+        if dn_meta is not None:
+            first_matching_query = dn_meta['num_denoising_queries']
+        return self.distillation_teacher.loss(
+            student_outputs,
+            self._last_distillation_targets,
+            self._last_distillation_scores,
+            first_matching_query=first_matching_query)
+
     def loss(self, hidden_states: Tensor, references: List[Tensor],
              enc_outputs_class: Tensor, enc_outputs_coord: Tensor,
              enc_outputs_centers_2d: Tensor, enc_outputs_z: Tensor,
              enc_outputs_rotation: Tensor, enc_outputs_size: Tensor,
-             batch_data_samples: SampleList, dn_meta: Dict[str, int]) -> dict:
+             batch_data_samples: SampleList, dn_meta: Dict[str, int],
+             depth_features=None) -> dict:
         """Perform forward propagation and loss calculation."""
         batch_gt_instances = []
         batch_img_metas = []
@@ -365,12 +572,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
 
-        outs = self(hidden_states, references)
+        outs = self(
+            hidden_states, references, depth_features=depth_features)
         loss_inputs = outs + (enc_outputs_class, enc_outputs_coord,
                               enc_outputs_centers_2d, enc_outputs_z,
                               enc_outputs_rotation, enc_outputs_size,
                               batch_gt_instances, batch_img_metas, dn_meta)
         losses = self.loss_by_feat(*loss_inputs)
+        losses.update(self._distillation_losses(outs, dn_meta))
         return losses
     def loss_by_feat(self, all_layers_cls_scores: Tensor, all_layers_bbox_preds: Tensor,
                      all_layers_centers_2d_preds: Tensor, all_layers_z_preds: Tensor,
@@ -398,7 +607,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # CoP chain outputs: only keep the matching (non-denoising) slice for
         # the auxiliary chain losses (the denoising branch keeps the plain
         # parallel predictions).
-        if self.use_cop_chain and dn_meta is not None:
+        if self._uses_auxiliary_chain and dn_meta is not None:
             n_dn = dn_meta['num_denoising_queries']
             all_m_sizes_chain = all_layers_sizes_chain_preds[:, :, n_dn:, :]
             all_m_rotation_chain = all_layers_rotation_chain_preds[:, :, n_dn:, :]
@@ -417,6 +626,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         # loss of proposal generated from encode feature map.
         if enc_cls_scores is not None:
+            encoder_pose_supervision = self.cop_encoder_pose_supervision
             (enc_loss_cls, enc_losses_bbox, enc_losses_iou, 
              enc_loss_centers_2d, enc_loss_z, enc_loss_rotation, enc_loss_size,
              _enc_size_chain, _enc_rotation_chain, _enc_z_chain) = \
@@ -425,14 +635,19 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                                        enc_outputs_rotation, enc_outputs_size,
                                        None, None, None,
                                        batch_gt_instances=batch_gt_instances,
-                                       batch_img_metas=batch_img_metas)
+                                       batch_img_metas=batch_img_metas,
+                                       pose_supervision=(
+                                           encoder_pose_supervision),
+                                       assigner=(
+                                           self.encoder_assigner))
             loss_dict['enc_loss_cls'] = enc_loss_cls
             loss_dict['enc_loss_bbox'] = enc_losses_bbox
             loss_dict['enc_loss_iou'] = enc_losses_iou
             loss_dict['enc_loss_centers_2d'] = enc_loss_centers_2d
-            loss_dict['enc_loss_z'] = enc_loss_z
-            loss_dict['enc_loss_rotation'] = enc_loss_rotation
-            loss_dict['enc_loss_size'] = enc_loss_size
+            if encoder_pose_supervision:
+                loss_dict['enc_loss_z'] = enc_loss_z
+                loss_dict['enc_loss_rotation'] = enc_loss_rotation
+                loss_dict['enc_loss_size'] = enc_loss_size
 
         if all_layers_denoising_cls_scores is not None:
             # calculate denoising loss from all decoder layers
@@ -480,14 +695,25 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             f'{self.__class__.__name__} only supports ' \
             'for batch_gt_instances_ignore setting to None.'
 
-        (losses_cls, losses_bbox, losses_iou, losses_centers_2d, 
+        # Chain-only mode does not instantiate the legacy auxiliary prediction
+        # path. ``multi_apply`` nevertheless needs one item per decoder layer.
+        num_decoder_layers = all_layers_cls_scores.shape[0]
+        if self._uses_auxiliary_chain:
+            size_chain_inputs = all_layers_sizes_chain_preds
+            rotation_chain_inputs = all_layers_rotation_chain_preds
+            z_chain_inputs = all_layers_z_chain_preds
+        else:
+            size_chain_inputs = [None] * num_decoder_layers
+            rotation_chain_inputs = [None] * num_decoder_layers
+            z_chain_inputs = [None] * num_decoder_layers
+
+        (losses_cls, losses_bbox, losses_iou, losses_centers_2d,
          losses_z, losses_rotation, losses_sizes,
          losses_size_chain, losses_rotation_chain, losses_z_chain) = multi_apply(
             self.loss_by_feat_single, all_layers_cls_scores, all_layers_bbox_preds,
             all_layers_centers_2d_preds, all_layers_z_preds,
             all_layers_rotation_preds, all_layers_sizes_preds,
-            all_layers_sizes_chain_preds, all_layers_rotation_chain_preds,
-            all_layers_z_chain_preds,
+            size_chain_inputs, rotation_chain_inputs, z_chain_inputs,
             batch_gt_instances=batch_gt_instances, batch_img_metas=batch_img_metas)
 
         loss_dict = dict()
@@ -499,7 +725,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         loss_dict['loss_z'] = losses_z[-1]
         loss_dict['loss_rotation'] = losses_rotation[-1]
         loss_dict['loss_size'] = losses_sizes[-1]
-        if self.use_cop_chain:
+        if self._uses_auxiliary_chain:
             loss_dict['loss_size_chain'] = losses_size_chain[-1]
             loss_dict['loss_rotation_chain'] = losses_rotation_chain[-1]
             loss_dict['loss_z_chain'] = losses_z_chain[-1]
@@ -516,7 +742,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_dict[f'd{num_dec_layer}.loss_z'] = loss_z_i
             loss_dict[f'd{num_dec_layer}.loss_rotation'] = loss_rotation_i
             loss_dict[f'd{num_dec_layer}.loss_size'] = loss_sizes_i
-            if self.use_cop_chain:
+            if self._uses_auxiliary_chain:
                 loss_dict[f'd{num_dec_layer}.loss_size_chain'] = losses_size_chain[i]
                 loss_dict[f'd{num_dec_layer}.loss_rotation_chain'] = losses_rotation_chain[i]
                 loss_dict[f'd{num_dec_layer}.loss_z_chain'] = losses_z_chain[i]
@@ -722,8 +948,17 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                            rotation_preds: Tensor, sizes_preds: Tensor,
                            sizes_chain_preds: Tensor,
                            rotation_chain_preds: Tensor, z_chain_preds: Tensor,
-                           batch_gt_instances: InstanceList, batch_img_metas: List[dict]) -> Tuple[Tensor]:
+                           batch_gt_instances: InstanceList,
+                           batch_img_metas: List[dict],
+                           pose_supervision: bool = True,
+                           assigner=None) -> Tuple[Tensor]:
         """Loss function for outputs from a single decoder layer."""
+        if not pose_supervision:
+            query_shape = centers_2d_preds.shape[:-1]
+            z_preds = centers_2d_preds.new_zeros((*query_shape, 1))
+            rotation_preds = centers_2d_preds.new_zeros(
+                (*query_shape, self.rot_dim))
+            sizes_preds = centers_2d_preds.new_zeros((*query_shape, 3))
         num_imgs = cls_scores.size(0)
         cls_scores_list = [cls_scores[i] for i in range(num_imgs)]
         bbox_preds_list = [bbox_preds[i] for i in range(num_imgs)]
@@ -735,7 +970,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                           centers_2d_preds_list, z_preds_list,
                                           rotation_preds_list, sizes_preds_list,  
-                                          batch_gt_instances, batch_img_metas)
+                                          batch_gt_instances, batch_img_metas,
+                                          assigner=assigner,
+                                          pose_for_matching=pose_supervision)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          centers_2d_targets_list, centers_2d_weights_list,
          z_targets_list, z_weights_list,
@@ -789,6 +1026,11 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # centers_2d loss
         centers_2d_preds = centers_2d_preds.reshape(-1, 2)
         loss_centers_2d = self.loss_centers_2d(centers_2d_preds, centers_2d_targets, centers_2d_weights, avg_factor=num_total_pos)
+
+        if not pose_supervision:
+            zero = loss_centers_2d * 0.0
+            return (loss_cls, loss_bbox, loss_iou, loss_centers_2d,
+                    zero, zero, zero, zero, zero, zero)
 
         # z loss
         z_preds = z_preds.reshape(-1, 1)
@@ -857,7 +1099,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
     def get_targets(self, cls_scores_list: List[Tensor], bbox_preds_list: List[Tensor],
                     centers_2d_preds_list: List[Tensor], z_preds_list: List[Tensor],
                     rotation_preds_list: List[Tensor], sizes_preds_list: List[Tensor],
-                    batch_gt_instances: InstanceList, batch_img_metas: List[dict]) -> tuple:
+                    batch_gt_instances: InstanceList,
+                    batch_img_metas: List[dict], assigner=None,
+                    pose_for_matching: bool = True) -> tuple:
         """Compute regression and classification targets for a batch image."""
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          centers_2d_targets_list, centers_2d_weights_list,
@@ -868,7 +1112,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                                       cls_scores_list, bbox_preds_list,
                                       centers_2d_preds_list, z_preds_list,
                                       rotation_preds_list, sizes_preds_list,
-                                      batch_gt_instances, batch_img_metas)
+                                      batch_gt_instances, batch_img_metas,
+                                      assigner=assigner,
+                                      pose_for_matching=pose_for_matching)
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
         num_total_neg = sum((inds.numel() for inds in neg_inds_list))
         return (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
@@ -880,7 +1126,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
     def _get_targets_single(self, cls_score: Tensor, bbox_pred: Tensor,
                            centers_2d_pred: Tensor, z_pred: Tensor,
                            rotation_pred: Tensor, sizes_pred: Tensor,
-                           gt_instances: InstanceData, img_meta: dict) -> tuple:
+                           gt_instances: InstanceData, img_meta: dict,
+                           assigner=None,
+                           pose_for_matching: bool = True) -> tuple:
         """Compute regression and classification targets for one image."""
         img_h, img_w = img_meta['img_shape']
         factor = bbox_pred.new_tensor([img_w, img_h, img_w, img_h]).unsqueeze(0)
@@ -889,43 +1137,51 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # convert bbox_pred from xywh, normalized to xyxy, unnormalized
         bbox_pred_unnorm = bbox_cxcywh_to_xyxy(bbox_pred) * factor
 
-        intrinsic = img_meta['intrinsic']
-        centers_2d_h = torch.cat([centers_2d_pred, 
-                                  torch.ones_like(centers_2d_pred[:, :1])],
-                                  dim=1)
-        if not isinstance(intrinsic, torch.Tensor):
-            if len(intrinsic) == 4:
-                # intrinsic is a list of [fx, fy, cx, cy]
-                intrinsic = [[intrinsic[0], 0, intrinsic[2]],
-                             [0, intrinsic[1], intrinsic[3]],
-                             [0, 0, 1]]
-            intrinsic = torch.tensor(intrinsic).to(centers_2d_h.device)
-        intrinsic = intrinsic.view(3, 3)
+        if pose_for_matching:
+            intrinsic = img_meta['intrinsic']
+            centers_2d_h = torch.cat([
+                centers_2d_pred,
+                torch.ones_like(centers_2d_pred[:, :1])
+            ], dim=1)
+            if not isinstance(intrinsic, torch.Tensor):
+                if len(intrinsic) == 4:
+                    intrinsic = [[intrinsic[0], 0, intrinsic[2]],
+                                 [0, intrinsic[1], intrinsic[3]],
+                                 [0, 0, 1]]
+                intrinsic = torch.tensor(
+                    intrinsic, device=centers_2d_h.device)
+            intrinsic = intrinsic.view(3, 3)
+            depth = torch.exp(z_pred) if self.use_log_z else z_pred
+            t_recovered = depth * (
+                torch.inverse(intrinsic) @ centers_2d_h.T).T
 
-        if self.use_log_z:
-            depth = torch.exp(z_pred)
+            pred_labels = cls_score.argmax(dim=-1)
+            if self.classwise_rotation:
+                rotation_pred = rotation_pred.reshape(
+                    num_bboxes, -1, self.rot_dim)
+                rotation_pred = rotation_pred[
+                    torch.arange(num_bboxes, device=cls_score.device),
+                    pred_labels]
+            if self.classwise_sizes:
+                sizes_pred = sizes_pred.reshape(num_bboxes, -1, 3)
+                sizes_pred = sizes_pred[
+                    torch.arange(num_bboxes, device=cls_score.device),
+                    pred_labels]
+            pred_instances = InstanceData(
+                scores=cls_score,
+                bboxes=bbox_pred_unnorm,
+                translations=t_recovered,
+                rotations=rotation_pred,
+                sizes=sizes_pred)
         else:
-            depth = z_pred
+            pred_instances = InstanceData(
+                scores=cls_score, bboxes=bbox_pred_unnorm)
 
-        t_recovered = depth * (torch.inverse(intrinsic) @ centers_2d_h.T).T
-
-        # choose the elements with the highest class score
-        pred_labels = cls_score.argmax(dim=-1)
-        if self.classwise_rotation:
-            rotation_pred = rotation_pred.reshape(num_bboxes, -1, self.rot_dim)
-            rotation_pred = rotation_pred[torch.arange(num_bboxes, device=cls_score.device), pred_labels]
-        
-        if self.classwise_sizes:
-            sizes_pred = sizes_pred.reshape(num_bboxes, -1, 3)
-            sizes_pred = sizes_pred[torch.arange(num_bboxes, device=cls_score.device), pred_labels]
-        
-
-        pred_instances = InstanceData(scores=cls_score, bboxes=bbox_pred_unnorm,
-                                     translations=t_recovered,
-                                     rotations=rotation_pred, sizes=sizes_pred)
-        
-        assign_result = self.assigner.assign(pred_instances=pred_instances,
-                                           gt_instances=gt_instances, img_meta=img_meta)
+        active_assigner = assigner or self.assigner
+        assign_result = active_assigner.assign(
+            pred_instances=pred_instances,
+            gt_instances=gt_instances,
+            img_meta=img_meta)
 
         gt_bboxes = gt_instances.bboxes
         gt_labels = gt_instances.labels

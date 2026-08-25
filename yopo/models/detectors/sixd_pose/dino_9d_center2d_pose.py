@@ -85,6 +85,23 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
         nn.init.xavier_uniform_(self.query_embedding.weight)
         normal_(self.level_embed)
 
+    def extract_feat(self, batch_inputs: Tensor):
+        """Extract fused transformer maps and optional explicit depth maps."""
+        if not getattr(self.bbox_head, 'requires_depth_features', False):
+            return super().extract_feat(batch_inputs)
+        if not hasattr(self.backbone, 'forward_with_depth_features'):
+            raise TypeError(
+                'depth_dense CoP requires a backbone implementing '
+                'forward_with_depth_features()')
+        fused_features, depth_features = \
+            self.backbone.forward_with_depth_features(batch_inputs)
+        if self.with_neck:
+            fused_features = self.neck(fused_features)
+        return dict(
+            fused_features=fused_features,
+            depth_features=depth_features,
+        )
+
     def forward_transformer(
         self,
         img_feats: Tuple[Tensor],
@@ -115,6 +132,11 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
             includes the `hidden_states` of the decoder output and may contain
             `references` including the initial and intermediate references.
         """
+        depth_features = None
+        if isinstance(img_feats, dict):
+            depth_features = img_feats['depth_features']
+            img_feats = img_feats['fused_features']
+
         encoder_inputs_dict, decoder_inputs_dict = self.pre_transformer(
             img_feats, batch_data_samples)
 
@@ -126,6 +148,8 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
 
         decoder_outputs_dict = self.forward_decoder(**decoder_inputs_dict)
         head_inputs_dict.update(decoder_outputs_dict)
+        if depth_features is not None:
+            head_inputs_dict['depth_features'] = depth_features
         return head_inputs_dict
 
     def pre_decoder(
@@ -187,33 +211,32 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
             centers_2d_input = torch.cat([output_memory, tmp_enc_outputs_coords], dim=-1)
         else:
             centers_2d_input = output_memory
-        if hasattr(self.bbox_head, 'use_bbox_for_z') and self.bbox_head.use_bbox_for_z:
-            z_input = torch.cat([output_memory, tmp_enc_outputs_coords], dim=-1)
-        else:
-            z_input = output_memory
-        if hasattr(self.bbox_head, 'use_bbox_for_rotation') and self.bbox_head.use_bbox_for_rotation:
-            rotation_input = torch.cat([output_memory, tmp_enc_outputs_coords], dim=-1)
-        else:
-            rotation_input = output_memory
-        if hasattr(self.bbox_head, 'use_bbox_for_size') and self.bbox_head.use_bbox_for_size:
-            size_input = torch.cat([output_memory, tmp_enc_outputs_coords], dim=-1)
-        else:
-            size_input = output_memory
         enc_outputs_centers_2d = self.bbox_head.reg_centers_2d_branch[
             self.decoder.num_layers](centers_2d_input)
-        
-        # Z prediction - independent of bbox
-        enc_outputs_z = self.bbox_head.reg_z_branch[
-            self.decoder.num_layers](z_input)
-            
-        # Rotation and size predictions
-        enc_outputs_rotation = self.bbox_head.reg_rotation_branch[
-            self.decoder.num_layers](rotation_input)
-        enc_outputs_sizes = self.bbox_head.reg_size_branch[
-            self.decoder.num_layers](size_input)
 
-        rot_dim = enc_outputs_rotation.shape[-1]
-        size_dim = enc_outputs_sizes.shape[-1]
+        encoder_pose_supervision = getattr(
+            self.bbox_head, 'cop_encoder_pose_supervision', True)
+        if encoder_pose_supervision:
+            z_input = output_memory
+            if self.bbox_head.use_bbox_for_z:
+                z_input = torch.cat(
+                    [output_memory, tmp_enc_outputs_coords], dim=-1)
+            rotation_input = output_memory
+            if self.bbox_head.use_bbox_for_rotation:
+                rotation_input = torch.cat(
+                    [output_memory, tmp_enc_outputs_coords], dim=-1)
+            size_input = output_memory
+            if self.bbox_head.use_bbox_for_size:
+                size_input = torch.cat(
+                    [output_memory, tmp_enc_outputs_coords], dim=-1)
+            enc_outputs_z = self.bbox_head.reg_z_branch[
+                self.decoder.num_layers](z_input)
+            enc_outputs_rotation = self.bbox_head.reg_rotation_branch[
+                self.decoder.num_layers](rotation_input)
+            enc_outputs_sizes = self.bbox_head.reg_size_branch[
+                self.decoder.num_layers](size_input)
+        else:
+            enc_outputs_z = enc_outputs_rotation = enc_outputs_sizes = None
 
         # NOTE The DINO selects top-k proposals according to scores of
         # multi-class classification, while DeformDETR, where the input
@@ -232,15 +255,20 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
         topk_centers_2d = torch.gather(
             enc_outputs_centers_2d, 1,
             topk_indices.unsqueeze(-1).repeat(1, 1, 2))
-        topk_z = torch.gather(
-            enc_outputs_z, 1,
-            topk_indices.unsqueeze(-1).repeat(1, 1, 1))
-        topk_rotation = torch.gather(
-            enc_outputs_rotation, 1,
-            topk_indices.unsqueeze(-1).repeat(1, 1, rot_dim))
-        topk_sizes = torch.gather(
-            enc_outputs_sizes, 1,
-            topk_indices.unsqueeze(-1).repeat(1, 1, size_dim))
+        if encoder_pose_supervision:
+            topk_z = torch.gather(
+                enc_outputs_z, 1,
+                topk_indices.unsqueeze(-1).repeat(1, 1, 1))
+            topk_rotation = torch.gather(
+                enc_outputs_rotation, 1,
+                topk_indices.unsqueeze(-1).repeat(
+                    1, 1, enc_outputs_rotation.shape[-1]))
+            topk_sizes = torch.gather(
+                enc_outputs_sizes, 1,
+                topk_indices.unsqueeze(-1).repeat(
+                    1, 1, enc_outputs_sizes.shape[-1]))
+        else:
+            topk_z = topk_rotation = topk_sizes = None
 
         topk_coords = topk_coords_unact.sigmoid()
         topk_coords_unact = topk_coords_unact.detach()

@@ -1,0 +1,557 @@
+import pytest
+import torch
+from torch import nn
+from mmengine.config import Config
+
+from yopo.models.dense_pose_heads.dino_9d_center2d_posehead import (
+    DINO9DCenter2DPoseHead,
+)
+from yopo.models.dense_pose_heads.depth_query_context import (
+    CoPStageFusion,
+    MultiScaleDepthQuerySampler,
+)
+
+
+def _head(mode, **kwargs):
+    head_kwargs = dict(
+        num_classes=1,
+        embed_dims=8,
+        num_reg_fcs=1,
+        num_pred_layer=1,
+        train_cfg=None,
+        use_cop_chain=True,
+        cop_prediction_mode=mode,
+        cop_chain_order=("z", "size", "rotation"),
+        cop_use_bbox_conditioning=True,
+        loss_cls=dict(
+            type="FocalLoss",
+            use_sigmoid=True,
+            gamma=2.0,
+            alpha=0.25,
+            loss_weight=1.0,
+        ),
+    )
+    head_kwargs.update(kwargs)
+    return DINO9DCenter2DPoseHead(**head_kwargs)
+
+
+def _forward(head):
+    hidden = torch.zeros(1, 1, 2, 8)
+    references = [torch.full((1, 2, 4), 0.5)]
+    return head(hidden, references)
+
+
+def test_cop_prediction_mode_rejects_unknown_value():
+    with pytest.raises(ValueError, match="cop_prediction_mode"):
+        _head("unknown")
+
+
+def test_chain_mode_routes_chain_pose_to_primary_outputs():
+    head = _head("chain")
+    head.init_weights()
+    with torch.no_grad():
+        head.reg_z_branch[0][-1].bias.fill_(1.0)
+        head.reg_rotation_branch[0][-1].bias.fill_(1.0)
+        head.reg_size_branch[0][-1].bias.fill_(1.0)
+        head.cop_z_out[0].bias.fill_(2.0)
+        head.cop_rotation_out[0].bias.fill_(2.0)
+        head.cop_size_out[0].bias.fill_(2.0)
+
+    outputs = _forward(head)
+
+    assert torch.all(outputs[3] == 2.0)
+    assert torch.all(outputs[4] == 2.0)
+    assert torch.all(outputs[5] == 2.0)
+    assert outputs[6:] == (None, None, None)
+    assert head.cop_chain_order == ("z", "size", "rotation")
+
+
+def test_chain_primary_backward_does_not_train_parallel_pose_branches():
+    head = _head("chain")
+    hidden = torch.randn(1, 1, 2, 8, requires_grad=True)
+    references = [torch.full((1, 2, 4), 0.5)]
+
+    outputs = head(hidden, references)
+    sum(output.sum() for output in outputs[3:6]).backward()
+
+    parallel_parameters = [
+        parameter
+        for branches in (
+            head.reg_z_branch,
+            head.reg_rotation_branch,
+            head.reg_size_branch,
+        )
+        for parameter in branches.parameters()
+    ]
+    cop_parameters = [
+        parameter
+        for branches in (head.cop_z_out, head.cop_size_out, head.cop_rotation_out)
+        for parameter in branches.parameters()
+    ]
+    assert all(parameter.grad is None for parameter in parallel_parameters)
+    assert any(parameter.grad is not None for parameter in cop_parameters)
+
+
+def test_auxiliary_mode_preserves_parallel_primary_and_chain_auxiliary():
+    head = _head("auxiliary")
+    head.init_weights()
+    with torch.no_grad():
+        head.reg_z_branch[0][-1].bias.fill_(1.0)
+        head.cop_z_out[0].bias.fill_(2.0)
+
+    outputs = _forward(head)
+
+    assert torch.all(outputs[3] == 1.0)
+    assert torch.all(outputs[8] == 2.0)
+
+
+def test_legacy_use_cop_chain_maps_to_auxiliary_mode():
+    head = _head(None)
+    assert head.cop_prediction_mode == "auxiliary"
+
+
+def test_chain_config_exposes_one_max_objects_knob():
+    cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_depth_size_rotation.py"
+    )
+    assert cfg.max_objects == 100
+    assert cfg.model.num_queries == cfg.max_objects
+    assert cfg.model.bbox_head.test_cfg.max_per_img == cfg.max_objects
+    assert cfg.model.bbox_head.cop_prediction_mode == "chain"
+    assert tuple(cfg.model.bbox_head.cop_chain_order) == ("z", "size", "rotation")
+    assert cfg.model.bbox_head.cop_use_bbox_conditioning is True
+
+
+def _write_teacher_checkpoints(tmp_path):
+    pose_head = _head("parallel")
+    pose_state = {
+        f"bbox_head.{key}": value.clone()
+        for key, value in pose_head.state_dict().items()
+    }
+    pose_path = tmp_path / "pose_teacher.pth"
+    torch.save({"state_dict": pose_state}, pose_path)
+
+    obb_state = {}
+    for layer_id in range(1):
+        prefix = f"bbox_head.reg_branches.{layer_id}"
+        obb_state[f"{prefix}.0.weight"] = torch.eye(8)
+        obb_state[f"{prefix}.0.bias"] = torch.zeros(8)
+        obb_state[f"{prefix}.2.weight"] = torch.zeros(5, 8)
+        obb_state[f"{prefix}.2.bias"] = torch.zeros(5)
+        obb_state[f"bbox_head.cls_branches.{layer_id}.weight"] = torch.zeros(1, 8)
+        obb_state[f"bbox_head.cls_branches.{layer_id}.bias"] = torch.zeros(1)
+    obb_path = tmp_path / "obb_teacher.pth"
+    torch.save({"state_dict": obb_state}, obb_path)
+    return str(obb_path), str(pose_path)
+
+
+def test_distillation_attributes_reject_unknown_value():
+    with pytest.raises(ValueError, match="distill_attributes"):
+        _head("chain", distill_attributes=("unknown",))
+
+
+def test_frozen_teacher_adapters_emit_cumulative_targets(tmp_path):
+    obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
+    head = _head(
+        "chain",
+        distill_attributes=("center", "z", "size"),
+        obb_center_teacher_checkpoint=obb_path,
+        pose_teacher_checkpoint=pose_path,
+        distill_loss_weights=dict(center=2.0, z=3.0, size=4.0),
+    )
+
+    outputs = _forward(head)
+
+    assert set(head._last_distillation_targets) == {"center", "z", "size"}
+    assert head._last_distillation_scores.shape == (1, 1, 2)
+    teacher_parameters = [
+        parameter
+        for name, parameter in head.named_parameters()
+        if "teacher" in name
+    ]
+    assert teacher_parameters
+    assert all(not parameter.requires_grad for parameter in teacher_parameters)
+    assert head.distill_loss_weights == {"center": 2.0, "z": 3.0, "size": 4.0}
+    losses = head._distillation_losses(outputs, dn_meta=None)
+    assert set(losses) == {
+        "loss_distill_center", "loss_distill_z", "loss_distill_size"
+    }
+    assert all(torch.isfinite(loss) for loss in losses.values())
+
+    head.train()
+    assert head.distillation_teacher.training is False
+
+
+def test_pose_center_teacher_matches_checkpoint_initialized_student(tmp_path):
+    obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
+    head = _head(
+        "chain",
+        distill_attributes=("center",),
+        center_teacher_source="pose_center",
+        obb_center_teacher_checkpoint=obb_path,
+        pose_teacher_checkpoint=pose_path,
+    )
+    checkpoint = torch.load(pose_path, map_location="cpu", weights_only=False)
+    head_state = {
+        key.removeprefix("bbox_head."): value
+        for key, value in checkpoint["state_dict"].items()
+    }
+    head.load_state_dict(head_state, strict=False)
+
+    outputs = _forward(head)
+
+    assert head.distillation_teacher_report["center"]["source"] == (
+        "frozen_pose_center_head"
+    )
+    assert torch.allclose(
+        outputs[2], head._last_distillation_targets["center"], atol=1e-7
+    )
+    assert torch.isfinite(head._last_distillation_targets["center"]).all()
+
+
+def test_incompatible_obb_center_checkpoint_is_rejected(tmp_path):
+    obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
+    checkpoint = torch.load(obb_path, map_location="cpu", weights_only=False)
+    checkpoint["state_dict"]["bbox_head.reg_branches.0.2.weight"] = (
+        torch.zeros(1, 8)
+    )
+    bad_path = tmp_path / "bad_obb_teacher.pth"
+    torch.save(checkpoint, bad_path)
+
+    with pytest.raises(RuntimeError, match="shape mismatch"):
+        _head(
+            "chain",
+            distill_attributes=("center",),
+            center_teacher_source="obb_adapter",
+            obb_center_teacher_checkpoint=str(bad_path),
+            pose_teacher_checkpoint=pose_path,
+        )
+
+
+def test_center_distillation_masks_teacher_below_confidence_threshold(tmp_path):
+    obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
+    head = _head(
+        "chain",
+        distill_attributes=("center",),
+        center_teacher_source="pose_center",
+        obb_center_teacher_checkpoint=obb_path,
+        pose_teacher_checkpoint=pose_path,
+        distill_score_threshold=0.9,
+    )
+    outputs = _forward(head)
+    losses = head._distillation_losses(outputs, dn_meta=None)
+    assert losses["loss_distill_center"].item() == 0.0
+
+
+def test_obb_center_adapter_remains_explicit_ablation(tmp_path):
+    obb_path, pose_path = _write_teacher_checkpoints(tmp_path)
+    head = _head(
+        "chain",
+        distill_attributes=("center",),
+        center_teacher_source="obb_adapter",
+        obb_center_teacher_checkpoint=obb_path,
+        pose_teacher_checkpoint=pose_path,
+    )
+    assert head.distillation_teacher_report["center"]["source"] == (
+        "frozen_obb_head_adapter"
+    )
+
+
+def test_curriculum_configs_are_chain_only_then_parallel_control():
+    expected = {
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py": ("center",),
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage2_obb_depth.py": ("center", "z"),
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage3_obb_depth_size.py": (
+            "center", "z", "size"
+        ),
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage4_full.py": (
+            "center", "z", "size", "rotation"
+        ),
+    }
+    for filename, attributes in expected.items():
+        cfg = Config.fromfile(f"configs/yopo/{filename}")
+        assert cfg.max_objects == 100
+        assert cfg.model.num_queries == cfg.max_objects
+        assert cfg.model.bbox_head.cop_prediction_mode == "chain"
+        assert tuple(cfg.model.bbox_head.distill_attributes) == attributes
+
+    parallel = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_parallel_control.py"
+    )
+    assert parallel.model.bbox_head.cop_prediction_mode == "parallel"
+    assert tuple(parallel.model.bbox_head.distill_attributes) == ()
+
+
+def test_depth_query_sampler_preserves_layer_batch_query_shape_and_is_spatial():
+    sampler = MultiScaleDepthQuerySampler(
+        embed_dims=8, num_levels=3, roi_size=3
+    )
+    depth_features = []
+    for height, width in ((8, 10), (4, 5), (2, 3)):
+        x_ramp = torch.linspace(0, 1, width).view(1, 1, 1, width)
+        depth_features.append(x_ramp.expand(2, 8, height, width).clone())
+    boxes = torch.tensor(
+        [
+            [
+                [[0.2, 0.5, 0.2, 0.2], [0.8, 0.5, 0.2, 0.2]],
+                [[0.3, 0.5, 0.2, 0.2], [0.7, 0.5, 0.2, 0.2]],
+            ],
+            [
+                [[0.1, 0.5, 0.2, 0.2], [0.9, 0.5, 0.2, 0.2]],
+                [[0.4, 0.5, 0.2, 0.2], [0.6, 0.5, 0.2, 0.2]],
+            ],
+        ],
+        dtype=torch.float32,
+    )
+
+    contexts = sampler.forward_layers(depth_features, boxes)
+
+    assert contexts.shape == (2, 2, 2, 8)
+    assert torch.isfinite(contexts).all()
+    assert not torch.allclose(contexts[0, 0, 0], contexts[0, 0, 1])
+
+
+def test_cop_stage_fusion_modes_validate_depth_and_keep_query_shape():
+    current = torch.randn(2, 5, 8)
+    original = torch.randn(2, 5, 8)
+    depth = torch.randn(2, 5, 8)
+
+    for mode in ("residual", "query_dense", "depth_dense"):
+        fusion = CoPStageFusion(embed_dims=8, mode=mode)
+        output = fusion(current, original, depth if mode == "depth_dense" else None)
+        assert output.shape == current.shape
+
+    with pytest.raises(ValueError, match="depth_query"):
+        CoPStageFusion(embed_dims=8, mode="depth_dense")(
+            current, original, None
+        )
+
+
+def test_chain_head_depth_dense_requires_depth_features_and_uses_them():
+    torch.manual_seed(7)
+    head = _head(
+        "chain",
+        cop_fusion_mode="depth_dense",
+        cop_depth_context=dict(num_levels=3, roi_size=3),
+    )
+    hidden = torch.randn(1, 1, 2, 8)
+    references = [torch.full((1, 2, 4), 0.5)]
+    zeros = [torch.zeros(1, 8, h, w) for h, w in ((8, 10), (4, 5), (2, 3))]
+    ramps = [
+        torch.linspace(0, 1, w).view(1, 1, 1, w).expand(1, 8, h, w)
+        for h, w in ((8, 10), (4, 5), (2, 3))
+    ]
+
+    with pytest.raises(ValueError, match="depth_features"):
+        head(hidden, references)
+    outputs_zero = head(hidden, references, depth_features=zeros)
+    outputs_ramp = head(hidden, references, depth_features=ramps)
+
+    assert head.last_depth_context_shape == (1, 1, 2, 8)
+    assert head.last_dense_input_shape == (1, 1, 2, 24)
+    assert any(
+        not torch.allclose(outputs_zero[index], outputs_ramp[index])
+        for index in (3, 4, 5)
+    )
+
+
+def test_curriculum_depth_context_is_enabled_from_depth_stage():
+    expected_modes = {
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py": "query_dense",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage2_obb_depth.py": "depth_dense",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage3_obb_depth_size.py": "depth_dense",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage4_full.py": "depth_dense",
+        "nocs_custom_fruit_rgbd_3dbbox_parallel_control.py": "residual",
+    }
+    for filename, mode in expected_modes.items():
+        cfg = Config.fromfile(f"configs/yopo/{filename}")
+        assert cfg.model.bbox_head.cop_fusion_mode == mode
+    standalone = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_depth_size_rotation.py"
+    )
+    assert standalone.model.bbox_head.cop_fusion_mode == "depth_dense"
+
+
+def test_main_curriculum_uses_safe_pose_center_teacher_and_keeps_obb_ablation():
+    stage1 = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py"
+    )
+    assert stage1.model.bbox_head.center_teacher_source == "pose_center"
+    assert stage1.model.bbox_head.distill_score_threshold == 0.2
+
+    ablation = Config.fromfile(
+        "configs/yopo/"
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb_adapter_ablation.py"
+    )
+    assert ablation.model.bbox_head.center_teacher_source == "obb_adapter"
+
+
+def test_chain_encoder_pose_disable_requires_explicit_2d_assigner():
+    with pytest.raises(ValueError, match="encoder_assigner"):
+        _head(
+            "chain",
+            cop_encoder_pose_supervision=False,
+            train_cfg=dict(
+                assigner=dict(
+                    type="HungarianAssigner",
+                    match_costs=[dict(type="FocalLossCost", weight=1.0)],
+                )
+            ),
+        )
+
+
+def test_curriculum_disables_encoder_parallel_pose_but_control_keeps_it():
+    for filename in (
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage1_obb.py",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage2_obb_depth.py",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage3_obb_depth_size.py",
+        "nocs_custom_fruit_rgbd_3dbbox_cop_stage4_full.py",
+    ):
+        cfg = Config.fromfile(f"configs/yopo/{filename}")
+        assert cfg.model.bbox_head.cop_encoder_pose_supervision is False
+        cost_types = [
+            cost.type for cost in cfg.model.train_cfg.encoder_assigner.match_costs
+        ]
+        assert cost_types == ["FocalLossCost", "BBoxL1Cost", "IoUCost"]
+
+    parallel = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_parallel_control.py"
+    )
+    assert parallel.model.bbox_head.cop_encoder_pose_supervision is True
+
+
+class _FailIfCalled(nn.Module):
+    def forward(self, _inputs):
+        raise RuntimeError("encoder pose branch was called")
+
+
+def test_chain_pre_decoder_skips_encoder_pose_branches():
+    from yopo.registry import MODELS
+    from yopo.utils import register_all_modules
+
+    register_all_modules()
+    shapes = torch.tensor([[8, 10], [4, 5], [2, 3], [1, 2]])
+    num_tokens = int((shapes[:, 0] * shapes[:, 1]).sum())
+    memory = torch.randn(1, num_tokens, 256)
+    mask = torch.zeros(1, num_tokens, dtype=torch.bool)
+
+    chain_cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage2_obb_depth.py"
+    )
+    chain = MODELS.build(chain_cfg.model).eval()
+    layer_id = chain.decoder.num_layers
+    chain.bbox_head.reg_z_branch[layer_id] = _FailIfCalled()
+    chain.bbox_head.reg_rotation_branch[layer_id] = _FailIfCalled()
+    chain.bbox_head.reg_size_branch[layer_id] = _FailIfCalled()
+    _, chain_head_inputs = chain.pre_decoder(memory, mask, shapes)
+    assert chain_head_inputs == {}
+
+    parallel_cfg = Config.fromfile(
+        "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_parallel_control.py"
+    )
+    parallel = MODELS.build(parallel_cfg.model).eval()
+    layer_id = parallel.decoder.num_layers
+    parallel.bbox_head.reg_z_branch[layer_id] = _FailIfCalled()
+    with pytest.raises(RuntimeError, match="encoder pose branch was called"):
+        parallel.pre_decoder(memory, mask, shapes)
+
+
+def test_chain_loss_accepts_absent_auxiliary_prediction_tensors():
+    head = _head("chain")
+
+    def fake_loss_by_feat_single(cls_scores, *_args, **_kwargs):
+        zero = cls_scores.sum() * 0
+        return (zero,) * 10
+
+    head.loss_by_feat_single = fake_loss_by_feat_single
+    cls_scores = torch.zeros(2, 1, 3, 1)
+    bbox_preds = torch.zeros(2, 1, 3, 4)
+    center_preds = torch.zeros(2, 1, 3, 2)
+    z_preds = torch.zeros(2, 1, 3, 1)
+    rotation_preds = torch.zeros(2, 1, 3, 6)
+    size_preds = torch.zeros(2, 1, 3, 3)
+
+    losses = head.loss_by_feat_simple(
+        cls_scores,
+        bbox_preds,
+        center_preds,
+        z_preds,
+        rotation_preds,
+        size_preds,
+        None,
+        None,
+        None,
+        batch_gt_instances=[],
+        batch_img_metas=[],
+    )
+
+    assert "loss_z" in losses
+    assert "d0.loss_z" in losses
+    assert all("chain" not in key for key in losses)
+
+
+def test_encoder_loss_keys_follow_chain_and_parallel_supervision_modes():
+    assigner = dict(
+        type="HungarianAssigner",
+        match_costs=[dict(type="FocalLossCost", weight=1.0)],
+    )
+    chain = _head(
+        "chain",
+        cop_encoder_pose_supervision=False,
+        train_cfg=dict(assigner=assigner, encoder_assigner=assigner),
+    )
+    parallel = _head("parallel", train_cfg=dict(assigner=assigner))
+
+    cls_scores = torch.zeros(1, 1, 2, 1)
+    bbox_preds = torch.zeros(1, 1, 2, 4)
+    center_preds = torch.zeros(1, 1, 2, 2)
+    z_preds = torch.zeros(1, 1, 2, 1)
+    rotation_preds = torch.zeros(1, 1, 2, 6)
+    size_preds = torch.zeros(1, 1, 2, 3)
+
+    def encoder_keys(head):
+        head.split_outputs = lambda *outputs: (*outputs[:6],) + (None,) * 6
+        head.loss_by_feat_simple = lambda *_args, **_kwargs: {}
+
+        def fake_loss_by_feat_single(cls_score, *_args, **_kwargs):
+            zero = cls_score.sum() * 0
+            return (zero,) * 10
+
+        head.loss_by_feat_single = fake_loss_by_feat_single
+        losses = head.loss_by_feat(
+            cls_scores,
+            bbox_preds,
+            center_preds,
+            z_preds,
+            rotation_preds,
+            size_preds,
+            None,
+            None,
+            None,
+            cls_scores[0],
+            bbox_preds[0],
+            center_preds[0],
+            z_preds[0],
+            rotation_preds[0],
+            size_preds[0],
+            batch_gt_instances=[],
+            batch_img_metas=[],
+            dn_meta=None,
+        )
+        return {key for key in losses if key.startswith("enc_")}
+
+    assert encoder_keys(chain) == {
+        "enc_loss_cls",
+        "enc_loss_bbox",
+        "enc_loss_iou",
+        "enc_loss_centers_2d",
+    }
+    assert encoder_keys(parallel) == {
+        "enc_loss_cls",
+        "enc_loss_bbox",
+        "enc_loss_iou",
+        "enc_loss_centers_2d",
+        "enc_loss_z",
+        "enc_loss_rotation",
+        "enc_loss_size",
+    }

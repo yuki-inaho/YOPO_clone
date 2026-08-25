@@ -1406,7 +1406,8 @@ class SimpleDINO9DPoseHead(DeformableDETRHead):
                 hidden_states: Tensor,
                 references: List[Tensor],
                 batch_data_samples: SampleList,
-                rescale: bool = True) -> InstanceList:
+                rescale: bool = True,
+                depth_features=None) -> InstanceList:
         """Perform forward propagation and loss calculation of the detection
         head on the queries of the upstream network.
 
@@ -1437,11 +1438,18 @@ class SimpleDINO9DPoseHead(DeformableDETRHead):
             data_samples.metainfo for data_samples in batch_data_samples
         ]
 
-        outs = self(hidden_states, references)
+        if depth_features is None:
+            outs = self(hidden_states, references)
+        else:
+            # RGB-D center heads consume query-aligned pre-fusion depth
+            # features while ordinary 9D heads keep the historical signature.
+            outs = self(
+                hidden_states, references, depth_features=depth_features)
 
-        # Subclasses (e.g. DINO9DCenter2DPoseHead) may return extra outputs
-        # (CoP chain predictions) after the first 6; the prediction head only
-        # consumes the core parallel outputs.
+        # Subclasses (e.g. DINO9DCenter2DPoseHead) may return auxiliary CoP
+        # outputs after the first 6. The first 6 are always the selected
+        # primary path: parallel outputs in parallel/auxiliary mode and CoP
+        # outputs in chain mode.
         predictions = self.predict_by_feat(
             *outs[:6], batch_img_metas=batch_img_metas, rescale=rescale)
         return predictions

@@ -80,15 +80,8 @@ class RGBDDualBackbone(BaseModule):
             self.fuse_norm.append(
                 nn.Identity() if norm is None else norm(out_channels))
 
-    def forward(self, x):
-        """Forward.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (N, 4, H, W).
-
-        Returns:
-            list[torch.Tensor]: Fused feature maps, one per scale.
-        """
+    def _forward_modalities(self, x):
+        """Return fused maps and the projected pre-fusion depth maps."""
         assert x.dim() == 4, f'expected (N, 4, H, W), got {tuple(x.shape)}'
         assert x.shape[1] == 4, (
             'RGBDDualBackbone expects a 4-channel (RGB+depth) input, '
@@ -103,11 +96,27 @@ class RGBDDualBackbone(BaseModule):
         assert len(depth_feats) == self.num_scales
 
         outs = []
+        projected_depth = []
         for i in range(self.num_scales):
             c = self.rgb_proj[i](rgb_feats[i])
             d = self.depth_proj[i](depth_feats[i])
+            projected_depth.append(d)
             f = torch.cat([c, d], dim=1)
             f = self.fuse[i](f)
             f = self.fuse_norm[i](f)
             outs.append(f)
-        return outs
+        return outs, projected_depth
+
+    def forward(self, x):
+        """Return fused feature maps, preserving the historical API."""
+        fused, _ = self._forward_modalities(x)
+        return fused
+
+    def forward_with_depth_features(self, x):
+        """Return fused maps and query-source depth maps explicitly.
+
+        The depth maps are projected to ``out_channels`` but are captured
+        before RGB/depth concatenation. This keeps their modality identity for
+        the CoP depth-query sampler without duplicating either backbone.
+        """
+        return self._forward_modalities(x)
