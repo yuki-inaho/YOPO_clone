@@ -6,7 +6,7 @@ from .crowdhuman import CrowdHumanDataset
 from .dataset_wrappers import ConcatDataset, MultiImageMixDataset
 from .deepfashion import DeepFashionDataset
 from .dod import DODDataset
-from .dota_tomato import DOTATomatoDataset
+from .dota_tomato import DOTAOBBDataset, DOTATomatoDataset
 from .dsdl import DSDLDetDataset
 from .flickr30k import Flickr30kDataset
 from .isaid import iSAIDDataset
@@ -38,5 +38,6 @@ __all__ = [
     'ODVGDataset', 'MDETRStyleRefCocoDataset', 'DODDataset',
     'CustomSampleSizeSampler', 'Flickr30kDataset', 'CocoCaptionDataset',
     'RefCocoDataset', 'iSAIDDataset', 'YCBVideoBOPDataset', 'NOCSDataset',
-    'HouseCat6DDataset', 'Wild6DDataset', 'DOTATomatoDataset'
+    'HouseCat6DDataset', 'Wild6DDataset', 'DOTAOBBDataset',
+    'DOTATomatoDataset'
 ]

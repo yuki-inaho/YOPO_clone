@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from yopo.apis import inference_detector, init_detector
+from yopo.utils import register_mmengine_checkpoint_safe_globals
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +68,7 @@ def main() -> None:
     args = parse_args()
     if args.num_images < 1 or args.max_dets < 1:
         raise ValueError('--num-images and --max-dets must both be positive')
+    register_mmengine_checkpoint_safe_globals()
 
     image_dir = Path(args.image_dir)
     output_dir = Path(args.output_dir)

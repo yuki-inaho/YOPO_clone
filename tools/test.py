@@ -12,7 +12,8 @@ from mmengine.runner import Runner
 from yopo.engine.hooks.utils import trigger_visualization_hook
 from yopo.evaluation import DumpDetResults
 from yopo.registry import RUNNERS
-from yopo.utils import setup_cache_size_limit_of_dynamo
+from yopo.utils import (register_mmengine_checkpoint_safe_globals,
+                        setup_cache_size_limit_of_dynamo)
 
 
 # TODO: support fuse_conv_bn and format_only
@@ -69,6 +70,7 @@ def main():
     # Reduce the number of repeated compilations and improve
     # testing speed.
     setup_cache_size_limit_of_dynamo()
+    register_mmengine_checkpoint_safe_globals()
 
     # load config
     cfg = Config.fromfile(args.config)
