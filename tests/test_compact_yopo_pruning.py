@@ -22,6 +22,10 @@ from yopo.utils import register_all_modules
 ROOT = Path(__file__).resolve().parents[1]
 COMPACT_CONFIG = ROOT / "configs/yopo/nocs_fruits_2025_2026_rgbd_3dbbox_" \
     "b1b0_e4d4_ffn1024_native_800x600.py"
+AMP_FINETUNE_CONFIG = ROOT / "configs/yopo/nocs_fruits_2025_2026_rgbd_3dbbox_" \
+    "b1b0_e4d4_ffn1024_amp_finetune.py"
+AMP_CAPACITY_CONFIG = ROOT / "configs/yopo/nocs_fruits_2025_2026_rgbd_3dbbox_" \
+    "b1b0_e4d4_ffn1024_amp_capacity.py"
 
 
 def test_compact_config_builds_expected_architecture() -> None:
@@ -44,6 +48,54 @@ def test_compact_config_builds_expected_architecture() -> None:
     groups = discover_transformer_ffn_groups(model)
     assert len(groups) == 8
     assert {group.hidden_channels for group in groups} == {1024}
+
+
+def test_compact_config_uses_joint_native_800x600_data() -> None:
+    cfg = Config.fromfile(COMPACT_CONFIG)
+
+    datasets = cfg.train_dataloader.dataset.datasets
+    assert [dataset.data_root for dataset in datasets] == [
+        "data/fruits_rgbd_2025_2026_800x600_preprocessed/2025/",
+        "data/fruits_rgbd_2025_2026_800x600_preprocessed/2026/",
+    ]
+    assert cfg.model.data_preprocessor.pad_size_divisor == 1
+    for dataset in datasets:
+        transform_names = [step.type for step in dataset.pipeline]
+        assert not {
+            "Resize", "ResizeforPose", "ResizeOBBGaussians", "Pad"
+        }.intersection(transform_names)
+
+
+def test_compact_amp_finetune_replaces_stale_lr_policy() -> None:
+    cfg = Config.fromfile(AMP_FINETUNE_CONFIG)
+
+    assert cfg.optim_wrapper.type == "AmpScheduleFreeOptimWrapper"
+    assert cfg.optim_wrapper.dtype == "float16"
+    assert cfg.optim_wrapper.loss_scale == pytest.approx(0.25)
+    assert cfg.optim_wrapper.optimizer.type == "AdamWScheduleFreeOptimizer"
+    assert cfg.optim_wrapper.optimizer.lr == pytest.approx(1e-4)
+    assert cfg.train_dataloader.batch_size == 30
+    assert cfg.auto_scale_lr.base_batch_size == 30
+    assert cfg.auto_scale_lr.enable is False
+    custom_keys = cfg.optim_wrapper.paramwise_cfg.custom_keys
+    assert "backbone" not in custom_keys
+    assert custom_keys["backbone.rgb_backbone"].lr_mult == pytest.approx(0.1)
+    assert custom_keys["neck"].lr_mult == pytest.approx(1.0)
+    assert custom_keys["encoder"].lr_mult == pytest.approx(0.5)
+    assert custom_keys["bbox_head.reg_rotation_branch"].lr_mult \
+        == pytest.approx(0.25)
+
+
+def test_compact_capacity_config_is_bounded_and_write_free() -> None:
+    cfg = Config.fromfile(AMP_CAPACITY_CONFIG)
+
+    assert cfg.train_cfg.type == "IterBasedTrainLoop"
+    assert cfg.train_cfg.max_iters == 3
+    assert cfg.train_dataloader.batch_size == 30
+    assert cfg.val_dataloader is None
+    assert cfg.val_evaluator is None
+    assert cfg.default_hooks.checkpoint.save_last is False
+    assert cfg.custom_hooks == [dict(type="ScheduleFreeOptimizerModeHook")]
 
 
 def test_group_fisher_sums_tied_sites_before_square() -> None:

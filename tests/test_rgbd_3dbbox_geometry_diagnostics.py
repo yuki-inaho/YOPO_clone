@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 import torch
 from mmengine.logging.history_buffer import HistoryBuffer
-from mmengine.structures import InstanceData
 
 from tools.analysis_tools.diagnose_rgbd_3dbbox_geometry import (
     evaluate_geometry_contract,
@@ -54,6 +53,41 @@ def test_matching_translation_uses_pixel_center_before_inverse_projection():
         torch.tensor([[0.0, 0.0, 2.0]]),
         atol=1e-6,
     )
+
+
+def test_matching_translation_is_float32_and_differentiable_for_fp16_inputs():
+    head = _head()
+    centers = torch.tensor(
+        [[0.5, 0.5]], dtype=torch.float16, requires_grad=True)
+    log_depth = torch.tensor(
+        [[np.log(2.0)]], dtype=torch.float16, requires_grad=True)
+    pred = head._build_matching_pred_instances(
+        cls_score=torch.zeros(1, 1, dtype=torch.float16),
+        bbox_pred=torch.tensor(
+            [[0.5, 0.5, 0.2, 0.2]], dtype=torch.float16),
+        centers_2d_pred=centers,
+        z_pred=log_depth,
+        rotation_pred=torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]], dtype=torch.float16),
+        sizes_pred=torch.tensor(
+            [[0.2, 0.3, 0.4]], dtype=torch.float16),
+        img_meta=dict(
+            img_shape=(480, 640),
+            intrinsic=[100.0, 100.0, 320.0, 240.0],
+        ),
+    )
+
+    assert pred.translations.dtype == torch.float32
+    assert torch.isfinite(pred.translations).all()
+    torch.testing.assert_close(
+        pred.translations,
+        torch.tensor([[0.0, 0.0, 2.0]]),
+        atol=2e-3,
+        rtol=0.0,
+    )
+    pred.translations.sum().backward()
+    assert centers.grad is not None and torch.isfinite(centers.grad).all()
+    assert log_depth.grad is not None and torch.isfinite(log_depth.grad).all()
 
 
 def test_geometry_contract_and_summary_are_json_safe():

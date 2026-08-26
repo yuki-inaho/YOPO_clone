@@ -207,5 +207,71 @@ depth adapters、neck と sliced FFN の回復を優先し、低 LR で全体 fi
 3. plan なし group L2、Group Fisher、必要なら Taylor の同一条件比較。
 4. NaN/Inf、peak VRAM、step time、checkpoint resume。
 
-現在 GPU は別プロセスが約 31.5 GiB 使用中だったため、800x600 の CUDA capacity
-probe と 512-sample production calibration は未実施である。
+### Main branch統合後のAMP capacity実測
+
+Stage-12 epoch 20終了後、`rgb-d`へ機能commitとdocs訂正commitだけをcherry-pickした。
+隔離snapshotは取り込んでいない。Stage-12の`best_AP50_95_epoch_20.pth`はjoint
+800x600 teacher configへ`strict=True`で全key一致し、次のGroup-L2初版partial
+checkpointを生成した。
+
+- partial checkpoint:
+  `/home/kasm-user/Desktop/YOPO_clone_artifacts/work_dirs/compact_b1b0_e4d4_ffn1024_800x600/stage12e20_group_l2_partial.pth`
+- SHA-256: `975d382e46644f1f61b4240bdcf8636c6c03e43d1b50332d45a4f52b10fc9d27`
+- parameter: 43,700,041 -> 24,589,045（43.7%減）
+- loaded key: 766、FFN physical slice: 8、prediction remap: 56
+- unhandled shape mismatch: 0
+
+capacityは実際の2025+2026 joint dataset、`4x600x800`、base LR `1e-4`、
+ScheduleFree AdamW、AMPで測定した。最初のFP16試行でmatching用の
+`torch.inverse(Half)`を検出したため、中心逆投影だけautocast無効のfloat32
+`torch.linalg.solve`へ集約した。FP16のbackward overflowはloss scaleを1.0から
+0.25へ下げることで解消した。これはunscale後のgradient/LRを変えない。
+
+| precision / scale | physical batch | update | process peak | 判定 |
+|---|---:|---:|---:|---|
+| FP16 / 1.0 | 24 | 3 | 23,942 MiB | finite |
+| FP16 / 1.0 | 28 | 3 | 28,160 MiB | gradient overflow、非採用 |
+| FP16 / 1.0 | 32 | 3 | 31,582 MiB | 3回目gradient overflow、非採用 |
+| BF16 / 1.0 | 32 | 0 | 14,300 MiBまで | MMCV deformable-attentionがBF16未実装 |
+| FP16 / 0.25 | 32 | 3 | 31,582 MiB | finiteだが余裕1,025 MiBのみ |
+| FP16 / 0.25 | 30 | 10 | 30,132 MiB | 全loss/grad finite、採用 |
+
+採用値はphysical batch 30。RTX 5090 total 32,607 MiBに対し2,475 MiB
+（2.42 GiB）のprocess余裕を残す。batch 32は短期的には通るが、長時間run、
+validation切替、display/CUDA contextの変動に対して余裕が小さいため採用しない。
+10 updateでlossは141.0032から79.1789、grad normは1343.1610から459.5631へ
+finiteのまま低下した。
+
+BF16については次の2 issueが同じ未実装errorを報告している。MMCV側issueの
+native PyTorch fallback案は未実装であり、現行CUDA extensionを迂回する独自slow
+pathは追加しない。
+
+- <https://github.com/IDEA-Research/Grounded-SAM-2/issues/38>
+- <https://github.com/open-mmlab/mmcv/issues/2878>
+
+採用学習config:
+
+`configs/yopo/nocs_fruits_2025_2026_rgbd_3dbbox_b1b0_e4d4_ffn1024_amp_finetune.py`
+
+容量測定用config:
+
+`configs/yopo/nocs_fruits_2025_2026_rgbd_3dbbox_b1b0_e4d4_ffn1024_amp_capacity.py`
+
+Group-L2 partialは配線・容量確認用初版としてのみ残す。その後、同じStage-12
+epoch 20 teacherで2025/2026を交互に256件ずつ、合計512 sampleの実loss backwardを
+行い、production Group Fisher selectionを完了した。
+
+- selection plan:
+  `/home/kasm-user/Desktop/YOPO_clone_artifacts/work_dirs/compact_b1b0_e4d4_ffn1024_800x600/group_fisher_512/production_group_fisher_plan.json`
+- plan SHA-256: `03c07e93d4e5f9d671ad20caac828b8e8c64668ecf759180b8932954c72977d2`
+- score archive SHA-256: `ea446b55d1cad52b4b338344430f398e175313ce8bee21a2d10bbaaf1e6ad470`
+- calibration loss: 512/512 finite、min 38.9383、max 130.5246、mean 55.7079
+- final partial checkpoint:
+  `/home/kasm-user/Desktop/YOPO_clone_artifacts/work_dirs/compact_b1b0_e4d4_ffn1024_800x600/stage12e20_group_fisher512_partial.pth`
+- final checkpoint SHA-256: `d0fe80ba50a87880ba897ca81c5410c2f30f5c1eaffc3bafabd767cc71430f93`
+
+final checkpoint reportは`purpose=selection`、`sample_count=512`、8 FFN groupすべて
+`importance_plan`、56 prediction remap、unexpected/unhandled shape mismatch 0を満たす。
+このcheckpointをloadしたbatch 30最終smokeも3 update finite、process peak
+30,132 MiB、loss 89.2745 -> 76.5227、grad norm 2150.5049 -> 1167.4302で完走した。
+以後のfine-tuningはGroup-L2版ではなく、このGroup Fisher 512版を`load_from`へ渡す。

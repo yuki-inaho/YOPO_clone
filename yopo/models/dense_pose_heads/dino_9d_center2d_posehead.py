@@ -1822,6 +1822,28 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             return self._image_space_intrinsic_matrix(img_meta, reference)
         return self._intrinsic_matrix(img_meta['intrinsic'], reference)
 
+    def _recover_translation(
+            self, intrinsic: Tensor, centers_2d_h: Tensor,
+            z_pred: Tensor) -> Tensor:
+        """Back-project image centers in stable float32 under AMP.
+
+        CUDA/CPU linear algebra does not support every low-precision inverse,
+        and explicitly solving ``K t = p`` is both more stable and cheaper than
+        constructing ``K^-1``.  Casting inside an autocast-disabled island
+        preserves gradients to the center/depth predictions while keeping the
+        geometric result finite.
+        """
+        with torch.autocast(
+                device_type=centers_2d_h.device.type, enabled=False):
+            centers_float = centers_2d_h.float()
+            intrinsic_float = intrinsic.float()
+            z_float = z_pred.float()
+            depth = torch.exp(z_float) if self.use_log_z else z_float
+            rays = torch.linalg.solve(
+                intrinsic_float, centers_float.transpose(0, 1)
+            ).transpose(0, 1)
+            return depth * rays
+
     def _build_matching_pred_instances(
             self, cls_score: Tensor, bbox_pred: Tensor,
             centers_2d_pred: Tensor, z_pred: Tensor,
@@ -1847,9 +1869,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             torch.ones_like(centers_2d_pred[:, :1])
         ], dim=1)
         intrinsic = self._training_intrinsic_matrix(img_meta, centers_2d_h)
-        depth = torch.exp(z_pred) if self.use_log_z else z_pred
-        t_recovered = depth * (
-            torch.inverse(intrinsic) @ centers_2d_h.T).T
+        t_recovered = self._recover_translation(
+            intrinsic, centers_2d_h, z_pred)
 
         pred_labels = cls_score.argmax(dim=-1)
         if self.classwise_rotation:
@@ -2186,12 +2207,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             intrinsic = torch.tensor(intrinsic).to(centers_2d_h.device)
         intrinsic = intrinsic.view(3, 3)
 
-        if self.use_log_z:
-            depth = torch.exp(z_pred)
-        else:
-            depth = z_pred
-
-        t_recovered = depth * (torch.inverse(intrinsic) @ centers_2d_h.T).T
+        t_recovered = self._recover_translation(
+            intrinsic, centers_2d_h, z_pred)
 
         # generate 3x4 transformation matrix
         T = torch.zeros(det_bboxes.shape[0], 4, 4).to(det_bboxes.device)
