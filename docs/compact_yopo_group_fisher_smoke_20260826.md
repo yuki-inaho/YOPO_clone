@@ -125,13 +125,14 @@ cd /home/kasm-user/Desktop/YOPO_hgnetv2_b1_mmrazor_smoke
 .venv/bin/pytest -q tests/test_compact_yopo_pruning.py
 ```
 
-結果: `5 passed`。次を確認した。
+結果: `6 passed`。次を確認した。
 
 - compact config が 24,589,045 parameters、4+4 FFN group を構築する。
 - tied site を square 前に加算する Fisher / Taylor の解析値一致。
 - FFN coupled-axis slice と encoder proposal branch remap。
 - dense masked FFN と physically sliced FFN の出力 parity。
 - smoke plan の明示 opt-in。
+- calibrated plan に必要な target FFN group が欠けた場合の fail-closed。
 
 ### 2. synthetic wiring smoke
 
