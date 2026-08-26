@@ -87,3 +87,8 @@ accuracy gate.
   samples from both years now verify as `4x600x800`, `img_shape==ori_shape`,
   and `scale_factor==(1.0, 1.0)`. Resume must use `epoch_5.pth` with optimizer
   state rather than restarting or loading it as model-only.
+- Post-fix standalone validation completed all 511 images: AP50 `0.4420`,
+  AP75 `0.1561`, AP50:95 `0.2054`. It emitted no 3D metric, as required by
+  Stage 1.
+- Exact resume confirmed `epoch=5, iter=425`; epoch 6 continued at base LR
+  `1e-4` with the restored optimizer state and finite losses.
