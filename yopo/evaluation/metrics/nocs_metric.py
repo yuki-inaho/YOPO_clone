@@ -182,6 +182,11 @@ class NOCSMetric(BaseMetric):
         two_phase_3d_iou (bool): Use proof-safe upper-bound pruning before the
             exact 3D OBB kernel. Defaults to True. Set False to A/B runtime or
             retain every below-threshold diagnostic overlap value.
+        compute_pose_metrics (bool): Compute 3D IoU and pose AP in addition to
+            2D HBB AP.  Set False for a detection-only curriculum stage.  In
+            that mode pose predictions are neither read nor normalized, so a
+            2D validation run cannot accidentally depend on an untrained 3D
+            head. Defaults to True.
         prefix (str, optional): The prefix that will be added in the metric
             names to disambiguate homonymous metrics of different evaluators.
             If prefix is not provided in the argument, self.default_prefix
@@ -200,6 +205,7 @@ class NOCSMetric(BaseMetric):
         iou_thrs: Union[Real, Sequence[float]] = 0.5,
         hbb_selection: Optional[dict] = None,
         two_phase_3d_iou: bool = True,
+        compute_pose_metrics: bool = True,
     ) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.nms_cfg = nms_cfg
@@ -213,6 +219,14 @@ class NOCSMetric(BaseMetric):
         if not isinstance(two_phase_3d_iou, bool):
             raise TypeError("two_phase_3d_iou must be a bool")
         self.two_phase_3d_iou = two_phase_3d_iou
+        if not isinstance(compute_pose_metrics, bool):
+            raise TypeError("compute_pose_metrics must be a bool")
+        if not compute_pose_metrics and dump_results_path:
+            raise ValueError(
+                "dump_results_path requires compute_pose_metrics=True because "
+                "the dump contract includes 3D pose fields"
+            )
+        self.compute_pose_metrics = compute_pose_metrics
         self.format_only = format_only
         self.dump_results_path = dump_results_path
         assert dump_format in ["pickle", "json"]
@@ -394,15 +408,11 @@ class NOCSMetric(BaseMetric):
             pred = data_sample["pred_instances"]
             keep = select_aligned_prediction_indices(
                 pred, score_thr=self.score_thr, nms_cfg=self.nms_cfg)
-            for field in (
-                "bboxes",
-                "scores",
-                "labels",
-                "translations",
-                "rotations",
-                "sizes",
-                "T",
-            ):
+            prediction_fields = ["bboxes", "scores", "labels"]
+            if self.compute_pose_metrics:
+                prediction_fields.extend(
+                    ["translations", "rotations", "sizes", "T"])
+            for field in prediction_fields:
                 result[field] = pred[field][keep].cpu().numpy()
 
             # A diagnostic 2D AP sweep often needs all decoder queries, while
@@ -421,13 +431,14 @@ class NOCSMetric(BaseMetric):
                 }
 
             # gt_scale = np.linalg.norm(ann['sizes'], axis=1)
-            pred_scale = np.linalg.norm(result["sizes"], axis=1)
-            result["sizes"] = result["sizes"] / pred_scale[:, None]
-            # ann['sizes'] = ann['sizes'] / gt_scale[:, None]
-            # # gt_R = ann['T'][:, :3, :3] * gt_scale[:, None, None]
-            pred_R = result["T"][:, :3, :3] * pred_scale[:, None, None]
-            # # ann['T'][:, :3, :3] = gt_R
-            result["T"][:, :3, :3] = pred_R
+            if self.compute_pose_metrics:
+                pred_scale = np.linalg.norm(result["sizes"], axis=1)
+                result["sizes"] = result["sizes"] / pred_scale[:, None]
+                # ann['sizes'] = ann['sizes'] / gt_scale[:, None]
+                # # gt_R = ann['T'][:, :3, :3] * gt_scale[:, None, None]
+                pred_R = result["T"][:, :3, :3] * pred_scale[:, None, None]
+                # # ann['T'][:, :3, :3] = gt_R
+                result["T"][:, :3, :3] = pred_R
 
             if self.dump_results_path:
                 self.dump_results(result, data_sample)
@@ -846,6 +857,8 @@ class NOCSMetric(BaseMetric):
         # sets cannot accidentally masquerade as the canonical metric.
         if _is_coco_iou_range(self.iou_thrs):
             eval_results["AP50_95"] = float(np.mean(tuple(aps_by_iou.values())))
+        if not self.compute_pose_metrics:
+            return eval_results
         logger.info(
             "3d_iou_* uses exact arbitrary-SO(3) oriented cuboid overlap; "
             "historical values from the pre-2026-08-26 corner-axis metric "

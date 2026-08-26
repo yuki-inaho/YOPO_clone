@@ -242,3 +242,55 @@ def test_omitted_hbb_selection_preserves_single_view():
 def test_invalid_hbb_selection_fails_fast(hbb_selection, error_type):
     with pytest.raises(error_type, match="hbb_selection"):
         NOCSMetric(hbb_selection=hbb_selection)
+
+
+def test_detection_only_metrics_never_call_pose_evaluation(monkeypatch):
+    metric = NOCSMetric(
+        nms_cfg=None,
+        score_thr=0.0,
+        iou_thrs=[0.5, 0.75],
+        compute_pose_metrics=False,
+    )
+    metric.dataset_meta = {"classes": ("fruit",)}
+    metric.compute_independent_mAP = lambda *args, **kwargs: pytest.fail(
+        "detection-only validation must not run 3D pose evaluation"
+    )
+    monkeypatch.setattr(
+        nocs_metric_module,
+        "eval_map",
+        lambda *args, **kwargs: (kwargs["iou_thr"], []),
+    )
+
+    result = metric.compute_metrics([_sample()])
+
+    assert result == {"AP50": pytest.approx(0.5), "AP75": pytest.approx(0.75)}
+
+
+def test_detection_only_process_does_not_require_pose_predictions():
+    sample = _process_data_sample()
+    sample["pred_instances"] = {
+        key: sample["pred_instances"][key]
+        for key in ("labels", "bboxes", "scores")
+    }
+    metric = NOCSMetric(
+        nms_cfg=None, score_thr=0.0, compute_pose_metrics=False)
+    metric.dataset_meta = {"classes": ("fruit",)}
+
+    metric.process({}, [sample])
+
+    _, pred = metric.results[0]
+    assert set(pred) == {"labels", "bboxes", "scores"}
+
+
+@pytest.mark.parametrize("value", [None, 0, "false"])
+def test_invalid_compute_pose_metrics_fails_fast(value):
+    with pytest.raises(TypeError, match="compute_pose_metrics"):
+        NOCSMetric(compute_pose_metrics=value)
+
+
+def test_detection_only_metric_rejects_pose_dump_contract(tmp_path):
+    with pytest.raises(ValueError, match="dump_results_path"):
+        NOCSMetric(
+            compute_pose_metrics=False,
+            dump_results_path=str(tmp_path),
+        )
