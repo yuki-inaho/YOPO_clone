@@ -67,12 +67,24 @@ class NOCSCustomFruitDataset(NOCSDataset):
             raise ValueError(
                 "OBB/instance count mismatch: "
                 f"{len(raw_obbs)} vs {len(instances)}")
+        coordinate_scale = gt_info.get(
+            "obb_coordinate_scale", self.obb_coordinate_scale)
+        if (
+            isinstance(coordinate_scale, bool)
+            or not np.isscalar(coordinate_scale)
+            or not np.isfinite(float(coordinate_scale))
+            or float(coordinate_scale) <= 0.0
+        ):
+            raise ValueError(
+                "obb_coordinate_scale label metadata must be positive, got "
+                f"{coordinate_scale!r}")
+        coordinate_scale = float(coordinate_scale)
         for instance, raw_obb in zip(instances, raw_obbs):
             obb = np.asarray(raw_obb, dtype=np.float64).copy()
             if obb.shape != (5,) or not np.isfinite(obb).all() or \
                     np.any(obb[2:4] <= 0.0):
                 raise ValueError(f"invalid custom fruit OBB: {raw_obb}")
-            obb[:4] *= self.obb_coordinate_scale
+            obb[:4] *= coordinate_scale
             cosine = np.cos(obb[4])
             sine = np.sin(obb[4])
             rotation_2d = np.array(

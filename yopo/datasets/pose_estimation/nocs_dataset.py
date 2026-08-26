@@ -1,18 +1,13 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import json
 import os
 import os.path as osp
 from typing import List, Optional, Union
 import pickle
 
 import numpy as np
-import torch
-from mmengine.fileio import get, get_local_path, list_from_file
 
 from yopo.registry import DATASETS
 from ..base_det_dataset import BaseDetDataset
-
-from .nocs_utils import get_bbox
 
 
 @DATASETS.register_module()
@@ -99,8 +94,9 @@ class NOCSDataset(BaseDetDataset):
         # Allow overriding the (normally hard-coded) per-split intrinsic from
         # the config. Used by the custom RGB-D dataset whose camera intrinsics
         # differ from the stock NOCS/REAL275 values.
-        if intrinsic is not None:
-            self.SPLIT_INFO[self.split]["intrinsic"] = list(intrinsic)
+        # Keep it per instance: mutating SPLIT_INFO leaks one dataset's camera
+        # into subsequently constructed datasets in the same Python process.
+        self._intrinsic_override = list(intrinsic) if intrinsic is not None else None
         self.num_sample_points = num_sample_points
         self.use_cuboid_as_bbox = use_cuboid_as_bbox
         self.use_log_z = use_log_z
@@ -140,7 +136,7 @@ class NOCSDataset(BaseDetDataset):
         dataset_info = self.SPLIT_INFO[self.split]
         img_path = dataset_info["img_path"]
         model_path = dataset_info["model_path"]
-        intrinsic = dataset_info["intrinsic"]
+        intrinsic = self._intrinsic_override or dataset_info["intrinsic"]
 
         self.img_list = [
             osp.join(self.data_root, img_path.split("/")[0], line.rstrip("\n"))
@@ -178,11 +174,34 @@ class NOCSDataset(BaseDetDataset):
             with open(label_file, "rb") as f:
                 gt_info = pickle.load(f)
 
+            # Custom portable labels may carry their own K and image shape.
+            # Stock NOCS labels omit both and retain the split-level defaults.
+            frame_intrinsic = gt_info.get("intrinsic", intrinsic)
+            frame_intrinsic = np.asarray(frame_intrinsic, dtype=np.float64).reshape(-1)
+            if frame_intrinsic.size not in (4, 9) or not np.isfinite(frame_intrinsic).all():
+                raise ValueError(
+                    f"invalid per-frame intrinsic in {label_file}: "
+                    f"shape={frame_intrinsic.shape}")
+            image_size_wh = np.asarray(
+                gt_info.get("image_size_wh", [self.IMG_SHAPE[1], self.IMG_SHAPE[0]])
+            ).reshape(-1)
+            if (
+                image_size_wh.size != 2
+                or not np.issubdtype(image_size_wh.dtype, np.number)
+                or not np.isfinite(image_size_wh.astype(np.float64)).all()
+                or np.any(image_size_wh.astype(np.float64) <= 0)
+            ):
+                raise ValueError(
+                    f"invalid per-frame image_size_wh in {label_file}: {image_size_wh}")
+            frame_width, frame_height = (int(value) for value in image_size_wh)
+
             raw_img_info = {}
             raw_img_info["img_id"] = img_id
             raw_img_info["file_name"] = file_name
             raw_img_info["img_path"] = img_file + "_color.png"
-            raw_img_info["intrinsic"] = intrinsic
+            raw_img_info["intrinsic"] = frame_intrinsic.tolist()
+            raw_img_info["width"] = frame_width
+            raw_img_info["height"] = frame_height
 
             parsed_data_info = self.parse_data_info(raw_img_info, gt_info)
             if parsed_data_info is None:
@@ -219,8 +238,8 @@ class NOCSDataset(BaseDetDataset):
         data_info["img_id"] = img_info["img_id"]
         data_info["intrinsic"] = img_info["intrinsic"]
 
-        data_info["height"] = self.IMG_SHAPE[0]
-        data_info["width"] = self.IMG_SHAPE[1]
+        data_info["height"] = img_info["height"]
+        data_info["width"] = img_info["width"]
 
         data_info["instances"] = self._parse_instance_info(
             gt_info, data_info["intrinsic"]
@@ -305,7 +324,7 @@ class NOCSDataset(BaseDetDataset):
 
             # center_2d = K @ np.array(translation) / translation[2]  # normalize by z
             # center_2d = center_2d[:2].tolist()  # only x, y
-            fx, fy, cx, cy = intrinsic
+            fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
             if translation[2] > 0:  # Avoid division by zero
                 center_2d_x = fx * translation[0] / translation[2] + cx
                 center_2d_y = fy * translation[1] / translation[2] + cy
