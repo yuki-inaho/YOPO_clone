@@ -14,6 +14,12 @@ def _write_image(path: Path, shape=(24, 32)) -> None:
     assert cv2.imwrite(str(path), image)
 
 
+def _write_depth(path: Path, shape=(24, 32)) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    depth = np.full(shape, 750, dtype=np.uint16)
+    assert cv2.imwrite(str(path), depth)
+
+
 def _write_label(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
@@ -113,6 +119,74 @@ def test_strict_dota_obb_loader_rejects_unpaired_files(tmp_path: Path) -> None:
         _dataset(tmp_path, img_shape=(24, 32), strict_loading=True)
 
 
+def test_strict_dota_obb_loader_adds_paired_depth_path(tmp_path: Path) -> None:
+    _write_image(tmp_path / "images" / "sample.jpg")
+    _write_depth(tmp_path / "depth" / "sample.png")
+    _write_label(
+        tmp_path / "labels" / "sample.txt",
+        "1 2 9 2 9 10 1 10 tomato 0\n",
+    )
+
+    dataset = DOTAOBBDataset(
+        data_root=str(tmp_path),
+        ann_file="labels",
+        data_prefix=dict(img_path="images", depth_path="depth"),
+        metainfo=dict(classes=("tomato",)),
+        img_shape=(24, 32),
+        img_suffixes=(".jpg",),
+        depth_suffixes=(".png",),
+        strict_loading=True,
+        pipeline=[],
+        serialize_data=False,
+    )
+
+    assert dataset.get_data_info(0)["depth_path"].endswith("sample.png")
+
+
+def test_strict_dota_obb_loader_rejects_missing_depth(tmp_path: Path) -> None:
+    _write_image(tmp_path / "images" / "sample.jpg")
+    (tmp_path / "depth").mkdir()
+    _write_label(
+        tmp_path / "labels" / "sample.txt",
+        "1 2 9 2 9 10 1 10 tomato 0\n",
+    )
+
+    with pytest.raises(FileNotFoundError, match="RGB/depth/label stem mismatch"):
+        DOTAOBBDataset(
+            data_root=str(tmp_path),
+            ann_file="labels",
+            data_prefix=dict(img_path="images", depth_path="depth"),
+            metainfo=dict(classes=("tomato",)),
+            img_shape=(24, 32),
+            strict_loading=True,
+            pipeline=[],
+            serialize_data=False,
+        )
+
+
+def test_strict_dota_obb_loader_rejects_depth_shape_mismatch(
+    tmp_path: Path,
+) -> None:
+    _write_image(tmp_path / "images" / "sample.jpg")
+    _write_depth(tmp_path / "depth" / "sample.png", shape=(12, 16))
+    _write_label(
+        tmp_path / "labels" / "sample.txt",
+        "1 2 9 2 9 10 1 10 tomato 0\n",
+    )
+
+    with pytest.raises(ValueError, match="RGB/depth shape mismatch"):
+        DOTAOBBDataset(
+            data_root=str(tmp_path),
+            ann_file="labels",
+            data_prefix=dict(img_path="images", depth_path="depth"),
+            metainfo=dict(classes=("tomato",)),
+            img_shape=(24, 32),
+            strict_loading=True,
+            pipeline=[],
+            serialize_data=False,
+        )
+
+
 def test_legacy_tomato_loader_remains_registered_with_stem_class() -> None:
     assert DOTATomatoDataset.METAINFO["classes"] == ("stem",)
 
@@ -177,3 +251,41 @@ def test_corrected_dota_gwd_stage_changes_only_refinement_policy() -> None:
     )
     assert inference.load_from is None
     assert inference.resume is False
+
+
+def test_corrected_dota_weak_da_matches_reference_policy() -> None:
+    stage1 = Config.fromfile(
+        "configs/yopo/"
+        "rotated_deformable_detr_tomato_obb_corrected_da_weak_riou_stage1.py"
+    )
+    pipeline = stage1.train_dataloader.dataset.pipeline
+
+    assert [transform.type for transform in pipeline] == [
+        "LoadImageFromFile",
+        "LoadAnnotations",
+        "Resize",
+        "RandomFlip",
+        "YOLOXHSVRandomAug",
+        "PackDetInputs",
+    ]
+    assert pipeline[3].prob == pytest.approx(0.75)
+    assert pipeline[3].direction == "vertical"
+    assert pipeline[4].hue_delta == 5
+    assert pipeline[4].saturation_delta == 30
+    assert pipeline[4].value_delta == 30
+    assert all(
+        transform.type != "YOLOXHSVRandomAug"
+        for transform in stage1.val_dataloader.dataset.pipeline
+    )
+    assert stage1.val_evaluator.score_thr == pytest.approx(0.05)
+
+    stage2 = Config.fromfile(
+        "configs/yopo/"
+        "rotated_deformable_detr_tomato_obb_corrected_da_weak_gwd_stage2.py"
+    )
+    assert stage2.train_dataloader.dataset == stage1.train_dataloader.dataset
+    assert stage2.model.bbox_head.loss_iou.type == "GDLoss"
+    assert stage2.model.bbox_head.loss_iou.loss_type == "gwd"
+    assert stage2.load_from.endswith(
+        "rddetr_tomato_obb_corrected_da_weak_riou_stage1/selected_best.pth"
+    )

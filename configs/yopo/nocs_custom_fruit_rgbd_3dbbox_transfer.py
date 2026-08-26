@@ -33,7 +33,7 @@ train_pipeline = [
         with_obb_gaussian=True,
     ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
-    dict(type="Resize", scale=scale, keep_ratio=True),
+    dict(type="ResizeforPose", scale=scale, keep_ratio=True),
     dict(type="ResizeOBBGaussians"),
     dict(type="RandomFlipFor9DPose", prob=0.5),
     dict(type="FilterAnnotations", min_gt_bbox_wh=(1e-2, 1e-2)),
@@ -51,7 +51,7 @@ val_pipeline = [
         with_obb_gaussian=True,
     ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
-    dict(type="Resize", scale=scale, keep_ratio=True),
+    dict(type="ResizeforPose", scale=scale, keep_ratio=True),
     dict(type="ResizeOBBGaussians"),
     dict(
         type="Pack9DPoseInputs",

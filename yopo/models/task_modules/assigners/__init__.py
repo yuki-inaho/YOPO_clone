@@ -7,11 +7,12 @@ from .center_region_assigner import CenterRegionAssigner
 from .dynamic_soft_label_assigner import DynamicSoftLabelAssigner
 from .grid_assigner import GridAssigner
 from .hungarian_assigner import HungarianAssigner
-from .iou2d_calculator import BboxOverlaps2D, BboxOverlaps2D_GLIP
+from .iou2d_calculator import (BboxOverlaps2D, BboxOverlaps2D_GLIP,
+                               RBboxOverlaps2D)
 from .match_cost import (BBoxL1Cost, BinaryFocalLossCost, ClassificationCost,
                          CrossEntropyLossCost, DiceCost, FocalLossCost,
                          IoUCost, RBoxL1Cost, CenterL1Cost, GDCost,
-                         RotatedIoUCost)
+                         OBBChamferCost, RotatedIoUCost)
 from .max_iou_assigner import MaxIoUAssigner
 from .multi_instance_assigner import MultiInstanceAssigner
 from .point_assigner import PointAssigner
@@ -29,8 +30,10 @@ __all__ = [
     'RegionAssigner', 'UniformAssigner', 'SimOTAAssigner',
     'TaskAlignedAssigner', 'TopkHungarianAssigner', 'BBoxL1Cost',
     'ClassificationCost', 'CrossEntropyLossCost', 'DiceCost', 'FocalLossCost',
-    'IoUCost', 'BboxOverlaps2D', 'DynamicSoftLabelAssigner',
+    'IoUCost', 'BboxOverlaps2D', 'RBboxOverlaps2D',
+    'DynamicSoftLabelAssigner',
     'MultiInstanceAssigner', 'BboxOverlaps2D_GLIP',
     'O2MHungarianAssigner', 'RBoxL1Cost', 'CenterL1Cost', 'GDCost',
     'RotatedIoUCost',
+    'OBBChamferCost',
 ]

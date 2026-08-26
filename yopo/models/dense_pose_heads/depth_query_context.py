@@ -19,7 +19,8 @@ class MultiScaleDepthQuerySampler(nn.Module):
                  embed_dims: int = 256,
                  num_levels: int = 3,
                  roi_size: int = 3,
-                 vectorize_layers: bool = True) -> None:
+                 vectorize_layers: bool = True,
+                 in_channels: Sequence[int] | None = None) -> None:
         super().__init__()
         if roi_size < 1 or roi_size % 2 == 0:
             raise ValueError(
@@ -30,6 +31,20 @@ class MultiScaleDepthQuerySampler(nn.Module):
         self.num_levels = num_levels
         self.roi_size = roi_size
         self.vectorize_layers = bool(vectorize_layers)
+        if in_channels is None:
+            in_channels = (embed_dims,) * num_levels
+        if len(in_channels) != num_levels:
+            raise ValueError(
+                f'in_channels must have {num_levels} entries, '
+                f'got {len(in_channels)}')
+        if any(int(channels) < 1 for channels in in_channels):
+            raise ValueError('all in_channels entries must be positive')
+        self.in_channels = tuple(int(channels) for channels in in_channels)
+        self.input_projections = nn.ModuleList([
+            nn.Identity() if channels == embed_dims else
+            nn.Conv2d(channels, embed_dims, kernel_size=1)
+            for channels in self.in_channels
+        ])
         self.output_projection = nn.Sequential(
             nn.Linear(embed_dims * num_levels, embed_dims),
             nn.LayerNorm(embed_dims),
@@ -96,7 +111,9 @@ class MultiScaleDepthQuerySampler(nn.Module):
                 f'expected {self.num_levels} depth levels, '
                 f'got {len(depth_features)}')
         sampled_levels = [
-            self._sample_level(feature, boxes) for feature in depth_features
+            self._sample_level(projection(feature), boxes)
+            for projection, feature in zip(
+                self.input_projections, depth_features)
         ]
         return self.output_projection(torch.cat(sampled_levels, dim=-1))
 

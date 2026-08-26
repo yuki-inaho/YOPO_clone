@@ -20,7 +20,7 @@ from .resnext import ResNeXt
 from .ssd_vgg import SSDVGG
 from .swin import SwinTransformer
 from .trident_resnet import TridentResNet
-from .dual_rgbd import RGBDDualBackbone
+from .dual_rgbd import RGBDDualBackbone, RGBDResidualBackbone
 
 __all__ = [
     'RegNet', 'ResNet', 'ResNetV1d', 'ResNeXt', 'SSDVGG', 'HRNet',
@@ -28,5 +28,5 @@ __all__ = [
     'DetectoRS_ResNeXt', 'Darknet', 'ResNeSt', 'TridentResNet', 'CSPDarknet',
     'SwinTransformer', 'PyramidVisionTransformer',
     'PyramidVisionTransformerV2', 'EfficientNet', 'CSPNeXt',
-    'DinoConvNeXt', 'HGNetV2', 'RGBDDualBackbone'
+    'DinoConvNeXt', 'HGNetV2', 'RGBDDualBackbone', 'RGBDResidualBackbone'
 ]

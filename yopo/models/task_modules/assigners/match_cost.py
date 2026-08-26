@@ -1452,3 +1452,162 @@ class RotatedIoUCost(BaseMatchCost):
             gt_bboxes,
             mode=self.iou_mode)
         return (-overlaps) * self.weight
+
+
+@TASK_UTILS.register_module()
+class OBBChamferCost(BaseMatchCost):
+    """Four-corner Chamfer cost for oriented-box Hungarian matching.
+
+    The cost operates on unnormalized ``(cx, cy, w, h, angle)`` boxes, with
+    ``angle`` expressed in radians. Corners are generated in image coordinates
+    and then normalized by ``(image_width, image_height)``. Normalizing the
+    corners, rather than ``w`` and ``h`` before rotation, preserves the image
+    geometry for non-square images.
+
+    ``paper_squared`` implements Eq. (5) of arXiv:2603.15497 using squared L2
+    distances. ``code_unsquared`` follows the accompanying AI4RS code's
+    unsquared distance reduction only. Both modes intentionally use the
+    geometrically correct corner-after-rotation normalization described above;
+    ``code_unsquared`` is therefore not a bit-for-bit AI4RS compatibility mode.
+
+    Args:
+        distance_mode: ``paper_squared`` or ``code_unsquared``.
+        equivalence_mode: Equivalent OBB encodings included before taking the
+            minimum cost. ``pi`` adds ``angle + pi``. ``pi_and_swap`` also adds
+            ``(h, w, angle +/- pi / 2)``. Chamfer is already invariant to
+            corner order, but explicit candidates make the representation
+            contract clear and protect future corner implementations.
+        weight: Match-cost weight.
+    """
+
+    _DISTANCE_MODES = frozenset({"paper_squared", "code_unsquared"})
+    _EQUIVALENCE_MODES = frozenset({"none", "pi", "pi_and_swap"})
+
+    def __init__(self,
+                 distance_mode: str = "paper_squared",
+                 equivalence_mode: str = "none",
+                 weight: Union[float, int] = 1.) -> None:
+        super().__init__(weight=weight)
+        if distance_mode not in self._DISTANCE_MODES:
+            raise ValueError(
+                f"distance_mode must be one of "
+                f"{sorted(self._DISTANCE_MODES)}, got {distance_mode!r}")
+        if equivalence_mode not in self._EQUIVALENCE_MODES:
+            raise ValueError(
+                f"equivalence_mode must be one of "
+                f"{sorted(self._EQUIVALENCE_MODES)}, got "
+                f"{equivalence_mode!r}")
+        if not math.isfinite(float(weight)):
+            raise ValueError(f"weight must be finite, got {weight!r}")
+        self.distance_mode = distance_mode
+        self.equivalence_mode = equivalence_mode
+
+    @staticmethod
+    def _as_tensor(boxes) -> Tensor:
+        if isinstance(boxes, BaseBoxes):
+            return boxes.tensor
+        if not isinstance(boxes, Tensor):
+            raise TypeError(
+                "OBBChamferCost bboxes must be a Tensor or BaseBoxes, "
+                f"got {type(boxes).__name__}")
+        return boxes
+
+    @staticmethod
+    def _validate_boxes(boxes: Tensor, name: str) -> None:
+        if boxes.ndim != 2 or boxes.shape[-1] != 5:
+            raise ValueError(
+                f"{name} bboxes must have shape (N, 5), got "
+                f"{tuple(boxes.shape)}")
+        finite = torch.isfinite(boxes)
+        if not finite.all():
+            first_bad = (~finite).nonzero(as_tuple=False)[0].tolist()
+            raise FloatingPointError(
+                f"OBBChamferCost received non-finite {name} bboxes at "
+                f"index {tuple(first_bad)}")
+
+    @staticmethod
+    def _image_normalizer(img_meta: Optional[dict], boxes: Tensor) -> Tensor:
+        if not isinstance(img_meta, dict) or "img_shape" not in img_meta:
+            raise ValueError(
+                "OBBChamferCost requires img_meta['img_shape']")
+        img_shape = img_meta["img_shape"]
+        if not hasattr(img_shape, "__len__") or len(img_shape) < 2:
+            raise ValueError(
+                "img_meta['img_shape'] must contain image height and width")
+        try:
+            img_h = float(img_shape[0])
+            img_w = float(img_shape[1])
+        except (TypeError, ValueError):
+            raise ValueError(
+                "img_meta['img_shape'] height and width must be numeric")
+        if (not math.isfinite(img_h) or not math.isfinite(img_w)
+                or img_h <= 0 or img_w <= 0):
+            raise ValueError(
+                "img_meta['img_shape'] height and width must be finite and "
+                f"positive, got {(img_h, img_w)}")
+        return boxes.new_tensor([img_w, img_h])
+
+    def _equivalent_boxes(self, boxes: Tensor) -> Tensor:
+        """Return equivalent encodings with shape (variants, boxes, 5)."""
+        candidates = [boxes]
+        if self.equivalence_mode in {"pi", "pi_and_swap"}:
+            pi_box = boxes.clone()
+            pi_box[..., 4] = pi_box[..., 4] + math.pi
+            candidates.append(pi_box)
+        if self.equivalence_mode == "pi_and_swap":
+            for angle_delta in (math.pi / 2, -math.pi / 2):
+                swapped = boxes.clone()
+                swapped[..., 2] = boxes[..., 3]
+                swapped[..., 3] = boxes[..., 2]
+                swapped[..., 4] = boxes[..., 4] + angle_delta
+                candidates.append(swapped)
+        return torch.stack(candidates, dim=0)
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        pred_bboxes = self._as_tensor(pred_instances.bboxes)
+        gt_bboxes = self._as_tensor(gt_instances.bboxes)
+        self._validate_boxes(pred_bboxes, "prediction")
+        self._validate_boxes(gt_bboxes, "ground truth")
+        if pred_bboxes.device != gt_bboxes.device:
+            raise ValueError(
+                "prediction and ground truth bboxes must be on the same "
+                f"device, got {pred_bboxes.device} and {gt_bboxes.device}")
+
+        normalizer = self._image_normalizer(img_meta, pred_bboxes)
+        with torch.autocast(
+                device_type=pred_bboxes.device.type, enabled=False):
+            pred_bboxes = pred_bboxes.float()
+            gt_bboxes = gt_bboxes.float()
+            normalizer = normalizer.float()
+
+            pred_corners = box2multiple_corners(
+                pred_bboxes.unsqueeze(0), num_points=4)[0]
+            gt_candidates = self._equivalent_boxes(gt_bboxes)
+            gt_corners = box2multiple_corners(
+                gt_candidates, num_points=4)
+            pred_corners = pred_corners / normalizer
+            gt_corners = gt_corners / normalizer
+
+            # (pred, gt, variant, pred_corner, gt_corner, xy)
+            delta = (
+                pred_corners[:, None, None, :, None, :]
+                - gt_corners.permute(1, 0, 2, 3)[None, :, :, None, :, :]
+            )
+            pairwise = delta.square().sum(dim=-1)
+            if self.distance_mode == "code_unsquared":
+                pairwise = pairwise.sqrt()
+
+            pred_to_gt = pairwise.min(dim=-1).values.mean(dim=-1)
+            gt_to_pred = pairwise.min(dim=-2).values.mean(dim=-1)
+            cost = (pred_to_gt + gt_to_pred).min(dim=-1).values
+            cost = cost * self.weight
+
+        if not torch.isfinite(cost).all():
+            raise FloatingPointError(
+                "OBBChamferCost produced a non-finite cost from finite "
+                "inputs")
+        return cost

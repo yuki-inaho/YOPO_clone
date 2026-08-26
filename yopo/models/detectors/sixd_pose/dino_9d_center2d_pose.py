@@ -1,7 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Dict, Optional, Tuple
 
-import numpy as np
 import torch
 from torch import Tensor, nn
 from torch.nn.init import normal_
@@ -46,7 +45,9 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
             dn_cfg['num_classes'] = self.bbox_head.num_classes
             dn_cfg['embed_dims'] = self.embed_dims
             dn_cfg['num_matching_queries'] = self.num_queries
-        self.dn_query_generator = CdnQueryGenerator(**dn_cfg)
+            self.dn_query_generator = CdnQueryGenerator(**dn_cfg)
+        else:
+            self.dn_query_generator = None
 
     def _init_layers(self) -> None:
         """Initialize layers except for backbone, neck and bbox_head."""
@@ -278,7 +279,7 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
 
         query = self.query_embedding.weight[:, None, :]
         query = query.repeat(1, bs, 1).transpose(0, 1)
-        if self.training:
+        if self.training and self.dn_query_generator is not None:
             dn_label_query, dn_bbox_query, dn_mask, dn_meta = \
                 self.dn_query_generator(batch_data_samples)
             query = torch.cat([dn_label_query, query], dim=1)
@@ -369,7 +370,8 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
             reg_branches=self.bbox_head.reg_branches,
             **kwargs)
 
-        if len(query) == self.num_queries:
+        if (self.dn_query_generator is not None and
+                len(query) == self.num_queries):
             # NOTE: This is to make sure label_embeding can be involved to
             # produce loss even if there is no denoising query (no ground truth
             # target in this GPU), otherwise, this will raise runtime error in

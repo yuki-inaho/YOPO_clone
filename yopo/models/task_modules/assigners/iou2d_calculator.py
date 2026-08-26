@@ -2,7 +2,7 @@
 import torch
 
 from yopo.registry import TASK_UTILS
-from yopo.structures.bbox import bbox_overlaps, get_box_tensor
+from yopo.structures.bbox import bbox_overlaps, get_box_tensor, rbbox_overlaps
 
 
 def cast_tensor_type(x, scale=1., dtype=None):
@@ -86,3 +86,18 @@ class BboxOverlaps2D_GLIP(BboxOverlaps2D):
 
         iou = inter / (area1[:, None] + area2 - inter)
         return iou
+
+
+@TASK_UTILS.register_module()
+class RBboxOverlaps2D:
+    """Pairwise overlap calculator for ``(cx, cy, w, h, angle)`` boxes."""
+
+    def __call__(self, bboxes1, bboxes2, mode='iou', is_aligned=False):
+        bboxes1 = get_box_tensor(bboxes1)
+        bboxes2 = get_box_tensor(bboxes2)
+        if bboxes1.size(-1) != 5 or bboxes2.size(-1) != 5:
+            raise ValueError(
+                'RBboxOverlaps2D expects last dimension 5, got '
+                f'{bboxes1.size(-1)} and {bboxes2.size(-1)}')
+        return rbbox_overlaps(
+            bboxes1, bboxes2, mode=mode, is_aligned=is_aligned)

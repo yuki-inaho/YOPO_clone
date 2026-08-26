@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.cnn import Linear
-from mmcv.cnn.bricks.transformer import FFN
 from mmengine.structures import InstanceData
 from mmengine.model import BaseModule, bias_init_with_prob, constant_init
 from torch import Tensor
@@ -23,6 +22,7 @@ from ..layers import inverse_sigmoid
 from ..losses import QualityFocalLoss
 from ..utils import multi_apply
 from .depth_query_context import CoPStageFusion, MultiScaleDepthQuerySampler
+from .matchability_quality import aligned_hbb_iou_quality_targets
 from .simple_dino_9dposehead import SimpleDINO9DPoseHead
 from .staged_distillation import StagedDistillationTeacher
 
@@ -71,26 +71,8 @@ def aligned_iou_quality_targets(
     keeps the quality loss responsible for score ranking only, rather than
     creating a second route that changes box geometry to increase its target.
     """
-    if labels.ndim != 1:
-        raise ValueError(f'labels must be 1D, got {labels.shape}')
-    if (bbox_predictions.shape != bbox_targets.shape or
-            bbox_predictions.ndim != 2 or
-            bbox_predictions.shape[-1] != 4 or
-            len(labels) != len(bbox_predictions)):
-        raise ValueError(
-            'bbox predictions/targets must share shape (N, 4) and match labels, '
-            f'got {bbox_predictions.shape}/{bbox_targets.shape}/{labels.shape}')
-    quality = bbox_predictions.new_zeros(len(labels))
-    positive = (labels >= 0) & (labels < num_classes)
-    if positive.any():
-        predicted_xyxy = bbox_cxcywh_to_xyxy(
-            bbox_predictions[positive].detach())
-        target_xyxy = bbox_cxcywh_to_xyxy(
-            bbox_targets[positive].detach())
-        quality[positive] = bbox_overlaps(
-            predicted_xyxy, target_xyxy, is_aligned=True
-        ).clamp(min=0.0, max=1.0)
-    return quality.detach()
+    return aligned_hbb_iou_quality_targets(
+        labels, bbox_predictions, bbox_targets, num_classes)
 
 
 def one_to_many_bbox_targets(
@@ -251,6 +233,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 type='FocalLoss', use_sigmoid=True, gamma=2.0, alpha=0.25,
                 loss_weight=1.0),
             projection_geometry_source: str = 'target',
+            train_intrinsic_to_image_space: bool = False,
             train_cfg: ConfigType = dict(
                 assigner=dict(
                     type='HungarianAssigner',
@@ -261,7 +244,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                         dict(type='PoseCost', weight=5.0)
                     ])),
             test_cfg: ConfigType = dict(max_per_img=100),
-            init_cfg: OptMultiConfig = None) -> None:
+            init_cfg: OptMultiConfig = None,
+            quality_target: ConfigType = None,
+            loss_rotation_frame: ConfigType = None) -> None:
         BaseModule.__init__(self, init_cfg=init_cfg)
         self.bg_cls_weight = 0
         self.sync_cls_avg_factor = sync_cls_avg_factor
@@ -283,6 +268,29 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_bbox = MODELS.build(loss_bbox)
         self.loss_iou = MODELS.build(loss_iou)
+        self.uses_quality_target = (
+            isinstance(self.loss_cls, QualityFocalLoss)
+            or bool(getattr(
+                self.loss_cls, 'requires_quality_target', False)))
+        if quality_target is not None and not self.uses_quality_target:
+            raise ValueError(
+                'quality_target requires a classification loss that accepts '
+                '(labels, quality) targets')
+        if self.uses_quality_target:
+            quality_target_cfg = copy.deepcopy(
+                quality_target or dict(
+                    type='MatchabilityQualityPolicy',
+                    source='hbb_iou'))
+            configured_num_classes = quality_target_cfg.pop(
+                'num_classes', num_classes)
+            if configured_num_classes != num_classes:
+                raise ValueError(
+                    'quality_target.num_classes must match the head: '
+                    f'{configured_num_classes} != {num_classes}')
+            quality_target_cfg['num_classes'] = num_classes
+            self.quality_target_policy = MODELS.build(quality_target_cfg)
+        else:
+            self.quality_target_policy = None
 
         self.use_cuboid_conditioning = use_cuboid_conditioning
         self.use_intrinsinc_for_bbox = use_intrinsinc_for_bbox
@@ -378,6 +386,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.loss_z = MODELS.build(loss_z)
 
         self.loss_rotation = MODELS.build(loss_rotation)
+        self.loss_rotation_frame = (
+            MODELS.build(loss_rotation_frame)
+            if loss_rotation_frame is not None else None)
+        if self.loss_rotation_frame is not None and rot_dim != 6:
+            raise ValueError(
+                'loss_rotation_frame requires rot_dim=6 raw rotation '
+                f'predictions, got rot_dim={rot_dim}')
         self.loss_sizes = MODELS.build(loss_sizes)
         self.loss_projection = (
             MODELS.build(loss_projection)
@@ -417,6 +432,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 "projection_geometry_source must be 'target' or 'prediction', "
                 f"got {projection_geometry_source!r}")
         self.projection_geometry_source = projection_geometry_source
+        self.train_intrinsic_to_image_space = bool(
+            train_intrinsic_to_image_space)
 
         if self.loss_cls.use_sigmoid:
             self.cls_out_channels = num_classes
@@ -441,6 +458,58 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         self._init_layers()
         self._init_distillation_teachers()
+
+    def _classification_loss(
+            self,
+            cls_scores: Tensor,
+            labels: Tensor,
+            label_weights: Tensor,
+            bbox_predictions: Tensor,
+            bbox_targets: Tensor,
+            avg_factor,
+            obb_predictions: Tensor = None,
+            obb_targets: Tensor = None) -> Tensor:
+        """Dispatch hard-label and quality-aware classification uniformly.
+
+        Geometry-quality construction is delegated to a configurable,
+        stateless policy.  The detector head only supplies aligned tensors and
+        therefore does not need a branch for each future quality source.
+        """
+        if not self.uses_quality_target:
+            return self.loss_cls(
+                cls_scores, labels, label_weights, avg_factor=avg_factor)
+        quality = self.quality_target_policy(
+            labels=labels,
+            bbox_predictions=bbox_predictions,
+            bbox_targets=bbox_targets,
+            obb_predictions=obb_predictions,
+            obb_targets=obb_targets,
+        )
+        return self.loss_cls(
+            cls_scores, (labels, quality), label_weights,
+            avg_factor=avg_factor)
+
+    @staticmethod
+    def _normalize_obb_gaussian_targets(
+            targets: Tensor, factors: Tensor) -> Tensor:
+        """Normalize compact Gaussian targets into the head output frame."""
+        if targets.ndim != 2 or targets.shape[-1] != 5:
+            raise ValueError(
+                'compact Gaussian targets must have shape (N, 5), got '
+                f'{targets.shape}')
+        if factors.shape != (len(targets), 4):
+            raise ValueError(
+                'image factors must have shape (N, 4), got '
+                f'{factors.shape}')
+        normalized = targets.clone()
+        image_width = factors[:, 0]
+        image_height = factors[:, 1]
+        normalized[:, 0] /= image_width
+        normalized[:, 1] /= image_height
+        normalized[:, 2] /= image_width.square()
+        normalized[:, 3] /= image_width * image_height
+        normalized[:, 4] /= image_height.square()
+        return normalized
 
     def replicate(self, layer, num_layers):
         """Replicate a layer using shared instances or deep copies based on self.share_pred_layer."""
@@ -1159,6 +1228,32 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             obb_aux_inputs,
             batch_gt_instances=batch_gt_instances, batch_img_metas=batch_img_metas)
 
+        losses_rotation_frame = None
+        if self.loss_rotation_frame is not None:
+            # ``all_layers_rotation_preds`` is the matching-query slice of the
+            # primary rotation output also consumed by inference.  ``forward``
+            # routes the parallel branch here in parallel/auxiliary mode and
+            # the CoP branch here in chain mode.  Applying the target-free
+            # constraint at this boundary therefore avoids supervising the DN,
+            # encoder, and auxiliary-chain streams by accident.
+            rotation_frame_inputs = all_layers_rotation_preds
+            if self.classwise_rotation:
+                expected_width = self.num_classes * self.rot_dim
+                if rotation_frame_inputs.shape[-1] != expected_width:
+                    raise ValueError(
+                        'classwise raw rotation predictions must have width '
+                        f'num_classes * rot_dim = {expected_width}, got '
+                        f'{rotation_frame_inputs.shape[-1]}')
+                # Every class frame can be selected during inference.  Keep
+                # all candidates valid instead of routing the regularizer
+                # through a non-differentiable predicted-class argmax.
+                rotation_frame_inputs = rotation_frame_inputs.unflatten(
+                    -1, (self.num_classes, self.rot_dim))
+            losses_rotation_frame = [
+                self.loss_rotation_frame(layer_predictions)
+                for layer_predictions in rotation_frame_inputs
+            ]
+
         loss_dict = dict()
         # loss from the last decoder layer
         loss_dict['loss_cls'] = losses_cls[-1]
@@ -1167,6 +1262,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         loss_dict['loss_centers_2d'] = losses_centers_2d[-1]
         loss_dict['loss_z'] = losses_z[-1]
         loss_dict['loss_rotation'] = losses_rotation[-1]
+        if losses_rotation_frame is not None:
+            loss_dict['loss_rotation_frame'] = losses_rotation_frame[-1]
         loss_dict['loss_size'] = losses_sizes[-1]
         if self.loss_projection is not None:
             loss_dict['loss_projection'] = losses_projection[-1]
@@ -1192,6 +1289,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_dict[f'd{num_dec_layer}.loss_centers_2d'] = loss_centers_2d_i
             loss_dict[f'd{num_dec_layer}.loss_z'] = loss_z_i
             loss_dict[f'd{num_dec_layer}.loss_rotation'] = loss_rotation_i
+            if losses_rotation_frame is not None:
+                loss_dict[f'd{num_dec_layer}.loss_rotation_frame'] = \
+                    losses_rotation_frame[i]
             loss_dict[f'd{num_dec_layer}.loss_size'] = loss_sizes_i
             if self.loss_projection is not None:
                 loss_dict[f'd{num_dec_layer}.loss_projection'] = \
@@ -1252,18 +1352,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         cls_avg_factor = max(cls_avg_factor, 1)
 
         if len(cls_scores) > 0:
-            if isinstance(self.loss_cls, QualityFocalLoss):
-                quality_targets = aligned_iou_quality_targets(
-                    labels,
-                    dn_bbox_preds.reshape(-1, 4),
-                    bbox_targets,
-                    self.num_classes,
-                )
-                loss_cls = self.loss_cls(
-                    cls_scores, (labels, quality_targets), label_weights,
-                    avg_factor=cls_avg_factor)
-            else:
-                loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+            loss_cls = self._classification_loss(
+                cls_scores=cls_scores,
+                labels=labels,
+                label_weights=label_weights,
+                bbox_predictions=dn_bbox_preds.reshape(-1, 4),
+                bbox_targets=bbox_targets,
+                avg_factor=cls_avg_factor,
+            )
         else:
             loss_cls = torch.zeros(1, dtype=cls_scores.dtype, device=cls_scores.device)
 
@@ -1462,6 +1558,25 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         obb_gaussian_targets = torch.cat(obb_gaussian_targets_list, 0)
         obb_gaussian_weights = torch.cat(obb_gaussian_weights_list, 0)
 
+        # Image factors are also the compact-Gaussian coordinate transform.
+        # Build them once and reuse them for quality, HBB, projection and OBB
+        # objectives rather than maintaining separate normalization paths.
+        factors = []
+        for img_meta, bbox_pred in zip(batch_img_metas, bbox_preds):
+            img_h, img_w = img_meta['img_shape']
+            factor = bbox_pred.new_tensor(
+                [img_w, img_h, img_w, img_h]).unsqueeze(0).repeat(
+                    bbox_pred.size(0), 1)
+            factors.append(factor)
+        factors = torch.cat(factors, 0)
+        flat_bbox_preds = bbox_preds.reshape(-1, 4)
+        flat_obb_aux_preds = None
+        normalized_obb_targets = None
+        if obb_aux_preds is not None:
+            flat_obb_aux_preds = obb_aux_preds.reshape(-1, 5)
+            normalized_obb_targets = self._normalize_obb_gaussian_targets(
+                obb_gaussian_targets, factors)
+
         # classification loss
         cls_scores = cls_scores.reshape(-1, self.cls_out_channels)
         cls_avg_factor = num_total_pos * 1.0 + num_total_neg * self.bg_cls_weight
@@ -1469,31 +1584,21 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             cls_avg_factor = reduce_mean(cls_scores.new_tensor([cls_avg_factor]))
         cls_avg_factor = max(cls_avg_factor, 1)
 
-        if isinstance(self.loss_cls, QualityFocalLoss):
-            quality_targets = aligned_iou_quality_targets(
-                labels,
-                bbox_preds.reshape(-1, 4),
-                bbox_targets,
-                self.num_classes,
-            )
-            loss_cls = self.loss_cls(
-                cls_scores, (labels, quality_targets), label_weights,
-                avg_factor=cls_avg_factor)
-        else:
-            loss_cls = self.loss_cls(cls_scores, labels, label_weights, avg_factor=cls_avg_factor)
+        loss_cls = self._classification_loss(
+            cls_scores=cls_scores,
+            labels=labels,
+            label_weights=label_weights,
+            bbox_predictions=flat_bbox_preds,
+            bbox_targets=bbox_targets,
+            avg_factor=cls_avg_factor,
+            obb_predictions=flat_obb_aux_preds,
+            obb_targets=normalized_obb_targets,
+        )
 
         num_total_pos = loss_cls.new_tensor([num_total_pos])
         num_total_pos = torch.clamp(reduce_mean(num_total_pos), min=1).item()
 
-        # construct factors used for rescale bboxes
-        factors = []
-        for img_meta, bbox_pred in zip(batch_img_metas, bbox_preds):
-            img_h, img_w = img_meta['img_shape']
-            factor = bbox_pred.new_tensor([img_w, img_h, img_w, img_h]).unsqueeze(0).repeat(bbox_pred.size(0), 1)
-            factors.append(factor)
-        factors = torch.cat(factors, 0)
-
-        bbox_preds = bbox_preds.reshape(-1, 4)
+        bbox_preds = flat_bbox_preds
         bboxes = bbox_cxcywh_to_xyxy(bbox_preds) * factors
         bboxes_gt = bbox_cxcywh_to_xyxy(bbox_targets) * factors
 
@@ -1548,8 +1653,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             projection_intrinsics = []
             for img_meta, per_image_bbox_preds in zip(
                     batch_img_metas, bbox_preds_list):
-                intrinsic = self._intrinsic_matrix(
-                    img_meta['intrinsic'], centers_2d_preds)
+                intrinsic = self._training_intrinsic_matrix(
+                    img_meta, centers_2d_preds)
                 projection_intrinsics.append(
                     intrinsic.unsqueeze(0).repeat(
                         per_image_bbox_preds.size(0), 1, 1))
@@ -1570,16 +1675,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if self.loss_obb_aux is not None and obb_aux_supervision:
             if obb_aux_preds is None:
                 raise RuntimeError('loss_obb_aux requires OBB predictions')
-            normalized_obb_targets = obb_gaussian_targets.clone()
-            image_width = factors[:, 0]
-            image_height = factors[:, 1]
-            normalized_obb_targets[:, 0] /= image_width
-            normalized_obb_targets[:, 1] /= image_height
-            normalized_obb_targets[:, 2] /= image_width.square()
-            normalized_obb_targets[:, 3] /= image_width * image_height
-            normalized_obb_targets[:, 4] /= image_height.square()
             loss_obb_aux = self.loss_obb_aux(
-                predicted=obb_aux_preds.reshape(-1, 5),
+                predicted=flat_obb_aux_preds,
                 target=normalized_obb_targets,
                 weight=obb_gaussian_weights,
                 avg_factor=num_total_pos,
@@ -1667,6 +1764,64 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                          [0, 0, 1]]
         return reference.new_tensor(intrinsic).view(3, 3)
 
+    @classmethod
+    def _image_space_intrinsic_matrix(
+            cls, img_meta: dict, reference: Tensor) -> Tensor:
+        """Map the stored original-image intrinsic into augmented pixels.
+
+        The pose pipeline deliberately keeps the original intrinsic for
+        teacher-free inference, where predicted centers are rescaled back to
+        original pixels. Training losses and matching operate before that
+        rescale, so they need ``K_image = H_image K_original`` instead.
+
+        ``RandomFlipFor9DPose`` historically reflects the stored intrinsic
+        using the resized image extent. Undo that reflection first, apply the
+        resize, then reapply it; this preserves existing inference metadata
+        while making the training geometry exact.
+        """
+        intrinsic = cls._intrinsic_matrix(img_meta['intrinsic'], reference)
+        scale_factor = img_meta.get('scale_factor')
+        if scale_factor is None:
+            return intrinsic
+        scale = reference.new_tensor(scale_factor).flatten()
+        if scale.numel() < 2:
+            raise ValueError(
+                'scale_factor must contain x/y scales, got '
+                f'{scale_factor!r}')
+        resize = torch.eye(3, device=reference.device, dtype=reference.dtype)
+        resize[0, 0] = scale[0]
+        resize[1, 1] = scale[1]
+
+        reflection = None
+        if img_meta.get('flip', False):
+            img_h, img_w = img_meta['img_shape'][:2]
+            reflection = torch.eye(
+                3, device=reference.device, dtype=reference.dtype)
+            direction = img_meta.get('flip_direction')
+            if direction == 'horizontal':
+                reflection[0, 0] = -1.0
+                reflection[0, 2] = float(img_w - 1)
+            elif direction == 'vertical':
+                reflection[1, 1] = -1.0
+                reflection[1, 2] = float(img_h - 1)
+            else:
+                raise ValueError(
+                    'flipped image requires horizontal or vertical '
+                    f'flip_direction, got {direction!r}')
+            # A pixel-axis reflection is its own inverse.
+            intrinsic = reflection @ intrinsic
+
+        intrinsic = resize @ intrinsic
+        if reflection is not None:
+            intrinsic = reflection @ intrinsic
+        return intrinsic
+
+    def _training_intrinsic_matrix(
+            self, img_meta: dict, reference: Tensor) -> Tensor:
+        if self.train_intrinsic_to_image_space:
+            return self._image_space_intrinsic_matrix(img_meta, reference)
+        return self._intrinsic_matrix(img_meta['intrinsic'], reference)
+
     def _build_matching_pred_instances(
             self, cls_score: Tensor, bbox_pred: Tensor,
             centers_2d_pred: Tensor, z_pred: Tensor,
@@ -1685,14 +1840,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if not pose_for_matching:
             return InstanceData(scores=cls_score, bboxes=bbox_pred_unnorm)
 
-        intrinsic = img_meta['intrinsic']
         centers_2d_px = centers_2d_pred * centers_2d_pred.new_tensor(
             [img_w, img_h])
         centers_2d_h = torch.cat([
             centers_2d_px,
             torch.ones_like(centers_2d_pred[:, :1])
         ], dim=1)
-        intrinsic = self._intrinsic_matrix(intrinsic, centers_2d_h)
+        intrinsic = self._training_intrinsic_matrix(img_meta, centers_2d_h)
         depth = torch.exp(z_pred) if self.use_log_z else z_pred
         t_recovered = depth * (
             torch.inverse(intrinsic) @ centers_2d_h.T).T
@@ -2064,8 +2218,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                       all_layers_rotation_preds: Tensor, all_layers_sizes_preds: Tensor,
                       dn_meta: Dict[str, int]) -> Tuple[Tensor]:
         """Split outputs into denoising and matching parts."""
-        num_denoising_queries = dn_meta['num_denoising_queries']
         if dn_meta is not None:
+            num_denoising_queries = dn_meta['num_denoising_queries']
             all_layers_denoising_cls_scores = \
                 all_layers_cls_scores[:, :, : num_denoising_queries, :]
             all_layers_denoising_bbox_preds = \

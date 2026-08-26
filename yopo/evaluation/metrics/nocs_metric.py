@@ -1,29 +1,166 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from collections import OrderedDict
+from collections.abc import Mapping
 import copy
+from numbers import Real
 import os
-from typing import List, Optional, Sequence, Union
+from typing import Optional, Sequence, Union
 import json
-import warnings
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
-from functools import partial
 import pickle
 
 import numpy as np
 from mmcv.ops import batched_nms
 from mmengine.evaluator import BaseMetric
 from mmengine.logging import MMLogger
-from plyfile import PlyData
 import torch
 
 from yopo.registry import METRICS
 from ..functional import eval_map
+from .oriented_box_iou_3d import (
+    oriented_box_iou_3d,
+    pairwise_oriented_box_iou_upper_bound_from_boxes_3d,
+)
+
+
+_COCO_IOU_THRESHOLDS = tuple(np.arange(0.50, 0.96, 0.05).tolist())
+
+
+def normalize_2d_iou_thresholds(
+    iou_thrs: Union[Real, Sequence[float]],
+) -> tuple[float, ...]:
+    """Validate and normalize configured 2D AP IoU thresholds.
+
+    Duplicate thresholds are rejected instead of silently giving them extra
+    weight in the mean AP. The user-provided order is retained for logging.
+    """
+    if isinstance(iou_thrs, bool):
+        raise TypeError("iou_thrs must be a number or a sequence of numbers")
+    if isinstance(iou_thrs, Real):
+        values = (float(iou_thrs),)
+    else:
+        if isinstance(iou_thrs, (str, bytes)):
+            raise TypeError("iou_thrs must be a number or a sequence of numbers")
+        try:
+            values = tuple(float(value) for value in iou_thrs)
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "iou_thrs must be a number or a sequence of numbers") from error
+
+    if not values:
+        raise ValueError("iou_thrs must contain at least one threshold")
+    if not np.isfinite(values).all():
+        raise ValueError(f"iou_thrs must contain only finite values, got {values}")
+    if any(value <= 0.0 or value > 1.0 for value in values):
+        raise ValueError(
+            f"iou_thrs values must be in the interval (0, 1], got {values}")
+    if len(set(values)) != len(values):
+        raise ValueError(f"iou_thrs must not contain duplicates, got {values}")
+    return values
+
+
+def _ap_key(iou_thr: float) -> str:
+    """Return an unambiguous metric key for an IoU threshold."""
+    percentage = iou_thr * 100.0
+    if np.isclose(percentage, round(percentage), rtol=0.0, atol=1e-9):
+        suffix = str(int(round(percentage)))
+    else:
+        suffix = f"{percentage:.12g}".replace(".", "p")
+    return f"AP{suffix}"
+
+
+def _is_coco_iou_range(iou_thrs: Sequence[float]) -> bool:
+    """Whether thresholds are exactly COCO's AP50:95 ten-point range."""
+    return len(iou_thrs) == len(_COCO_IOU_THRESHOLDS) and np.allclose(
+        sorted(iou_thrs), _COCO_IOU_THRESHOLDS, rtol=0.0, atol=1e-9)
+
+
+def resolve_hbb_selection(
+    hbb_selection: Optional[Mapping],
+    *,
+    default_score_thr: float,
+    default_nms_cfg: Optional[dict],
+) -> Optional[dict]:
+    """Resolve an optional 2D-only selection policy.
+
+    ``None`` deliberately means "reuse the normal 2D/3D aligned prediction",
+    preserving the historical behavior without storing a duplicate result.
+    """
+    if hbb_selection is None:
+        return None
+    if not isinstance(hbb_selection, Mapping):
+        raise TypeError("hbb_selection must be a mapping or None")
+    unknown_keys = set(hbb_selection) - {"score_thr", "nms_cfg"}
+    if unknown_keys:
+        raise ValueError(
+            f"unsupported hbb_selection keys: {sorted(unknown_keys)}")
+    try:
+        score_thr = float(hbb_selection.get("score_thr", default_score_thr))
+    except (TypeError, ValueError) as error:
+        raise TypeError("hbb_selection.score_thr must be a number") from error
+    if not np.isfinite(score_thr):
+        raise ValueError("hbb_selection.score_thr must be finite")
+    return {
+        "score_thr": score_thr,
+        "nms_cfg": hbb_selection.get("nms_cfg", default_nms_cfg),
+    }
+
+
+def select_aligned_prediction_indices(
+    pred,
+    *,
+    score_thr: float,
+    nms_cfg: Optional[dict],
+) -> torch.Tensor:
+    """Select query indices once so every 2D/3D field stays aligned."""
+    scores = pred["scores"]
+    keep = torch.arange(len(scores), device=scores.device)
+    if score_thr > 0:
+        keep = keep[scores > score_thr]
+    if nms_cfg is not None and keep.numel():
+        _, local_keep = batched_nms(
+            pred["bboxes"][keep],
+            scores[keep],
+            pred["labels"][keep],
+            nms_cfg,
+        )
+        keep = keep[local_keep]
+    return keep
+
+
+def rescale_ground_truth_bboxes(
+    bboxes: np.ndarray,
+    scale_factor,
+) -> np.ndarray:
+    """Map pipeline-resized GT boxes back to prediction/original coordinates.
+
+    YOPO's detector ``predict`` contract returns rescaled boxes in the original
+    image coordinate system.  Validation annotations, however, remain in the
+    resized pipeline coordinate system.  Metrics must undo that resize before
+    comparing the two.  ``scale_factor`` follows the MMDetection ``(w, h)``
+    convention and may also be supplied as ``(w, h, w, h)``.
+    """
+    bboxes = np.asarray(bboxes).copy()
+    if scale_factor is None or bboxes.size == 0:
+        return bboxes
+    scale = np.asarray(scale_factor, dtype=np.float64).reshape(-1)
+    if scale.size == 2:
+        scale = np.tile(scale, 2)
+    if scale.size != 4 or not np.isfinite(scale).all() or np.any(scale <= 0):
+        raise ValueError(
+            "scale_factor must contain positive finite (w, h) or "
+            f"(w, h, w, h) values, got {scale_factor!r}")
+    return bboxes / scale.astype(bboxes.dtype, copy=False)
 
 
 @METRICS.register_module()
 class NOCSMetric(BaseMetric):
     """NOCS evaluation metric.
+
+    ``3d_iou_*`` uses the exact intersection volume of arbitrarily oriented
+    SO(3) cuboids.  Results produced before the 2026-08-26 correction used a
+    corner-axis reduction and are not numerically comparable.
 
     Args:
         metric (str | list[str]): Metrics to be evaluated. Options are
@@ -33,6 +170,18 @@ class NOCSMetric(BaseMetric):
         collect_device (str): Device name used for collecting results from
             different ranks during distributed training. Must be 'cpu' or
             'gpu'. Defaults to 'cpu'.
+        iou_thrs (float | Sequence[float]): 2D bbox IoU thresholds passed to
+            :func:`eval_map`. The default ``0.5`` preserves the historical
+            ``AP50``-only behavior. Configuring ``0.50:0.05:0.95`` additionally
+            reports their arithmetic mean as ``AP50_95``.
+        hbb_selection (dict, optional): Optional 2D AP-only prediction
+            selection with ``score_thr`` and ``nms_cfg`` keys. When omitted,
+            2D AP and 3D pose use the same historical selection. For an
+            unfiltered diagnostic sweep, set ``dict(score_thr=0.0,
+            nms_cfg=None)``; 3D pose and dumped predictions remain unchanged.
+        two_phase_3d_iou (bool): Use proof-safe upper-bound pruning before the
+            exact 3D OBB kernel. Defaults to True. Set False to A/B runtime or
+            retain every below-threshold diagnostic overlap value.
         prefix (str, optional): The prefix that will be added in the metric
             names to disambiguate homonymous metrics of different evaluators.
             If prefix is not provided in the argument, self.default_prefix
@@ -48,10 +197,22 @@ class NOCSMetric(BaseMetric):
         dump_results_path: Optional[str] = None,
         dump_format: str = "pickle",  # "pickle" or "json"
         prefix: Optional[str] = None,
+        iou_thrs: Union[Real, Sequence[float]] = 0.5,
+        hbb_selection: Optional[dict] = None,
+        two_phase_3d_iou: bool = True,
     ) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
         self.nms_cfg = nms_cfg
         self.score_thr = score_thr
+        self.iou_thrs = normalize_2d_iou_thresholds(iou_thrs)
+        self.hbb_selection = resolve_hbb_selection(
+            hbb_selection,
+            default_score_thr=score_thr,
+            default_nms_cfg=nms_cfg,
+        )
+        if not isinstance(two_phase_3d_iou, bool):
+            raise TypeError("two_phase_3d_iou must be a bool")
+        self.two_phase_3d_iou = two_phase_3d_iou
         self.format_only = format_only
         self.dump_results_path = dump_results_path
         assert dump_format in ["pickle", "json"]
@@ -204,10 +365,19 @@ class NOCSMetric(BaseMetric):
             gt_instances = gt["gt_instances"]
             gt_ignore_instances = gt["ignored_instances"]
 
+            # ``model.test_step`` asks the head for predictions rescaled to
+            # ``ori_shape``.  Keep GT in that same coordinate system.  This is
+            # especially important for the 736x512 fruit data whose validation
+            # pipeline resizes to 640x445 before packing annotations.
+            metadata = getattr(data_sample, "metainfo", data_sample)
+            scale_factor = metadata.get("scale_factor")
+
             ann = dict(
                 labels=gt_instances["labels"].cpu().numpy(),
-                bboxes=gt_instances["bboxes"].cpu().numpy(),
-                bboxes_ignore=gt_ignore_instances["bboxes"].cpu().numpy(),
+                bboxes=rescale_ground_truth_bboxes(
+                    gt_instances["bboxes"].cpu().numpy(), scale_factor),
+                bboxes_ignore=rescale_ground_truth_bboxes(
+                    gt_ignore_instances["bboxes"].cpu().numpy(), scale_factor),
                 labels_ignore=gt_ignore_instances["labels"].cpu().numpy(),
                 translations=gt_instances["translations"].cpu().numpy(),
                 rotations=gt_instances["rotations"].cpu().numpy(),
@@ -222,49 +392,33 @@ class NOCSMetric(BaseMetric):
 
             result = dict()
             pred = data_sample["pred_instances"]
+            keep = select_aligned_prediction_indices(
+                pred, score_thr=self.score_thr, nms_cfg=self.nms_cfg)
+            for field in (
+                "bboxes",
+                "scores",
+                "labels",
+                "translations",
+                "rotations",
+                "sizes",
+                "T",
+            ):
+                result[field] = pred[field][keep].cpu().numpy()
 
-            # if self.nms_cfg is not None:
-            #     pred_bboxes = pred['bboxes']
-            #     pred_scores = pred['scores']
-            #     pred_labels = pred['labels']
-
-            #     _, keep_nms = batched_nms(
-            #         pred_bboxes, pred_scores, pred_labels,
-            #         self.nms_cfg)
-            #     keep_nms = keep_nms.cpu().numpy()
-            # if self.score_thr > 0:
-            #     keep_score = torch.where(pred['scores'] > self.score_thr)[0].cpu().numpy()
-            # else:
-            #     keep_score = np.arange(len(pred['scores']))
-            # keep_idxs = np.intersect1d(keep_nms, keep_score)
-
-            result["bboxes"] = pred["bboxes"].cpu().numpy()
-            result["scores"] = pred["scores"].cpu().numpy()
-            result["labels"] = pred["labels"].cpu().numpy()
-
-            result["translations"] = pred["translations"].cpu().numpy()
-            result["rotations"] = pred["rotations"].cpu().numpy()
-            result["sizes"] = pred["sizes"].cpu().numpy()
-            result["T"] = pred["T"].cpu().numpy()
-
-            # if keep_idxs.size > 0:
-            #     result['bboxes'] = result['bboxes'][keep_idxs]
-            #     result['scores'] = result['scores'][keep_idxs]
-            #     result['labels'] = result['labels'][keep_idxs]
-            #     result['translations'] = result['translations'][keep_idxs]
-            #     result['rotations'] = result['rotations'][keep_idxs]
-            #     result['sizes'] = result['sizes'][keep_idxs]
-            #     result['T'] = result['T'][keep_idxs]
-
-            # valid_indices = np.where(result['scores'] > self.score_thr)[0]
-            # if len(valid_indices):
-            #     result['bboxes'] = result['bboxes'][valid_indices, :]
-            #     result['scores'] = result['scores'][valid_indices]
-            #     result['labels'] = result['labels'][valid_indices]
-            #     result['translations'] = result['translations'][valid_indices, :]
-            #     result['rotations'] = result['rotations'][valid_indices, :]
-            #     result['sizes'] = result['sizes'][valid_indices, :]
-            #     result['T'] = result['T'][valid_indices, :]
+            # A diagnostic 2D AP sweep often needs all decoder queries, while
+            # deployment/3D pose metrics should retain their score+NMS policy.
+            # Keep only the three fields eval_map consumes in this optional
+            # view; all 3D fields remain aligned to ``result`` above.
+            if self.hbb_selection is not None:
+                hbb_keep = select_aligned_prediction_indices(
+                    pred,
+                    score_thr=self.hbb_selection["score_thr"],
+                    nms_cfg=self.hbb_selection["nms_cfg"],
+                )
+                result["hbb_eval"] = {
+                    field: pred[field][hbb_keep].cpu().numpy()
+                    for field in ("bboxes", "scores", "labels")
+                }
 
             # gt_scale = np.linalg.norm(ann['sizes'], axis=1)
             pred_scale = np.linalg.norm(result["sizes"], axis=1)
@@ -336,10 +490,6 @@ class NOCSMetric(BaseMetric):
         images_per_batch = max(
             1, min(10, total_images // (num_workers * 4))
         )  # 4x more batches than workers
-        total_batches = (
-            total_images + images_per_batch - 1
-        ) // images_per_batch  # Ceiling division
-
         batches = [
             (preds[i : i + images_per_batch], gts[i : i + images_per_batch])
             for i in range(0, len(preds), images_per_batch)
@@ -357,6 +507,7 @@ class NOCSMetric(BaseMetric):
                 shift_thres_list,
                 use_matches_for_pose,
                 iou_pose_thres,
+                self.two_phase_3d_iou,
             )
             for batch_preds, batch_gts in batches
         ]
@@ -393,6 +544,7 @@ class NOCSMetric(BaseMetric):
 
         # Aggregate results from all batches
         print("Aggregating results from all batches...")
+        pruning_stats = {"total_pairs": 0, "exact_candidates": 0}
         for batch_result in tqdm(
             batch_results, desc="Aggregating batches", unit="batch"
         ):
@@ -403,7 +555,12 @@ class NOCSMetric(BaseMetric):
                 batch_pose_pred_matches,
                 batch_pose_pred_scores,
                 batch_pose_gt_matches,
+                batch_pruning_stats,
             ) = batch_result
+            pruning_stats["total_pairs"] += batch_pruning_stats["total_pairs"]
+            pruning_stats["exact_candidates"] += batch_pruning_stats[
+                "exact_candidates"
+            ]
 
             for cls_id in range(num_classes):
                 iou_pred_matches_all[cls_id] = np.concatenate(
@@ -431,12 +588,25 @@ class NOCSMetric(BaseMetric):
                     axis=-1,
                 )
 
+        total_pairs = pruning_stats["total_pairs"]
+        candidate_pairs = pruning_stats["exact_candidates"]
+        pruning_message = (
+            "3D IoU exact-phase candidates: "
+            f"{candidate_pairs}/{total_pairs} "
+            f"({candidate_pairs / total_pairs:.2%})"
+            if total_pairs
+            else "3D IoU exact-phase candidates: 0/0"
+        )
+        if logger is not None:
+            logger.info(pruning_message)
+        else:
+            print(pruning_message)
+
         # Compute AP scores (this part remains sequential as it's already fast)
         print("Computing IoU AP scores...")
         iou_dict = {}
         iou_dict["thres_list"] = iou_thres_list
         for cls_id in tqdm(range(num_classes), desc="Computing IoU APs", unit="class"):
-            class_name = classes[cls_id]
             for s, iou_thres in enumerate(iou_thres_list):
                 iou_3d_aps[cls_id, s] = compute_ap_from_matches_scores(
                     iou_pred_matches_all[cls_id][s, :],
@@ -617,25 +787,37 @@ class NOCSMetric(BaseMetric):
             and the values are corresponding results.
         """
         logger: MMLogger = MMLogger.get_current_instance()
+        if not results:
+            raise ValueError("NOCSMetric requires at least one processed sample")
         gts, preds = zip(*results)
         eval_results = OrderedDict()
-        for iou_thr in [0.5]:
+
+        # ``eval_map`` expects one (N, 5) bbox+score array per image/class.
+        # This representation is independent of IoU, so construct it once and
+        # reuse it for every configured threshold.
+        class_preds = []
+        for pred in preds:
+            hbb_pred = pred.get("hbb_eval", pred)
+            tmp_dets = []
+            for label in range(len(self.dataset_meta["classes"])):
+                index = np.where(hbb_pred["labels"] == label)[0]
+                pred_bbox_scores = np.hstack(
+                    [
+                        hbb_pred["bboxes"][index],
+                        hbb_pred["scores"][index].reshape((-1, 1)),
+                    ]
+                )
+                tmp_dets.append(pred_bbox_scores)
+            class_preds.append(tmp_dets)
+
+        aps_by_iou = OrderedDict()
+        for iou_thr in self.iou_thrs:
             logger.info(f"\n{'-' * 15}iou_thr: {iou_thr}{'-' * 15}")
             # Follow the official implementation,
             # http://host.robots.ox.ac.uk/pascal/VOC/voc2012/VOCdevkit_18-May-2011.tar
             # we should use the legacy coordinate system in yopo 1.x,
             # which means w, h should be computed as 'x2 - x1 + 1` and
             # `y2 - y1 + 1`
-            class_preds = []
-            for pred in preds:
-                tmp_dets = []
-                for label in range(len(self.dataset_meta["classes"])):
-                    index = np.where(pred["labels"] == label)[0]
-                    pred_bbox_scores = np.hstack(
-                        [pred["bboxes"][index], pred["scores"][index].reshape((-1, 1))]
-                    )
-                    tmp_dets.append(pred_bbox_scores)
-                class_preds.append(tmp_dets)
             mean_ap, _ = eval_map(
                 class_preds,
                 gts,
@@ -646,7 +828,29 @@ class NOCSMetric(BaseMetric):
                 eval_mode="area",
                 use_legacy_coordinate=True,
             )
-            eval_results[f"AP{int(iou_thr * 100):02d}"] = round(mean_ap, 3)
+            # Keep full precision: this value drives checkpoint selection and
+            # early stopping, where three-decimal rounding can turn genuine
+            # small improvements into false plateaus. Logger formatting may
+            # still present a compact value without changing the metric.
+            mean_ap = float(mean_ap)
+            if not np.isfinite(mean_ap):
+                raise ValueError(
+                    f"eval_map returned a non-finite AP at IoU {iou_thr}: "
+                    f"{mean_ap}")
+            aps_by_iou[iou_thr] = mean_ap
+            eval_results[_ap_key(iou_thr)] = mean_ap
+
+        # AP50_95 is the arithmetic mean of the ten dataset-level mAP values,
+        # matching the aggregation convention used for COCO-style AP50:95.
+        # It is emitted only for that exact range, so sparse/custom threshold
+        # sets cannot accidentally masquerade as the canonical metric.
+        if _is_coco_iou_range(self.iou_thrs):
+            eval_results["AP50_95"] = float(np.mean(tuple(aps_by_iou.values())))
+        logger.info(
+            "3d_iou_* uses exact arbitrary-SO(3) oriented cuboid overlap; "
+            "historical values from the pre-2026-08-26 corner-axis metric "
+            "are not comparable."
+        )
         pose_results = self.compute_independent_mAP(
             preds, gts, logger=logger, cat_id=-1, classes=self.dataset_meta["classes"]
         )
@@ -672,6 +876,8 @@ def compute_3d_matches(
     pred_scales,
     iou_3d_thresholds,
     score_threshold=0,
+    prune_below_iou_threshold=False,
+    return_pruning_stats=False,
 ):
     """Finds matches between prediction and ground truth instances.
     Returns:
@@ -679,73 +885,137 @@ def compute_3d_matches(
                   predicted box.
         pred_matches: 2-D array. For each predicted box, it has the index of
                     the matched ground truth box.
-        overlaps: [pred_boxes, gt_boxes] IoU overlaps.
+        overlaps: [pred_boxes, gt_boxes] IoU overlaps. When
+            ``prune_below_iou_threshold`` is true, entries proven unable to
+            reach the lowest requested threshold are zero without running the
+            exact narrow phase. Matching/AP remains exact, but those
+            below-threshold entries are not diagnostic exact IoUs.
+        pruning_stats: Appended only when ``return_pruning_stats=True``.
     """
 
-    def trim_zeros(x):
-        """It's common to have tensors larger than the available data and
-        pad with zeros. This function removes rows that are all zeros.
-        x: [rows, columns].
-        """
-
-        pre_shape = x.shape
-        assert len(x.shape) == 2, x.shape
-        new_x = x[~np.all(x == 0, axis=1)]
-        post_shape = new_x.shape
-        assert pre_shape[0] == post_shape[0]
-        assert pre_shape[1] == post_shape[1]
-
-        return new_x
-
     # Trim zero padding
-    # TODO: cleaner to do zero unpadding upstream
     num_pred = len(pred_class_ids)
     num_gt = len(gt_class_ids)
-    indices = np.zeros(0)
+    indices = np.zeros(0, dtype=np.int64)
 
     if num_pred:
-        pred_boxes = trim_zeros(pred_boxes).copy()
-        pred_scores = pred_scores[: pred_boxes.shape[0]].copy()
+        pred_boxes = np.asarray(pred_boxes)
+        if pred_boxes.ndim != 2:
+            raise ValueError(
+                f"pred_boxes must have two dimensions, got {pred_boxes.shape}"
+            )
+        if len(pred_boxes) != num_pred:
+            raise ValueError(
+                "pred_boxes and pred_class_ids must align: "
+                f"{len(pred_boxes)} != {num_pred}"
+            )
+        aligned_fields = {
+            "pred_scores": np.asarray(pred_scores),
+            "pred_class_ids": np.asarray(pred_class_ids),
+            "pred_scales": np.asarray(pred_scales),
+            "pred_RTs": np.asarray(pred_RTs),
+        }
+        for name, field in aligned_fields.items():
+            if len(field) != num_pred:
+                raise ValueError(
+                    f"{name} must align with pred_boxes: "
+                    f"{len(field)} != {num_pred}"
+                )
+
+        nonzero_mask = ~np.all(pred_boxes == 0, axis=1)
+        original_indices = np.flatnonzero(nonzero_mask)
+        pred_boxes = pred_boxes[nonzero_mask].copy()
+        pred_scores = aligned_fields["pred_scores"][nonzero_mask].copy()
+        pred_class_ids = aligned_fields["pred_class_ids"][nonzero_mask].copy()
+        pred_scales = aligned_fields["pred_scales"][nonzero_mask].copy()
+        pred_RTs = aligned_fields["pred_RTs"][nonzero_mask].copy()
+        num_pred = len(pred_boxes)
 
         # Sort predictions by score from high to low
-        indices = np.argsort(pred_scores)[::-1]
+        sort_order = np.argsort(pred_scores)[::-1]
+        indices = original_indices[sort_order]
 
-        pred_boxes = pred_boxes[indices].copy()
-        pred_class_ids = pred_class_ids[indices].copy()
-        pred_scores = pred_scores[indices].copy()
-        pred_scales = pred_scales[indices].copy()
-        pred_RTs = pred_RTs[indices].copy()
+        pred_boxes = pred_boxes[sort_order].copy()
+        pred_class_ids = pred_class_ids[sort_order].copy()
+        pred_scores = pred_scores[sort_order].copy()
+        pred_scales = pred_scales[sort_order].copy()
+        pred_RTs = pred_RTs[sort_order].copy()
+
+    # Decompose each similarity transform once.  Convex overlap remains
+    # pairwise, but repeating SVD/polar normalization for every N x M pair is
+    # unnecessarily expensive on dense fruit scenes.
+    pred_oriented_boxes = [
+        None
+        if pred_RTs[i] is None
+        else _decompose_nocs_similarity_box(
+            pred_RTs[i],
+            pred_scales[i],
+            name=f"pred_RTs[{i}]",
+            allow_nonpositive_sizes=True,
+        )
+        for i in range(num_pred)
+    ]
+    gt_oriented_boxes = [
+        None
+        if gt_RTs[j] is None
+        else _decompose_nocs_similarity_box(
+            gt_RTs[j], gt_scales[j], name=f"gt_RTs[{j}]"
+        )
+        for j in range(num_gt)
+    ]
+
+    if not iou_3d_thresholds:
+        raise ValueError("iou_3d_thresholds must contain at least one value")
+    lowest_iou_threshold = float(min(iou_3d_thresholds))
+    if not np.isfinite(lowest_iou_threshold) or lowest_iou_threshold < 0.0:
+        raise ValueError(
+            "iou_3d_thresholds must contain finite non-negative values"
+        )
+    if prune_below_iou_threshold and lowest_iou_threshold > 0.0:
+        exact_candidate_mask, _ = _pairwise_exact_iou_candidate_mask(
+            pred_oriented_boxes,
+            gt_oriented_boxes,
+            lowest_iou_threshold=lowest_iou_threshold,
+            pred_class_ids=pred_class_ids,
+            gt_class_ids=gt_class_ids,
+            class_names=class_names,
+            gt_handle_visibility=gt_handle_visibility,
+        )
+    else:
+        exact_candidate_mask = np.ones((num_pred, num_gt), dtype=bool)
 
     # Compute IoU overlaps [pred_bboxs gt_bboxs]
     overlaps = np.zeros((num_pred, num_gt), dtype=np.float32)
     for i in range(num_pred):
         for j in range(num_gt):
-            overlaps[i, j] = compute_3d_iou(
-                pred_RTs[i],
-                gt_RTs[j],
-                pred_scales[i],
-                gt_scales[j],
-                gt_handle_visibility[j],
-                class_names[pred_class_ids[i]],
-                class_names[gt_class_ids[j]],
-            )
+            if exact_candidate_mask[i, j]:
+                overlaps[i, j] = _compute_decomposed_3d_iou(
+                    pred_oriented_boxes[i],
+                    gt_oriented_boxes[j],
+                    gt_handle_visibility[j],
+                    class_names[pred_class_ids[i]],
+                    class_names[gt_class_ids[j]],
+                )
+            elif pred_oriented_boxes[i] is None or gt_oriented_boxes[j] is None:
+                overlaps[i, j] = -1.0
 
     # Loop through predictions and find matching ground truth boxes
     num_iou_3d_thres = len(iou_3d_thresholds)
     pred_matches = -1 * np.ones([num_iou_3d_thres, num_pred])
     gt_matches = -1 * np.ones([num_iou_3d_thres, num_gt])
 
+    sorted_overlap_indices = []
+    for i in range(len(pred_boxes)):
+        sorted_ixs = np.argsort(overlaps[i])[::-1]
+        low_score_idx = np.where(overlaps[i, sorted_ixs] < score_threshold)[0]
+        if low_score_idx.size > 0:
+            sorted_ixs = sorted_ixs[: low_score_idx[0]]
+        sorted_overlap_indices.append(sorted_ixs)
+
     for s, iou_thres in enumerate(iou_3d_thresholds):
         for i in range(len(pred_boxes)):
-            # Find best matching ground truth box
-            # 1. Sort matches by score
-            sorted_ixs = np.argsort(overlaps[i])[::-1]
-            # 2. Remove low scores
-            low_score_idx = np.where(overlaps[i, sorted_ixs] < score_threshold)[0]
-            if low_score_idx.size > 0:
-                sorted_ixs = sorted_ixs[: low_score_idx[0]]
-            # 3. Find the match
-            for j in sorted_ixs:
+            # Find the match using the threshold-independent cached ordering.
+            for j in sorted_overlap_indices[i]:
                 # If ground truth box is already matched, go to next one
                 # print('gt_match: ', gt_match[j])
                 if gt_matches[s, j] > -1:
@@ -763,7 +1033,15 @@ def compute_3d_matches(
                     pred_matches[s, i] = j
                     break
 
-    return gt_matches, pred_matches, overlaps, indices
+    result = (gt_matches, pred_matches, overlaps, indices)
+    if return_pruning_stats:
+        result += (
+            {
+                "total_pairs": int(num_pred * num_gt),
+                "exact_candidates": int(np.count_nonzero(exact_candidate_mask)),
+            },
+        )
+    return result
 
 
 def compute_RT_overlaps(
@@ -944,98 +1222,228 @@ def compute_ap_from_matches_scores(pred_match, pred_scores, gt_match):
     return ap
 
 
+def _decompose_nocs_similarity_box(
+    RT, scales, *, name, allow_nonpositive_sizes=False
+):
+    """Return ``(center, full_sizes, SO(3) rotation)`` from a NOCS RT."""
+    transform = np.asarray(RT, dtype=np.float64)
+    if transform.shape != (4, 4):
+        raise ValueError(f"{name} must have shape (4, 4), got {transform.shape}")
+    if not np.isfinite(transform).all():
+        raise ValueError(f"{name} must contain only finite values")
+
+    linear = transform[:3, :3]
+    determinant = float(np.linalg.det(linear))
+    if not np.isfinite(determinant) or abs(determinant) <= 1e-12:
+        raise ValueError(
+            f"{name} linear block must have non-zero finite determinant, "
+            f"got {determinant}"
+        )
+    uniform_scale = float(np.cbrt(determinant))
+    rotation = linear / uniform_scale
+    gram = rotation.T @ rotation
+    # Float32 6D-to-SO(3) conversion reaches ~2e-5 Gram error on the current
+    # validation predictions.  A 1e-4 gate admits that measured numerical
+    # drift while still rejecting genuinely anisotropic affine transforms.
+    if not np.allclose(gram, np.eye(3), rtol=1e-4, atol=1e-4):
+        raise ValueError(
+            f"{name} linear block must be rotation times uniform scale; "
+            f"max|R^T R-I|={np.max(np.abs(gram - np.eye(3))):.12g}"
+        )
+
+    # Project only the already-validated near-rotation to exact SO(3), so the
+    # geometry helper can retain its strict input contract.
+    left, _, right_t = np.linalg.svd(rotation)
+    rotation = left @ right_t
+    if np.linalg.det(rotation) < 0.0:
+        left[:, -1] *= -1.0
+        rotation = left @ right_t
+
+    full_sizes = np.asarray(scales, dtype=np.float64)
+    if full_sizes.shape != (3,):
+        raise ValueError(f"{name} scales must have shape (3,), got {full_sizes.shape}")
+    full_sizes = abs(uniform_scale) * full_sizes
+    if not np.isfinite(full_sizes).all():
+        raise ValueError(
+            f"{name} effective full sizes must be finite, "
+            f"got {full_sizes.tolist()}"
+        )
+    if np.any(full_sizes <= 0.0):
+        if allow_nonpositive_sizes:
+            return transform[:3, 3], None, rotation
+        raise ValueError(
+            f"{name} effective full sizes must be positive, "
+            f"got {full_sizes.tolist()}"
+        )
+    return transform[:3, 3], full_sizes, rotation
+
+
+def _uses_nocs_continuous_y_symmetry(
+    class_name_1, class_name_2, handle_visibility
+):
+    return (
+        class_name_1 in ["bottle", "bowl", "can"]
+        and class_name_1 == class_name_2
+    ) or (
+        class_name_1 == "mug"
+        and class_name_1 == class_name_2
+        and handle_visibility == 0
+    )
+
+
+def _float32_iou_upper_bound_can_match(upper_bounds, threshold):
+    """Gate exact candidates in the same float32 domain as matching.
+
+    Exact IoUs are stored in the float32 ``overlaps`` matrix before threshold
+    comparison.  Monotone float32 rounding preserves ``exact <= upper``, and
+    one additional outward ULP covers the coarse bound's numerical guard.
+    """
+    upper_float32 = np.asarray(upper_bounds, dtype=np.float32)
+    guarded_upper = np.nextafter(
+        upper_float32, np.full_like(upper_float32, np.inf)
+    )
+    return guarded_upper.astype(np.float64) > float(threshold)
+
+
+def _pairwise_exact_iou_candidate_mask(
+    pred_boxes,
+    gt_boxes,
+    *,
+    lowest_iou_threshold,
+    pred_class_ids,
+    gt_class_ids,
+    class_names,
+    gt_handle_visibility,
+):
+    """Return safe exact-phase candidates and their IoU upper bounds."""
+    num_pred = len(pred_boxes)
+    num_gt = len(gt_boxes)
+    upper_bounds = np.full((num_pred, num_gt), -1.0, dtype=np.float64)
+    valid_pred = [
+        index
+        for index, box in enumerate(pred_boxes)
+        if box is not None and box[1] is not None
+    ]
+    valid_gt = [index for index, box in enumerate(gt_boxes) if box is not None]
+    if valid_pred and valid_gt:
+        pred_centers = np.stack([pred_boxes[index][0] for index in valid_pred])
+        pred_sizes = np.stack([pred_boxes[index][1] for index in valid_pred])
+        pred_rotations = np.stack([pred_boxes[index][2] for index in valid_pred])
+        gt_centers = np.stack([gt_boxes[index][0] for index in valid_gt])
+        gt_sizes = np.stack([gt_boxes[index][1] for index in valid_gt])
+        gt_rotations = np.stack([gt_boxes[index][2] for index in valid_gt])
+        valid_upper = pairwise_oriented_box_iou_upper_bound_from_boxes_3d(
+            pred_centers,
+            pred_sizes,
+            pred_rotations,
+            gt_centers,
+            gt_sizes,
+            gt_rotations,
+        )
+        upper_bounds[np.ix_(valid_pred, valid_gt)] = valid_upper
+
+    # A pair-specific local-y canonicalization can change an anisotropic box's
+    # world AABB.  Do not prune declared symmetric pairs using the unaligned
+    # envelope; send them directly to the exact symmetry-aware narrow phase.
+    symmetry_pairs = np.zeros((num_pred, num_gt), dtype=bool)
+    for pred_index in valid_pred:
+        for gt_index in valid_gt:
+            symmetry_pairs[pred_index, gt_index] = (
+                _uses_nocs_continuous_y_symmetry(
+                    class_names[pred_class_ids[pred_index]],
+                    class_names[gt_class_ids[gt_index]],
+                    gt_handle_visibility[gt_index],
+                )
+            )
+    upper_bounds[symmetry_pairs] = 1.0
+
+    # Strict '<' pruning retains equality-boundary pairs, including any one-ULP
+    # numerical uncertainty introduced while constructing the AABB envelope.
+    candidate_mask = _float32_iou_upper_bound_can_match(
+        upper_bounds, lowest_iou_threshold
+    )
+    return candidate_mask, upper_bounds
+
+
+def _compute_decomposed_3d_iou(
+    box_1, box_2, handle_visibility, class_name_1, class_name_2
+):
+    """Compute IoU from validated ``(center, size, rotation)`` tuples."""
+    if box_1 is None or box_2 is None:
+        return -1
+
+    center_1, full_sizes_1, rotation_1 = box_1
+    center_2, full_sizes_2, rotation_2 = box_2
+    if full_sizes_1 is None:
+        # Direct size regression can occasionally emit a finite non-positive
+        # side.  Keep it as an unmatched false positive instead of aborting a
+        # whole validation run.  GT decomposition remains strict above.
+        return 0.0
+
+    if _uses_nocs_continuous_y_symmetry(
+        class_name_1, class_name_2, handle_visibility
+    ):
+        # Preserve the established NOCS continuous local-y symmetry policy.
+        relative_rotation = rotation_1.T @ rotation_2
+        theta = np.arctan2(
+            relative_rotation[0, 2] - relative_rotation[2, 0],
+            relative_rotation[0, 0] + relative_rotation[2, 2],
+        )
+        cosine = np.cos(theta)
+        sine = np.sin(theta)
+        rotation_1 = rotation_1 @ np.array(
+            [[cosine, 0.0, sine], [0.0, 1.0, 0.0], [-sine, 0.0, cosine]],
+            dtype=np.float64,
+        )
+
+    return oriented_box_iou_3d(
+        center_1,
+        full_sizes_1,
+        rotation_1,
+        center_2,
+        full_sizes_2,
+        rotation_2,
+    )
+
+
 def compute_3d_iou(
     RT_1, RT_2, scales_1, scales_2, handle_visibility, class_name_1, class_name_2
 ):
-    """Computes IoU overlaps between two 3d bboxes.
-    bbox_3d_1, bbox_3d_1: [3, 8]
+    """Compute exact IoU between two NOCS similarity-transform cuboids.
+
+    The linear block of each ``RT`` is interpreted as a proper rotation times
+    one uniform scalar.  That scalar is moved into the supplied full side
+    lengths before evaluating the true arbitrary-SO(3) cuboid intersection.
+    A small polar projection removes floating-point drift only after the
+    similarity contract has been validated.
+
+    ``3d_iou_*`` values emitted through this function are intentionally not
+    comparable with historical runs that reduced transformed corners along
+    the wrong array axis.  ``None`` transforms retain the historical ``-1``
+    sentinel.  A finite non-positive predicted side produces IoU zero, leaving
+    that prediction to be counted as a false positive; invalid GT sizes,
+    non-finite values, and malformed/non-similarity transforms fail fast.
     """
-
-    # flatten masks
-    def asymmetric_3d_iou(RT_1, RT_2, scales_1, scales_2):
-        noc_cube_1 = get_3d_bbox(scales_1, 0)
-        bbox_3d_1 = transform_coordinates_3d(noc_cube_1, RT_1)
-
-        noc_cube_2 = get_3d_bbox(scales_2, 0)
-        bbox_3d_2 = transform_coordinates_3d(noc_cube_2, RT_2)
-
-        bbox_1_max = np.amax(bbox_3d_1, axis=0)
-        bbox_1_min = np.amin(bbox_3d_1, axis=0)
-        bbox_2_max = np.amax(bbox_3d_2, axis=0)
-        bbox_2_min = np.amin(bbox_3d_2, axis=0)
-
-        # new
-        # bbox_1_max = np.amax(bbox_3d_1, axis=1)
-        # bbox_1_min = np.amin(bbox_3d_1, axis=1)
-        # bbox_2_max = np.amax(bbox_3d_2, axis=1)
-        # bbox_2_min = np.amin(bbox_3d_2, axis=1)
-
-        overlap_min = np.maximum(bbox_1_min, bbox_2_min)
-        overlap_max = np.minimum(bbox_1_max, bbox_2_max)
-
-        # intersections and union
-        if np.amin(overlap_max - overlap_min) < 0:
-            intersections = 0
-        else:
-            intersections = np.prod(overlap_max - overlap_min)
-        union = (
-            np.prod(bbox_1_max - bbox_1_min)
-            + np.prod(bbox_2_max - bbox_2_min)
-            - intersections
-        )
-        overlaps = intersections / union
-        return overlaps
 
     if RT_1 is None or RT_2 is None:
         return -1
 
-    if (class_name_1 in ["bottle", "bowl", "can"] and class_name_1 == class_name_2) or (
-        class_name_1 == "mug"
-        and class_name_1 == class_name_2
-        and handle_visibility == 0
-    ):
-        # For symmetric objects, find the optimal rotation around the y-axis
-        # to maximize the IoU instead of brute-forcing.
-        def y_rotation_matrix(theta):
-            return np.array(
-                [
-                    [np.cos(theta), 0, np.sin(theta), 0],
-                    [0, 1, 0, 0],
-                    [-np.sin(theta), 0, np.cos(theta), 0],
-                    [0, 0, 0, 1],
-                ]
-            )
-
-        # The rotation part of RT_1 and RT_2 is scaled.
-        # We need to extract the pure rotation to find the optimal angle.
-        R1_scaled_mat = RT_1[:3, :3]
-        R2_scaled_mat = RT_2[:3, :3]
-
-        # Extract pure rotation matrices
-        R1 = R1_scaled_mat / np.cbrt(np.linalg.det(R1_scaled_mat))
-        R2 = R2_scaled_mat / np.cbrt(np.linalg.det(R2_scaled_mat))
-
-        # Compute the relative rotation.
-        R_12 = R1.T @ R2
-        # Find the angle that aligns R1's y-rotation with R2's.
-        # This is derived by maximizing trace(R_y(theta)^T R_1^T R_2).
-        theta = np.arctan2(R_12[0, 2] - R_12[2, 0], R_12[0, 0] + R_12[2, 2])
-
-        # Create a new RT_1 by applying the optimal rotation.
-        # The new rotation matrix must be rescaled with the original scaling.
-        rotated_R1 = R1 @ y_rotation_matrix(theta)[:3, :3]
-
-        # Re-apply original scaling to the rotated matrix
-        rotated_R1_scaled = rotated_R1 * np.cbrt(np.linalg.det(R1_scaled_mat))
-
-        rotated_RT_1 = RT_1.copy()
-        rotated_RT_1[:3, :3] = rotated_R1_scaled
-
-        max_iou = asymmetric_3d_iou(rotated_RT_1, RT_2, scales_1, scales_2)
-    else:
-        max_iou = asymmetric_3d_iou(RT_1, RT_2, scales_1, scales_2)
-
-    return max_iou
+    center_1, full_sizes_1, rotation_1 = _decompose_nocs_similarity_box(
+        RT_1,
+        scales_1,
+        name="RT_1",
+        allow_nonpositive_sizes=True,
+    )
+    center_2, full_sizes_2, rotation_2 = _decompose_nocs_similarity_box(
+        RT_2, scales_2, name="RT_2"
+    )
+    return _compute_decomposed_3d_iou(
+        (center_1, full_sizes_1, rotation_1),
+        (center_2, full_sizes_2, rotation_2),
+        handle_visibility,
+        class_name_1,
+        class_name_2,
+    )
 
 
 def get_3d_bbox(scale, shift=0):
@@ -1114,6 +1522,7 @@ def _process_batch_worker(args):
         shift_thres_list,
         use_matches_for_pose,
         iou_pose_thres,
+        two_phase_3d_iou,
     ) = args
 
     num_degree_thres = len(degree_thres_list)
@@ -1133,6 +1542,7 @@ def _process_batch_worker(args):
     pose_pred_scores_all = [
         np.zeros((num_degree_thres, num_shift_thres, 0)) for _ in range(num_classes)
     ]
+    pruning_stats = {"total_pairs": 0, "exact_candidates": 0}
 
     for pred, gt in zip(batch_preds, batch_gts):
         gt_class_ids = gt["labels"].astype(np.int32)
@@ -1207,7 +1617,13 @@ def _process_batch_worker(args):
                     else np.ones(0)
                 )
 
-            (iou_cls_gt_match, iou_cls_pred_match, _, iou_pred_indices) = (
+            (
+                iou_cls_gt_match,
+                iou_cls_pred_match,
+                _,
+                iou_pred_indices,
+                class_pruning_stats,
+            ) = (
                 compute_3d_matches(
                     cls_gt_class_ids,
                     cls_gt_RTs,
@@ -1220,8 +1636,14 @@ def _process_batch_worker(args):
                     cls_pred_RTs,
                     cls_pred_scales,
                     iou_thres_list,
+                    prune_below_iou_threshold=two_phase_3d_iou,
+                    return_pruning_stats=True,
                 )
             )
+            pruning_stats["total_pairs"] += class_pruning_stats["total_pairs"]
+            pruning_stats["exact_candidates"] += class_pruning_stats[
+                "exact_candidates"
+            ]
             if len(iou_pred_indices):
                 cls_pred_class_ids = cls_pred_class_ids[iou_pred_indices]
                 cls_pred_RTs = cls_pred_RTs[iou_pred_indices]
@@ -1330,4 +1752,5 @@ def _process_batch_worker(args):
         pose_pred_matches_all,
         pose_pred_scores_all,
         pose_gt_matches_all,
+        pruning_stats,
     )

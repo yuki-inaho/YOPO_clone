@@ -1467,7 +1467,7 @@ requires-dist = [
     { name = "mmengine", specifier = ">=0.7.1,<1.0.0" },
     { name = "muon-optimizer", git = "https://github.com/KellerJordan/Muon.git?rev=f98f1cacc0263b04290753e32be8d498c1efc806" },
     { name = "numpy", specifier = "<2" },
-    { name = "opencv-python" },
+    { name = "opencv-python", specifier = "==4.11.0.86" },
     { name = "packaging" },
     { name = "pillow" },
     { name = "plyfile" },

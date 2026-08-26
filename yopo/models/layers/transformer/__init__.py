@@ -18,6 +18,9 @@ from .grounding_dino_layers import (GroundingDinoTransformerDecoder,
 from .mask2former_layers import (Mask2FormerTransformerDecoder,
                                  Mask2FormerTransformerDecoderLayer,
                                  Mask2FormerTransformerEncoder)
+from .oriented_contrastive_denoising import (BoxOnlyOCDNoise,
+                                              BoxOnlyOCDQueries,
+                                              generate_box_only_ocd_queries)
 from .stable_dino_layers import StableDINOTransformerEncoder
 from .utils import (MLP, AdaptivePadding, ConditionalAttention, DynamicConv,
                     PatchEmbed, PatchMerging, coordinate_to_encoding,
@@ -39,5 +42,6 @@ __all__ = [
     'Mask2FormerTransformerDecoderLayer', 'Mask2FormerTransformerDecoder',
     'GroundingDinoTransformerDecoderLayer', 'GroundingDinoTransformerEncoder',
     'GroundingDinoTransformerDecoder',
-    'StableDINOTransformerEncoder'
+    'StableDINOTransformerEncoder', 'BoxOnlyOCDNoise', 'BoxOnlyOCDQueries',
+    'generate_box_only_ocd_queries',
 ]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+import pytest
 import torch
 from mmengine.config import Config
 from mmengine.utils import import_modules_from_strings
@@ -14,6 +15,26 @@ from yopo.utils import register_all_modules
 
 CONFIG_PATH = "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_transfer.py"
 CUSTOM_INTRINSIC = [443.9066, 449.1953, 321.3503, 230.8687]
+
+
+def test_concat_raw_depth_can_swap_only_rgb_channels():
+    from yopo.datasets.transforms.raw_depth import ConcatRawDepthToImage
+
+    result = ConcatRawDepthToImage(
+        depth_scale=255.0,
+        bgr_to_rgb=True,
+    ).transform(
+        {
+            "img": np.array([[[10, 20, 30]]], dtype=np.uint8),
+            "depth": np.array([[0.5]], dtype=np.float32),
+            "depth_valid_mask": np.array([[True]]),
+        }
+    )
+
+    assert result["img"].shape == (1, 1, 4)
+    assert result["img"][0, 0].tolist() == pytest.approx(
+        [30.0, 20.0, 10.0, 127.5]
+    )
 
 
 def test_rgbd_3dbbox_sample_contract():

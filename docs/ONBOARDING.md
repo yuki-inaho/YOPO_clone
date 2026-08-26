@@ -29,6 +29,7 @@
 | 役割定義 | `.agents/roles/{coordinator,worker,audit}.txt` | start-work-audit パターンの統括/作業/監査の責務・禁止事項・報告形式 |
 | ビルド/タスク | `justfile`, `pyproject.toml` | `just` レシピ（sync/env-doctor/smoke-*/…）と uv 依存定義（cu121 index・mmcv wheel URL） |
 | 既知課題/テスト資産 | `tests/`（上流 mmdet 由来）, 作業書 §7 | 上流テスト群。本作業のスモークは `just smoke-train`/`just smoke-infer` が回帰確認の役割 |
+| RGB-Dモデル規模・計算量 | `docs/rgbd_3dobb_model_complexity_analysis.md` | 現行43.70M parameter、module構造、640x445/800x600 FLOPs概算、再現コマンド、GPU実測方針 |
 | 概要 | `README.md` | uv/cu121 Quickstart + モデルズー + 実データ手順 |
 
 ## 4. タスク境界（任せること / 任せないこと）
