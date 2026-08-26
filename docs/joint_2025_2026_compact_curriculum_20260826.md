@@ -92,3 +92,8 @@ accuracy gate.
   Stage 1.
 - Exact resume confirmed `epoch=5, iter=425`; epoch 6 continued at base LR
   `1e-4` with the restored optimizer state and finite losses.
+- First in-loop validation at epoch 10: AP50 `0.5653`, AP75 `0.2103`,
+  AP50:95 `0.2656`. AP50:95 improved by `+0.0602` over the standalone epoch-5
+  baseline. `best_AP50_95_epoch_10.pth`, `best_AP75_epoch_10.pth`, and the
+  exactly resumable `epoch_10.pth` were written. Stage 1 remains active in
+  tmux session `yopo_joint800_stage1_resume_e5` until its plateau gate.
