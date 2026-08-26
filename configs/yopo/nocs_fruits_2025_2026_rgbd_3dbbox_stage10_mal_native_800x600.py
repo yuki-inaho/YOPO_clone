@@ -11,6 +11,20 @@ _base_ = [
     "stage10_2d_anchor_mal_full.py"
 ]
 
+custom_imports = dict(
+    imports=[
+        "yopo.datasets.pose_estimation.nocs_custom_fruit_dataset",
+        "yopo.datasets.transforms.raw_depth",
+        "yopo.datasets.transforms.identity_geometry",
+        "yopo.engine.hooks.rgbd_pose_transfer",
+        "yopo.engine.optimizers.deim_optimizers",
+        "yopo.models.backbones.dual_rgbd",
+        "yopo.models.losses.projected_ellipsoid_loss",
+        "yopo.models.losses.stable_rotation",
+    ],
+    allow_failed_imports=False,
+)
+
 dataset_type = "NOCSCustomFruitDataset"
 backend_args = None
 joint_root = "data/fruits_rgbd_2025_2026_800x600_preprocessed/"
@@ -27,6 +41,14 @@ native_train_pipeline = [
         with_obb_gaussian=True,
     ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
+    # No resize still needs an explicit identity-geometry contract.  Besides
+    # failing closed on a malformed canvas/depth pair, this records the
+    # scale_factor consumed by rescaled prediction and validation.
+    dict(
+        type="AssertIdentityImageGeometry",
+        image_size=(800, 600),
+        channels=4,
+    ),
     dict(type="RandomFlipFor9DPose", prob=0.5),
     dict(type="FilterAnnotations", min_gt_bbox_wh=(1e-2, 1e-2)),
     dict(type="Pack9DPoseInputs"),
@@ -43,6 +65,11 @@ native_val_pipeline = [
         with_obb_gaussian=True,
     ),
     dict(type="ConcatRawDepthToImage", depth_scale=255.0),
+    dict(
+        type="AssertIdentityImageGeometry",
+        image_size=(800, 600),
+        channels=4,
+    ),
     dict(
         type="Pack9DPoseInputs",
         meta_keys=(

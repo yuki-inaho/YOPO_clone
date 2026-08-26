@@ -24,6 +24,10 @@ def configs():
 
 def test_all_stages_keep_joint_native_data_and_amp_batch_30(configs):
     for config in configs:
+        assert (
+            "yopo.datasets.transforms.identity_geometry"
+            in config.custom_imports.imports
+        )
         assert config.train_dataloader.batch_size == 30
         assert config.model.data_preprocessor.pad_size_divisor == 1
         assert config.optim_wrapper.type == "AmpScheduleFreeOptimWrapper"
@@ -43,6 +47,19 @@ def test_all_stages_keep_joint_native_data_and_amp_batch_30(configs):
             for transform in config.train_dataloader.dataset.datasets[0].pipeline
         }
         assert "Resize" not in pipeline_types
+        assert "AssertIdentityImageGeometry" in pipeline_types
+        identity = next(
+            transform
+            for transform in config.train_dataloader.dataset.datasets[0].pipeline
+            if transform.type == "AssertIdentityImageGeometry"
+        )
+        assert tuple(identity.image_size) == (800, 600)
+        assert identity.channels == 4
+        val_pipeline_types = {
+            transform.type
+            for transform in config.val_dataloader.dataset.datasets[0].pipeline
+        }
+        assert "AssertIdentityImageGeometry" in val_pipeline_types
 
 
 def test_stage1_is_pose_independent_detection(configs):

@@ -68,3 +68,22 @@ This command starts only after the implementation/config commit is pushed.
 The first finite optimizer update and observed GPU peak are recorded before
 the run is treated as healthy; the first AP50:95 validation is the first
 accuracy gate.
+
+## Run record
+
+- Implementation/config commit: `4695d13` (pushed before training).
+- First launch: `20260826_153828`, batch 30, base LR `1e-4`.
+- Epoch 5 train result: total loss `15.9860`, bbox L1 `0.1031`, GIoU
+  `0.6883`, center2D `0.0492`; all pose losses exactly zero and all logged
+  values finite.
+- Peak observed process GPU allocation: approximately 29.9 GiB; MMEngine
+  peak tensor memory 27,651 MiB.
+- The first validation correctly exposed a native-input metadata omission:
+  prediction rescaling requires `scale_factor`, but the resize-free joint
+  pipeline had not recorded identity scale. Training was stopped after the
+  valid `epoch_5.pth` save.
+- Fix: insert `AssertIdentityImageGeometry(image_size=(800, 600), channels=4)`
+  in every joint train/validation pipeline and explicitly import it. Real
+  samples from both years now verify as `4x600x800`, `img_shape==ori_shape`,
+  and `scale_factor==(1.0, 1.0)`. Resume must use `epoch_5.pth` with optimizer
+  state rather than restarting or loading it as model-only.
