@@ -221,7 +221,8 @@ def main() -> None:
             "magenta": (
                 "not drawn in all-predictions mode because background-query OBBs "
                 "are not supervised"
-                if args.all_predictions else "predicted 2D OBB ellipse"
+                if args.all_predictions else
+                "predicted 2D OBB ellipse when exposed by the model"
             ),
         },
         "images": [],
@@ -254,7 +255,9 @@ def main() -> None:
         # teacher-free dumps usable in that mode; matched rendering still
         # requires the explicit diagnostic OBB output.
         pred_obbs = (
-            None if args.all_predictions else _array(pred["obb_gaussians"])
+            None
+            if args.all_predictions or "obb_gaussians" not in pred
+            else _array(pred["obb_gaussians"])
         )
         pred_scores = _array(pred["scores"])
         pred_sizes = _array(pred["sizes"])
@@ -302,8 +305,9 @@ def main() -> None:
             for rank, (pred_index, gt_index, iou) in enumerate(pairs):
                 pred_box = pred_boxes[pred_index]
                 draw_box(panel_2d, pred_box, PRED_COLOR, 2)
-                draw_obb(panel_2d, pred_obbs[pred_index],
-                         (pred_box[:2] + pred_box[2:]) * 0.5)
+                if pred_obbs is not None:
+                    draw_obb(panel_2d, pred_obbs[pred_index],
+                             (pred_box[:2] + pred_box[2:]) * 0.5)
                 draw_cuboid(panel_3d, gt_sizes[gt_index], gt_transforms[gt_index],
                              intrinsic, GT_COLOR, 1)
                 draw_cuboid(panel_3d, pred_sizes[pred_index],

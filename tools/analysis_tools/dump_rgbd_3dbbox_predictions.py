@@ -39,6 +39,18 @@ def main() -> None:
     # checkpoint hook expects ``before_train`` to initialize its file backend,
     # so retaining it would fail after an otherwise complete validation.
     cfg.default_hooks.pop("checkpoint", None)
+    # A val-only Runner has no optimizer.  ScheduleFree's mode-switch hook is
+    # therefore both unnecessary and invalid here; early stopping is likewise
+    # a training-loop concern.  Preserve every other custom validation hook.
+    training_only_hooks = {
+        "EarlyStoppingHook",
+        "ScheduleFreeOptimizerModeHook",
+    }
+    cfg.custom_hooks = [
+        hook
+        for hook in cfg.get("custom_hooks", [])
+        if hook.get("type") not in training_only_hooks
+    ]
     runner = Runner.from_cfg(cfg)
     runner.val_evaluator.metrics.append(
         DumpDetResults(out_file_path=str(output)))
