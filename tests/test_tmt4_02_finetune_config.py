@@ -57,7 +57,7 @@ def test_finetune_uses_materialized_450_50_native_split(config):
     train = config.train_dataloader
     valid = config.val_dataloader
 
-    assert train.batch_size == 30
+    assert train.batch_size == 29
     assert train.dataset.type == "NOCSCustomFruitDataset"
     assert train.dataset.split == "real_train"
     assert valid.dataset.type == "NOCSCustomFruitDataset"

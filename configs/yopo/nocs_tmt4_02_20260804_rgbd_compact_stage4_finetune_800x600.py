@@ -53,7 +53,9 @@ optim_wrapper = dict(
 # consumes the train-style per-frame ``*_label.pkl`` files in this export.
 train_dataloader = dict(
     _delete_=True,
-    batch_size=30,
+    # Batch 30 reaches 31.33/31.36 GiB and fails on the dual-path activation
+    # peak.  Batch 29 is the measured 32 GiB safety limit for this topology.
+    batch_size=29,
     num_workers=6,
     persistent_workers=True,
     pin_memory=True,
@@ -86,8 +88,8 @@ val_dataloader = dict(
     ),
 )
 
-# 450 images / batch 30 = 15 updates per epoch.  Thirty epochs therefore give
-# 450 target-domain updates while validation every five epochs catches both
+# 450 images / batch 29 = 16 updates per epoch.  Thirty epochs therefore give
+# 480 target-domain updates while validation every five epochs catches both
 # rapid adaptation and regression.  The Stage-4 stable BF16 LR remains 5e-5.
 max_epochs = 30
 train_cfg = dict(max_epochs=max_epochs, val_interval=5)
