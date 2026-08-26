@@ -1255,10 +1255,11 @@ def _decompose_nocs_similarity_box(
     uniform_scale = float(np.cbrt(determinant))
     rotation = linear / uniform_scale
     gram = rotation.T @ rotation
-    # Float32 6D-to-SO(3) conversion reaches ~2e-5 Gram error on the current
-    # validation predictions.  A 1e-4 gate admits that measured numerical
-    # drift while still rejecting genuinely anisotropic affine transforms.
-    if not np.allclose(gram, np.eye(3), rtol=1e-4, atol=1e-4):
+    # Float32 6D-to-SO(3) conversion reaches ~2e-5 Gram error, while BF16 AMP
+    # validation has measured up to 1.5e-4.  A 5e-4 gate admits that numerical
+    # drift before the SVD projection below, yet still rejects genuinely
+    # anisotropic affine transforms by a wide margin.
+    if not np.allclose(gram, np.eye(3), rtol=5e-4, atol=5e-4):
         raise ValueError(
             f"{name} linear block must be rotation times uniform scale; "
             f"max|R^T R-I|={np.max(np.abs(gram - np.eye(3))):.12g}"

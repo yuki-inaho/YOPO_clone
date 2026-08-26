@@ -115,6 +115,13 @@ def test_nocs_iou_rejects_nonuniform_rt_scale():
         _iou(invalid, _rt(), np.ones(3), np.ones(3))
 
 
+def test_nocs_iou_projects_small_bfloat16_rotation_drift_to_so3():
+    near_rotation = _rt()
+    near_rotation[0, 0] += 1.5e-4
+
+    assert _iou(near_rotation, _rt(), np.ones(3), np.ones(3)) > 0.999
+
+
 def test_nocs_iou_polar_normalizes_measured_float32_rotation_drift():
     rotation = Rotation.from_euler("xyz", [0.2, -0.3, 0.4]).as_matrix()
     drifted = rotation.copy()

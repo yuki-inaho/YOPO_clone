@@ -42,6 +42,12 @@ model = dict(
 )
 
 optim_wrapper = dict(
+    # The CoP-primary GWD path can overflow query activations under FP16 even
+    # with static loss scaling and gradient clipping.  BF16 keeps AMP tensor
+    # cores and the same memory class while providing FP32-like exponent range.
+    dtype="bfloat16",
+    loss_scale=1.0,
+    optimizer=dict(lr=5e-5),
     paramwise_cfg=dict(
         custom_keys={
             "bbox_head.cop_": dict(lr_mult=0.25),

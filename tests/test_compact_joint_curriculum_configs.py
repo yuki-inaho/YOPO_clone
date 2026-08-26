@@ -23,7 +23,7 @@ def configs():
 
 
 def test_all_stages_keep_joint_native_data_and_amp_batch_30(configs):
-    for config in configs:
+    for stage_index, config in enumerate(configs):
         assert (
             "yopo.datasets.transforms.identity_geometry"
             in config.custom_imports.imports
@@ -31,9 +31,14 @@ def test_all_stages_keep_joint_native_data_and_amp_batch_30(configs):
         assert config.train_dataloader.batch_size == 30
         assert config.model.data_preprocessor.pad_size_divisor == 1
         assert config.optim_wrapper.type == "AmpScheduleFreeOptimWrapper"
-        assert config.optim_wrapper.dtype == "float16"
-        assert config.optim_wrapper.loss_scale == pytest.approx(0.25)
-        assert config.optim_wrapper.optimizer.lr == pytest.approx(1e-4)
+        if stage_index < 3:
+            assert config.optim_wrapper.dtype == "float16"
+            assert config.optim_wrapper.loss_scale == pytest.approx(0.25)
+            assert config.optim_wrapper.optimizer.lr == pytest.approx(1e-4)
+        else:
+            assert config.optim_wrapper.dtype == "bfloat16"
+            assert config.optim_wrapper.loss_scale == pytest.approx(1.0)
+            assert config.optim_wrapper.optimizer.lr == pytest.approx(5e-5)
         roots = [
             dataset.data_root
             for dataset in config.train_dataloader.dataset.datasets

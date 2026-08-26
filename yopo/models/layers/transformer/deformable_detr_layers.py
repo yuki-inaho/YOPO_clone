@@ -18,6 +18,70 @@ except Exception:
     checkpoint_wrapper = None
 
 
+class AmpSafeMultiScaleDeformableAttention(
+        MultiScaleDeformableAttention):
+    """Run MMCV deformable attention in FP32 under BF16 autocast.
+
+    The prebuilt MMCV CUDA extension supports FP16 and FP32, but not BF16.
+    Keeping this one extension call in FP32 lets the surrounding transformer
+    use BF16 AMP for its wider exponent range.  The returned tensor is cast
+    back to the autocast dtype so downstream layers retain AMP behavior.
+    """
+
+    @staticmethod
+    def _fp32_if_floating(tensor: Optional[Tensor]) -> Optional[Tensor]:
+        if tensor is not None and tensor.is_floating_point():
+            return tensor.float()
+        return tensor
+
+    def forward(self,
+                query: Tensor,
+                key: Optional[Tensor] = None,
+                value: Optional[Tensor] = None,
+                identity: Optional[Tensor] = None,
+                query_pos: Optional[Tensor] = None,
+                key_padding_mask: Optional[Tensor] = None,
+                reference_points: Optional[Tensor] = None,
+                spatial_shapes: Optional[Tensor] = None,
+                level_start_index: Optional[Tensor] = None,
+                **kwargs) -> Tensor:
+        autocast_bf16 = (query.is_cuda and torch.is_autocast_enabled()
+                         and torch.get_autocast_gpu_dtype()
+                         == torch.bfloat16)
+        has_bf16_input = any(
+            tensor is not None and tensor.dtype == torch.bfloat16
+            for tensor in (query, key, value, identity, query_pos,
+                           reference_points))
+        if not autocast_bf16 and not has_bf16_input:
+            return super().forward(
+                query=query,
+                key=key,
+                value=value,
+                identity=identity,
+                query_pos=query_pos,
+                key_padding_mask=key_padding_mask,
+                reference_points=reference_points,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                **kwargs)
+
+        output_dtype = torch.bfloat16 if autocast_bf16 else query.dtype
+        device_type = query.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            output = super().forward(
+                query=self._fp32_if_floating(query),
+                key=self._fp32_if_floating(key),
+                value=self._fp32_if_floating(value),
+                identity=self._fp32_if_floating(identity),
+                query_pos=self._fp32_if_floating(query_pos),
+                key_padding_mask=key_padding_mask,
+                reference_points=self._fp32_if_floating(reference_points),
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index,
+                **kwargs)
+        return output.to(dtype=output_dtype)
+
+
 class DeformableDetrTransformerEncoder(DetrTransformerEncoder):
     """Transformer encoder of Deformable DETR."""
 
@@ -243,7 +307,8 @@ class DeformableDetrTransformerEncoderLayer(DetrTransformerEncoderLayer):
 
     def _init_layers(self) -> None:
         """Initialize self_attn, ffn, and norms."""
-        self.self_attn = MultiScaleDeformableAttention(**self.self_attn_cfg)
+        self.self_attn = AmpSafeMultiScaleDeformableAttention(
+            **self.self_attn_cfg)
         self.embed_dims = self.self_attn.embed_dims
         self.ffn = FFN(**self.ffn_cfg)
         norms_list = [
@@ -259,7 +324,8 @@ class DeformableDetrTransformerDecoderLayer(DetrTransformerDecoderLayer):
     def _init_layers(self) -> None:
         """Initialize self_attn, cross-attn, ffn, and norms."""
         self.self_attn = MultiheadAttention(**self.self_attn_cfg)
-        self.cross_attn = MultiScaleDeformableAttention(**self.cross_attn_cfg)
+        self.cross_attn = AmpSafeMultiScaleDeformableAttention(
+            **self.cross_attn_cfg)
         self.embed_dims = self.self_attn.embed_dims
         self.ffn = FFN(**self.ffn_cfg)
         norms_list = [
