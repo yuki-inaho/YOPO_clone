@@ -2,7 +2,7 @@
 
 最終更新: 2026-08-26
 対象: `rgb-d` / `DINO9DCenter2DPoseHead` / fruit RGB-D 736x512
-状態: component実装・同一条件probe・2-phase評価A/B完了、native 736x512 capacity実行前
+状態: component実装・同一条件probe・2-phase評価A/B・native 736x512 capacity/1-epoch gate完了、FULL epoch 20でユーザー指定停止
 
 ## 1. 結論
 
@@ -363,12 +363,116 @@ score threshold 0.2、2D NMS IoU 0.5、8 worker、3D threshold 0.10/0.25/0.50/0.
 - 実train/validation sampleでHBB、OBB Gaussian、intrinsic、center2D、rotation、translation、
   size、z、Tが不変であることを確認した。
 - 新規7 tests、関連込み23 tests、Ruffが成功した。
-- capacityはb16から測り、目標peakは約29.5--31.0 GiB。OOMまたは31 GiB超ならb15、
-  29.5 GiB未満ならb17を一度だけ試す。
+- capacityはb16・2 iterationで正常終了した。RTX 5090の総VRAM 32,607 MiBに対し、
+  `nvidia-smi`のprocess peakは30,516 MiB（29.80 GiB）、MMEngineのpeak allocated表示は
+  28,119 MiBだった。全lossとgradient normはfiniteでOOMもなく、目標29.5--31.0 GiB内なので
+  b16を採用した。残り約2.04 GiBを安全余白とし、b17の追加試行は行わない。
 - FULLは初期50 epoch、val interval 5、LR 3e-6、AP50:95の20-epoch停滞で早期終了する。
   改善継続時だけ25 epochずつ、最大100までexact-resumeする。
 - val evaluatorは`two_phase_3d_iou=True`を明示し、corrected exact metricを維持したまま
   broad-phaseで高速化する。
+
+### 2026-08-26: native 736x512 1-epoch quality gate
+
+Stage-11 KFIoU epoch 2 model-only checkpointを同じ初期値にし、batch 16、LR 3e-6で1 epochだけ
+学習した。75/75 iterationと330画像validationをexit code 0で完走し、全loss/gradientはfiniteだった。
+validation時のexact narrow phaseは2,680,428 pair中5,278 pair（0.20%）だけを計算した。
+
+| metric | old-resolution selected seed | native gate epoch 1 | delta |
+|---|---:|---:|---:|
+| AP50:95 | 0.180867 | 0.1930 | +0.0121 |
+| AP50 | 0.476129 | 0.4851 | +0.0090 |
+| AP75 | 0.094018 | 0.1102 | +0.0162 |
+| exact 3D IoU@0.10 | 0.033796 | 0.0330 | -0.0008 |
+| exact 3D IoU@0.25 | 0.013144 | 0.0126 | -0.0005 |
+| exact 3D IoU@0.50 | 0.001009 | 0.0008 | -0.0002 |
+| pose AP 10 degree / 5 cm | 0.1382 | 0.1497 | +0.0115 |
+| pose AP 10 degree / 10 cm | 0.1659 | 0.1832 | +0.0173 |
+
+2D APとpose APは明確に改善し、3D IoUの低下は1 epochのgeometry transitionとして小さい。
+lossも安定して低下したためFULL開始gateをpassとする。gateは品質判定専用でcheckpointを重複保存せず、
+FULLも同じStage-11 KFIoU epoch 2 model-only checkpointから独立に開始する。
+
+FULLは2026-08-26 14:26 UTCに開始した。artifact rootは
+`/home/kasm-user/Desktop/YOPO_clone_artifacts/work_dirs/stage12_native736x512_kfiou_full_b16_from_stage11e2`
+である。`/workspace`の空きが241 MiBしかないため、checkpointを含む新規出力は空き約93 GiBの
+Desktop側に限定した。起動直後にmodel-only checkpointのloadとfresh optimizerをログ確認し、
+epoch 1の最初の30 iterationはcapacity/gateと同じfinite loss軌跡を再現している。
+長時間側のprocess VRAMは31,498 MiBで安定したが、display等を含むdevice空きは約603 MiBまで
+下がるため、FULL中はほかのGPU workloadを併用しない。OOM時のみbatch 15へ下げ、LR 3e-6は
+据え置く。学習には未使用だった継承`test_pipeline`定義の640x480 resizeも除去し、下流の推論configが
+TestLoopを有効化した場合もtrain/validationと同じnative 736x512 identity geometryを再利用できるようにした。
+Stage-12 FULLのTestLoop自体は従来どおり無効であり、学習中のvalidationには影響しない。
+
+最初の実運用gateであるepoch 5 validationは全主要指標でnative 1-epoch gateを上回った。
+
+| metric | native gate epoch 1 | FULL epoch 5 | delta |
+|---|---:|---:|---:|
+| AP50:95 | 0.1930 | 0.195789 | +0.002789 |
+| AP50 | 0.4851 | 0.490007 | +0.004907 |
+| AP75 | 0.1102 | 0.112533 | +0.002333 |
+| exact 3D IoU@0.10 | 0.0330 | 0.035299 | +0.002299 |
+| exact 3D IoU@0.25 | 0.0126 | 0.013923 | +0.001323 |
+| exact 3D IoU@0.50 | 0.0008 | 0.000970 | +0.000170 |
+| pose AP 10 degree / 5 cm | 0.1497 | 0.150016 | +0.000316 |
+
+OOM、Traceback、NaN/Infはなく、MMEngine peak allocatedは28,479 MiBだった。`epoch_5.pth`、
+`best_AP50_95_epoch_5.pth`、`best_AP75_epoch_5.pth`、`best_3d_iou_0.25_epoch_5.pth`の
+生成を確認した。unused test pipeline修正後のfocused config/geometry testは11件すべて成功した。
+
+epoch 10でも改善が継続した。epoch 5比でAP50:95は+0.003976、AP75は+0.003542、exact
+3D IoU@0.25は+0.000597、pose 10 degree / 5 cmは+0.007573だった。3D IoU@0.50だけ
+-0.0000032だが、閾値の高い希少matchで生じた無視できる規模の変動である。
+
+| metric | FULL epoch 5 | FULL epoch 10 | delta |
+|---|---:|---:|---:|
+| AP50:95 | 0.195789 | 0.199764 | +0.003976 |
+| AP50 | 0.490007 | 0.497277 | +0.007270 |
+| AP75 | 0.112533 | 0.116075 | +0.003542 |
+| exact 3D IoU@0.10 | 0.035299 | 0.037048 | +0.001749 |
+| exact 3D IoU@0.25 | 0.013923 | 0.014520 | +0.000597 |
+| exact 3D IoU@0.50 | 0.000970 | 0.000967 | -0.000003 |
+| pose AP 10 degree / 5 cm | 0.150016 | 0.157588 | +0.007573 |
+
+exact narrow phaseは2,724,655 pair中5,599 pair（0.21%）。`epoch_10.pth`と3種の
+epoch-10 best checkpointへ正常更新され、NaN/Inf/OOM/例外はない。Stage-12本体processは
+31,498 MiBで安定した。監視中、一時的な別CPU指定processが498 MiBのCUDA contextを確保して
+device peak 32,012 MiBまで上げたが終了済みであり、FULLには介入していない。
+
+### 2026-08-26: LR再確認とepoch 15 exact-resume
+
+ユーザー指摘を受け、LRを再監査した。現在の`3e-6`はscratch学習向けではなく、成熟したStage-11
+bestを全parameter ScheduleFreeでfine-tuneするための値である。過去の同系3D warm-start単一因子
+gateでは、`5e-5`で3D IoU@0.50が0.1690から0.0952、`1e-5`でも0.1266へ低下し、`1e-6`だけ
+0.1692を維持した。別のfresh runではScheduleFree `2.5e-3`がepoch 13でHungarian cost非finiteに
+なった。したがってMuonのscratch向け`1e-3`やScheduleFree `1e-4`を現在の全層warm-startへ
+そのまま移植せず、改善中の`3e-6`を維持する。
+
+会話turnの中断に伴い、元のunified processはepoch 15 validationのexact 3D集計中に外部終了した。
+Python/CUDA OOM/NaN/Inf/kernel OOMの証跡はなく、2D tableまでは出たが最終metric dictは未生成なので
+epoch 15 validationを正式値に使わない。validation前に保存された`epoch_15.pth`は497,643,043 bytes、
+`state_dict/optimizer/param_schedulers/message_hub/meta`を持ち、metaはepoch 15、iter 1125だった。
+tmux `yopo_stage12_full_resume`でこのcheckpointからexact-resumeし、ログの`resumed epoch: 15,
+iter: 1125`、epoch 16のLR 3e-6、finite loss/gradientを確認した。以後の正式な比較点はepoch 20とする。
+
+epoch 20 validationは完了し、ユーザー指示により直後に停止した。epoch 21は約30 iterationだけ
+RAM上で更新されたがcheckpoint保存前なので不採用であり、SIGINT後にGPU解放を確認した。
+
+| metric | FULL epoch 10 | FULL epoch 20 | delta |
+|---|---:|---:|---:|
+| AP50:95 | 0.199764 | 0.202231 | +0.002467 |
+| AP50 | 0.497277 | 0.504579 | +0.007302 |
+| AP75 | 0.116075 | 0.118236 | +0.002162 |
+| exact 3D IoU@0.10 | 0.037048 | 0.038728 | +0.001679 |
+| exact 3D IoU@0.25 | 0.014520 | 0.015142 | +0.000622 |
+| exact 3D IoU@0.50 | 0.000967 | 0.001069 | +0.000102 |
+| pose AP 10 degree / 5 cm | 0.157588 | 0.153256 | -0.004332 |
+
+2D APとexact 3D overlapはすべてepoch 10を上回った。一方pose APはepoch 10の方が良く、用途別に
+checkpointを使い分ける余地がある。epoch 20でAP50:95/AP75/3D IoU@0.25の全bestが更新されたため、
+標準採用品はepoch 20とする。resumable checkpointのSHA-256は
+`515deacba10da10526d9159afa0fa5f351fcb8ba86cb83d94902fa00ef18912e`。詳細metric、best path、
+各checksumはartifact rootの`stage12_epoch20_summary.json`へself-containedに保存した。
 
 ### 2026-08-26: claude-mem
 
@@ -388,7 +492,7 @@ semantic、probe結果、採否だけを節目ごとに記録し、逐次ログ�
 - [x] 同一bestからKFIoU / Stiefelを独立probeする。
 - [x] gate判定を行い、KFIoU epoch 2を採用、Stiefelを非採用とする。
 - [x] proof-safe 2-phase評価を実装し、全330画像でall-exactとのmatching完全一致を確認する。
-- [ ] 採用bestと2-phase A/B結果をclaude-memへ追記する。
+- [x] 採用bestと2-phase A/B結果をDeepSeek V4 Flash版claude-memへ追記する。
 
 ## 10. 最終FULLのDefinition of Done: ネイティブ736x512・高VRAM占有
 
@@ -400,15 +504,15 @@ tensor shapeをDoDの判定対象とする。
   自動testで保証する。
 - [x] 不要なresize/paddingで画素・座標を変えず、RGB、raw depth、HBB、2D OBB Gaussian、3D pose
   annotation、camera intrinsicが元736x512データと同じ座標系にあることをtestする。
-- [ ] RTX 5090で2-iteration capacity smokeを行い、finite forward/backward、OOMなし、最大
-  allocated/reserved VRAMを記録する。
-- [ ] 現行640x445・batch 20より画素数が約32%増えるため、batch 15または16から測定を始める。
-  OOMを避ける安全余白を残しつつVRAMを高占有する最大値を採用する。batchを変える場合もLRを
-  盲目的に上げず、成熟checkpoint用の保守的LRで短期安定性を先に確認する。
+- [x] RTX 5090でbatch 16の2-iteration capacity smokeを行い、finite forward/backward、OOMなしを
+  確認した。最大process VRAMは30,516 / 32,607 MiB、MMEngine peak allocatedは28,119 MiB。
+- [x] 現行640x445・batch 20より画素数が約32%増える条件でbatch 16を採用した。約2.04 GiBの
+  安全余白を残しつつ目標使用量29.5--31.0 GiB内に入ったため、追加のbatch探索は打ち切った。
+  LRは成熟checkpoint用の保守値3e-6を維持し、次に1-epoch品質gateで安定性を確認する。
 - [x] KFIoU/Stiefel単独gateを通ったcomponentだけを最終configへ含める。今回はKFIoUだけを採用し、
   Stiefelとcombinedは含めない。
 - [x] corrected exact 3D OBB IoUの2-phase経路をall-exactと全件A/Bし、metric-equivalenceを保証する。
-- [ ] corrected exact 3D OBB IoU、AP50:95、AP75、pose APを毎評価時に保存し、旧3D metric値とは
+- [x] corrected exact 3D OBB IoU、AP50:95、AP75、pose APを完了した各正式評価時に保存し、旧3D metric値とは
   比較しない。
-- [ ] FULLのbest/last checkpoint、resolved config、metrics JSON、VRAM実測、起動コマンド、採否理由を
+- [x] FULLのbest/last checkpoint、resolved config、metrics JSON、VRAM実測、起動コマンド、採否理由を
   artifact root、本書、DeepSeek版claude-memへ記録する。

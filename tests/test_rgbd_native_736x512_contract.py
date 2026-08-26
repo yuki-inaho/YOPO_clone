@@ -128,6 +128,22 @@ def test_native_configs_remove_resize_and_pad_from_train_and_validation(
                 'Pack9DPoseInputs',
             ]
 
+        # The inherited training config intentionally disables TestLoop, but
+        # its reusable pipeline definition must not retain the old 640x480
+        # resize when a downstream inference config enables that loop.
+        test_names = [step.type for step in cfg.test_pipeline]
+        assert test_names == [
+            'LoadImageFromFile',
+            'LoadRawDepthImageWithValidMask',
+            'Load9DPoseAnnotations',
+            'ConcatRawDepthToImage',
+            'AssertIdentityImageGeometry',
+            'Pack9DPoseInputs',
+        ]
+        assert not {
+            'Resize', 'ResizeforPose', 'ResizeOBBGaussians', 'Pad'
+        }.intersection(test_names)
+
     assert base.train_dataloader.batch_size == 16
     assert full.train_dataloader.batch_size == 16
     assert full.load_from is None

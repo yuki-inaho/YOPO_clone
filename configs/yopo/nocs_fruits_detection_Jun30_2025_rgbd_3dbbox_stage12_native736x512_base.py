@@ -74,6 +74,12 @@ val_pipeline = [
     ),
 ]
 
+# Keep standalone test/inference on exactly the same native geometry.  The
+# inherited Stage-10 test pipeline still resized to 640x480; it is unused by
+# the training loop but would otherwise silently change coordinates when this
+# config is reused for final evaluation or visualization.
+test_pipeline = val_pipeline
+
 train_dataloader = dict(
     # Native pixels are 1.324x the former 640x445 tensor.  Start the RTX 5090
     # capacity search at b16, then change this single knob via CLI according
