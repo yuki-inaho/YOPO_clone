@@ -927,6 +927,27 @@ def test_depth_query_sampler_preserves_layer_batch_query_shape_and_is_spatial():
     assert not torch.allclose(contexts[0, 0, 0], contexts[0, 0, 1])
 
 
+def test_depth_query_sampler_projects_heterogeneous_backbone_channels():
+    sampler = MultiScaleDepthQuerySampler(
+        embed_dims=8,
+        num_levels=3,
+        roi_size=1,
+        in_channels=(4, 6, 10),
+    )
+    depth_features = [
+        torch.randn(2, channels, height, width, requires_grad=True)
+        for channels, height, width in ((4, 8, 10), (6, 4, 5), (10, 2, 3))
+    ]
+    boxes = torch.rand(2, 7, 4)
+
+    contexts = sampler(depth_features, boxes)
+    contexts.sum().backward()
+
+    assert contexts.shape == (2, 7, 8)
+    assert torch.isfinite(contexts).all()
+    assert all(feature.grad is not None for feature in depth_features)
+
+
 def test_depth_query_sampler_vectorizes_decoder_layers(monkeypatch):
     from yopo.models.dense_pose_heads import depth_query_context
 

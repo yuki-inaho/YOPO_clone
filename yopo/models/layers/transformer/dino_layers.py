@@ -6,6 +6,7 @@ import torch
 from mmengine.model import BaseModule
 from torch import Tensor, nn
 
+from yopo.registry import MODELS
 from yopo.structures import SampleList
 from yopo.structures.bbox import bbox_xyxy_to_cxcywh
 from yopo.utils import OptConfigType
@@ -150,13 +151,20 @@ class CdnQueryGenerator(BaseModule):
                  num_matching_queries: int,
                  label_noise_scale: float = 0.5,
                  box_noise_scale: float = 1.0,
-                 group_cfg: OptConfigType = None) -> None:
+                 group_cfg: OptConfigType = None,
+                 box_noise: OptConfigType = None) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.embed_dims = embed_dims
         self.num_matching_queries = num_matching_queries
         self.label_noise_scale = label_noise_scale
         self.box_noise_scale = box_noise_scale
+        if box_noise is not None and box_noise_scale != 1.0:
+            warnings.warn(
+                'box_noise_scale is ignored when a custom box_noise strategy '
+                'is configured.', stacklevel=2)
+        self.box_noise = (
+            MODELS.build(box_noise) if box_noise is not None else None)
 
         # prepare grouping strategy
         group_cfg = {} if group_cfg is None else group_cfg
@@ -396,6 +404,18 @@ class CdnQueryGenerator(BaseModule):
             (cx, cy, w, h), where
             `num_noisy_targets = num_target_total * num_groups * 2`.
         """
+        if self.box_noise is not None:
+            noisy_bboxes_expand = self.box_noise(gt_bboxes, num_groups)
+            if noisy_bboxes_expand.shape != (
+                    len(gt_bboxes) * num_groups * 2, 4):
+                raise RuntimeError(
+                    'box_noise strategy must return shape '
+                    f'({len(gt_bboxes) * num_groups * 2}, 4), got '
+                    f'{noisy_bboxes_expand.shape}')
+            noisy_bboxes_expand = bbox_xyxy_to_cxcywh(
+                noisy_bboxes_expand)
+            return inverse_sigmoid(noisy_bboxes_expand, eps=1e-3)
+
         assert self.box_noise_scale > 0
         device = gt_bboxes.device
 

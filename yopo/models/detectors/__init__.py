@@ -35,6 +35,7 @@ from .reppoints_detector import RepPointsDetector
 from .retinanet import RetinaNet
 from .rpn import RPN
 from .rtmdet import RTMDet
+from .rotated_rt_detr import RotatedRTDETR
 from .semi_base import SemiBaseDetector
 from .single_stage import SingleStageDetector
 from .soft_teacher import SoftTeacher
@@ -56,5 +57,6 @@ __all__ = [
     'AutoAssign', 'YOLOF', 'CenterNet', 'YOLOX', 'LAD', 'TOOD', 'DDOD',
     'SemiBaseDetector', 'SoftTeacher', 'RTMDet', 'Detectron2Wrapper',
     'CrowdDet', 'DetectionTransformer', 'ConditionalDETR', 'DINO',
+    'RotatedRTDETR',
     'DABDETR', 'GLIP', 'DDQDETR', 'GroundingDINO', 'MAEDepth'
 ]

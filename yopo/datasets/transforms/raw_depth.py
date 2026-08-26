@@ -47,9 +47,15 @@ class LoadRawDepthImageWithValidMask(BaseTransform):
 class ConcatRawDepthToImage(BaseTransform):
     """Append raw-normalized depth, optionally followed by its validity mask."""
 
-    def __init__(self, depth_scale: float = 255.0, append_valid_mask: bool = False) -> None:
+    def __init__(
+        self,
+        depth_scale: float = 255.0,
+        append_valid_mask: bool = False,
+        bgr_to_rgb: bool = False,
+    ) -> None:
         self.depth_scale = float(depth_scale)
         self.append_valid_mask = append_valid_mask
+        self.bgr_to_rgb = bool(bgr_to_rgb)
 
     def transform(self, results: dict) -> dict:
         img = results["img"]
@@ -61,7 +67,11 @@ class ConcatRawDepthToImage(BaseTransform):
                 f"rgb={img.shape[:2]}, depth={depth.shape}, mask={valid_mask.shape}"
             )
 
-        channels = [img.astype(np.float32, copy=False), (depth * self.depth_scale)[..., None]]
+        rgb = img[..., ::-1] if self.bgr_to_rgb else img
+        channels = [
+            rgb.astype(np.float32, copy=False),
+            (depth * self.depth_scale)[..., None],
+        ]
         if self.append_valid_mask:
             channels.append(valid_mask.astype(np.float32)[..., None])
         results["img"] = np.concatenate(channels, axis=-1)

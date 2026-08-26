@@ -64,6 +64,29 @@ def parse_args():
     return args
 
 
+def ensure_test_components(cfg: Config) -> Config:
+    """Reuse validation components when a train-only config disables test.
+
+    Several YOPO curricula intentionally set all ``test_*`` entries to
+    ``None``.  ``tools/test.py`` is nevertheless expected to evaluate their
+    validation split.  Resolve that convention in one place instead of
+    duplicating the full RGB-D dataloader pipeline in every experiment config.
+    """
+    if cfg.get('test_dataloader') is None:
+        if cfg.get('val_dataloader') is None:
+            raise ValueError(
+                'test_dataloader is None and no val_dataloader is available')
+        cfg.test_dataloader = deepcopy(cfg.val_dataloader)
+    if cfg.get('test_cfg') is None:
+        cfg.test_cfg = dict(type='TestLoop')
+    if cfg.get('test_evaluator') is None:
+        if cfg.get('val_evaluator') is None:
+            raise ValueError(
+                'test_evaluator is None and no val_evaluator is available')
+        cfg.test_evaluator = deepcopy(cfg.val_evaluator)
+    return cfg
+
+
 def main():
     args = parse_args()
 
@@ -77,6 +100,7 @@ def main():
     cfg.launcher = args.launcher
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
+    cfg = ensure_test_components(cfg)
 
     # work_dir is determined in this priority: CLI > segment in file > filename
     if args.work_dir is not None:

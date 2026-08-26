@@ -50,8 +50,8 @@ def parse_args() -> argparse.Namespace:
         "--nms-iou-threshold",
         type=float,
         help=(
-            "diagnostic-only class-agnostic 2D NMS; retained query indices "
-            "select the corresponding 3D predictions"
+            "class-agnostic 2D NMS deployment post-processing; retained query "
+            "indices select the corresponding aligned OBB/3D predictions"
         ),
     )
     return parser.parse_args()
@@ -211,7 +211,8 @@ def main() -> None:
         "nms_iou_threshold": (
             args.nms_iou_threshold if args.all_predictions else None),
         "nms_role": (
-            "diagnostic fallback only; not part of the NMS-free model"
+            "deployment post-processing; retained 2D indices select the same "
+            "query-aligned OBB and 3D predictions"
             if args.nms_iou_threshold is not None else None),
         "max_predictions": args.max_predictions if args.all_predictions else None,
         "legend": {

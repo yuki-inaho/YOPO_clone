@@ -1,13 +1,12 @@
 import math
 from typing import Optional
-import warnings
 
 import mmcv
 import numpy as np
 from numpy import random
 import cv2
 
-from yopo.structures.bbox import HorizontalBoxes, BaseBoxes, autocast_box_type
+from yopo.structures.bbox import autocast_box_type
 from mmcv.transforms.utils import cache_randomness
 from yopo.registry import TRANSFORMS
 from mmcv.transforms import BaseTransform
@@ -237,7 +236,13 @@ class RandomAffinefor6DPose(BaseTransform):
 
 @TRANSFORMS.register_module()
 class RandomTranslatePixels(BaseTransform):
-    """Translate image, bounding boxes and camera intrinsics.
+    """Translate every image-space field with one projective transform.
+
+    The pixel translation is represented by ``H`` and camera projection is
+    updated as ``K' = H K``. Camera-frame 3D annotations therefore remain
+    unchanged. Updating both ``K`` and the 3D translation would apply the
+    requested pixel offset twice and is deliberately avoided here.
+
     Args:
         prob (float): Probability of translating.
         max_translate_offset (int): Maximum pixel offset for translation.
@@ -252,13 +257,56 @@ class RandomTranslatePixels(BaseTransform):
                  max_translate_offset: int = 50,
                  filter_thr_px: int = 1,
                  pad_val: int = 0,
-                 shift_depth: bool = False) -> None:
+                 shift_depth: bool = True) -> None:
         assert 0 <= prob <= 1
         self.prob = prob
         self.max_translate_offset = max_translate_offset
         self.filter_thr_px = filter_thr_px
         self.pad_val = pad_val
         self.shift_depth = shift_depth
+
+    @staticmethod
+    def _shift_array(array: np.ndarray, offset_x: int, offset_y: int,
+                     pad_value) -> np.ndarray:
+        """Shift an array so positive x/y offsets move content right/down."""
+        height, width = array.shape[:2]
+        shifted = np.full_like(array, pad_value)
+        copy_width = width - abs(offset_x)
+        copy_height = height - abs(offset_y)
+        if copy_width <= 0 or copy_height <= 0:
+            return shifted
+        src_x = max(-offset_x, 0)
+        src_y = max(-offset_y, 0)
+        dst_x = max(offset_x, 0)
+        dst_y = max(offset_y, 0)
+        shifted[dst_y:dst_y + copy_height, dst_x:dst_x + copy_width] = (
+            array[src_y:src_y + copy_height, src_x:src_x + copy_width])
+        return shifted
+
+    @staticmethod
+    def _translate_intrinsic(intrinsic, offset_x: int, offset_y: int):
+        """Return ``H @ K`` without mutating a dataset-shared intrinsic."""
+        homography = np.array(
+            [[1., 0., offset_x], [0., 1., offset_y], [0., 0., 1.]],
+            dtype=np.float32)
+        array = np.asarray(intrinsic)
+        if array.shape == (4,):
+            translated = array.astype(np.float32, copy=True)
+            translated[2] += offset_x
+            translated[3] += offset_y
+            return translated.tolist() if isinstance(intrinsic, list) else translated
+        if array.shape == (3, 3):
+            return homography.astype(array.dtype, copy=False) @ array
+        if array.shape == (9,):
+            translated = homography @ array.astype(np.float32).reshape(3, 3)
+            return translated.reshape(-1).tolist() if isinstance(
+                intrinsic, list) else translated.reshape(-1)
+        if array.ndim == 3 and array.shape[1:] == (3, 3):
+            translated = np.stack([homography @ matrix for matrix in array])
+            return translated.tolist() if isinstance(intrinsic, list) else translated
+        raise ValueError(
+            'intrinsic must be [fx, fy, cx, cy], a flattened 3x3, a 3x3 '
+            f'matrix, or a stack of 3x3 matrices; got {array.shape}')
 
     @cache_randomness
     def _get_offset(self) -> tuple[int, int]:
@@ -284,9 +332,10 @@ class RandomTranslatePixels(BaseTransform):
         - img
         - gt_bboxes
         - intrinsic
-        - translation
-        - T
         - center_2d
+        - obb_gaussian (optional)
+        - depth (optional)
+        - depth_valid_mask (optional)
         - other gt_* fields
         """
         offset_x, offset_y = self._get_offset()
@@ -297,70 +346,21 @@ class RandomTranslatePixels(BaseTransform):
         img = results['img']
         img_h, img_w = img.shape[:2]
 
-        # shift img
-        new_img = np.full_like(img, self.pad_val)
-        new_x = 0 if offset_x > 0 else -offset_x
-        new_y = 0 if offset_y > 0 else -offset_y
-        ori_x = offset_x if offset_x > 0 else 0
-        ori_y = offset_y if offset_y > 0 else 0
-        new_h = img_h - np.abs(offset_y)
-        new_w = img_w - np.abs(offset_x)
+        results['img'] = self._shift_array(
+            img, offset_x, offset_y, self.pad_val)
+        if self.shift_depth and results.get('depth') is not None:
+            results['depth'] = self._shift_array(
+                results['depth'], offset_x, offset_y, 0)
+        if results.get('depth_valid_mask') is not None:
+            results['depth_valid_mask'] = self._shift_array(
+                results['depth_valid_mask'], offset_x, offset_y, False)
 
-        if new_h <= 0 or new_w <= 0:
-            return results
-
-        new_img[new_y:new_y + new_h, new_x:new_x + new_w] = \
-            img[ori_y:ori_y + new_h, ori_x:ori_x + new_w]
-        results['img'] = new_img
-
-        if self.shift_depth:
-            if 'depth' not in results or results['depth'] is None:
-                raise ValueError('shift_depth is True, but depth is not found')
-            depth = results['depth']
-            max_distance = np.max(depth)
-            new_depth = np.full_like(depth, max_distance)
-            new_depth[new_y:new_y + new_h, new_x:new_x + new_w] = \
-                depth[ori_y:ori_y + new_h, ori_x:ori_x + new_w]
-            results['depth'] = new_depth
-
-        # --- Update 3D Poses ---
-        # Get camera intrinsics to back-project 2D offset to 3D
-        K = None
-        if 'intrinsic' in results:
-            intrinsic_val = results['intrinsic']
-            if isinstance(intrinsic_val, list) and len(intrinsic_val) == 4:
-                K = np.array([[intrinsic_val[0], 0, intrinsic_val[2]],
-                              [0, intrinsic_val[1], intrinsic_val[3]],
-                              [0, 0, 1]], dtype=np.float32)
-            elif isinstance(intrinsic_val, list) and not isinstance(
-                    intrinsic_val[0], (list, np.ndarray)):
-                K = np.array([[intrinsic_val[0], 0, intrinsic_val[2]],
-                              [0, intrinsic_val[1], intrinsic_val[3]],
-                              [0, 0, 1]], dtype=np.float32)
-            elif isinstance(intrinsic_val, list):
-                K = intrinsic_val[0]
-            else:
-                K = intrinsic_val
-
-        if K is not None:
-            fx, fy = K[0, 0], K[1, 1]
-            if 'translation' in results and len(results['translation']) > 0:
-                z = results['translation'][:, 2]
-                # Use abs() to handle potential negative depth values
-                z_abs = np.abs(z)
-                delta_x_3d = (offset_x * z_abs) / fx
-                delta_y_3d = (offset_y * z_abs) / fy
-
-                results['translation'][:, 0] += delta_x_3d
-                results['translation'][:, 1] += delta_y_3d
-
-                if 'T' in results:
-                    results['T'][:, 0, 3] = results['translation'][:, 0]
-                    results['T'][:, 1, 3] = results['translation'][:, 1]
-
-            if 'center_2d' in results and len(results['center_2d']) > 0:
-                results['center_2d'][:, 0] += offset_x
-                results['center_2d'][:, 1] += offset_y
+        if 'center_2d' in results and len(results['center_2d']) > 0:
+            results['center_2d'][:, 0] += offset_x
+            results['center_2d'][:, 1] += offset_y
+        if 'obb_gaussian' in results and len(results['obb_gaussian']) > 0:
+            results['obb_gaussian'][:, 0] += offset_x
+            results['obb_gaussian'][:, 1] += offset_y
 
         # Translate bounding boxes
         if 'gt_bboxes' in results:
@@ -370,8 +370,10 @@ class RandomTranslatePixels(BaseTransform):
             bboxes.clip_([img_h, img_w])
 
             if self.filter_thr_px > 0:
-                valid_inds = (bboxes.widths > self.filter_thr_px) & \
-                             (bboxes.heights > self.filter_thr_px)
+                valid_inds = (
+                    (bboxes.widths > self.filter_thr_px)
+                    & (bboxes.heights > self.filter_thr_px)
+                    & bboxes.is_inside([img_h, img_w], all_inside=False))
 
                 if not valid_inds.all():
                     valid_inds_np = valid_inds.cpu().numpy()
@@ -380,7 +382,8 @@ class RandomTranslatePixels(BaseTransform):
                     # Explicitly filter all related annotations
                     keys_to_filter = [
                         'gt_bboxes_labels', 'gt_ignore_flags',
-                        'translation', 'rotation', 'size', 'center_2d', 'z', 'T'
+                        'translation', 'rotation', 'size', 'center_2d', 'z',
+                        'T', 'obb_gaussian'
                     ]
 
                     for key in keys_to_filter:
@@ -399,27 +402,9 @@ class RandomTranslatePixels(BaseTransform):
                 if len(results['gt_bboxes']) == 0:
                     return None
 
-        # Translate camera intrinsics
         if 'intrinsic' in results:
-            K_res = results['intrinsic']
-            if isinstance(K_res, list) and len(K_res) == 4:
-                K_res[2] += offset_x
-                K_res[3] += offset_y
-            elif isinstance(K_res, list) and not isinstance(
-                    K_res[0], (list, np.ndarray)):
-                K_res[2] += offset_x
-                K_res[3] += offset_y
-            elif isinstance(K_res, list):
-                new_intrinsics = []
-                for K_mat in K_res:
-                    K_new = K_mat.copy()
-                    K_new[0, 2] += offset_x
-                    K_new[1, 2] += offset_y
-                    new_intrinsics.append(K_new)
-                results['intrinsic'] = new_intrinsics
-            elif isinstance(K_res, np.ndarray):
-                K_res[0, 2] += offset_x
-                K_res[1, 2] += offset_y
+            results['intrinsic'] = self._translate_intrinsic(
+                results['intrinsic'], offset_x, offset_y)
 
         return results
 
@@ -427,7 +412,8 @@ class RandomTranslatePixels(BaseTransform):
         return self.__class__.__name__ + \
                f'(prob={self.prob}, ' \
                f'max_translate_offset={self.max_translate_offset}, ' \
-               f'filter_thr_px={self.filter_thr_px})'
+               f'filter_thr_px={self.filter_thr_px}, ' \
+               f'shift_depth={self.shift_depth})'
 
 @TRANSFORMS.register_module()
 class ResizeOBBGaussians(BaseTransform):
@@ -466,7 +452,14 @@ class ResizeOBBGaussians(BaseTransform):
 
 @TRANSFORMS.register_module()
 class RandomFlipFor9DPose(BaseTransform):
-    """Flip the image and 9D pose annotations.
+    """Flip image coordinates while preserving a valid camera-frame 9D pose.
+
+    An image reflection is not a proper 3D rotation. Applying
+    ``diag(-1, 1, 1)`` to an object rotation produces ``det(R)=-1`` and is not
+    a valid SE(3) annotation. This transform instead applies the reflection to
+    the camera intrinsic (``K' = F K``), keeps ``T``/rotation/translation
+    unchanged, and reflects all image-space annotations. The resulting
+    projection satisfies ``p' = K' [R|t] X = F p`` exactly.
 
     Required Keys:
         - img
@@ -481,24 +474,20 @@ class RandomFlipFor9DPose(BaseTransform):
         - img
         - gt_bboxes
         - intrinsic
-        - translation
-        - rotation
-        - T
         - center_2d
+        - obb_gaussian
+        - depth (optional)
+        - depth_valid_mask (optional)
 
     Args:
         prob (float): The flipping probability. Defaults to 0.5.
-        direction (str): The flipping direction. Defaults to 'horizontal'.
-            Currently only 'horizontal' is supported for 9D pose annotations.
+        direction (str): Horizontal or vertical image-coordinate reflection.
+            Defaults to 'horizontal'.
     """
 
     def __init__(self, prob: float = 0.5, direction: str = 'horizontal'):
         if direction not in ['horizontal', 'vertical']:
             raise ValueError(f'Direction {direction} is not supported.')
-        if direction != 'horizontal':
-            warnings.warn(
-                'Vertical flip for 9D pose is not implemented. '
-                'Only image and bboxes will be flipped.')
         assert 0 <= prob <= 1
         self.prob = prob
         self.direction = direction
@@ -519,6 +508,8 @@ class RandomFlipFor9DPose(BaseTransform):
             dict: Flipped results.
         """
         is_flip = self._get_flip_flag()
+        results['flip'] = is_flip
+        results['flip_direction'] = self.direction if is_flip else None
         if not is_flip:
             return results
 
@@ -527,52 +518,68 @@ class RandomFlipFor9DPose(BaseTransform):
         results['img'] = mmcv.imflip(img, direction=self.direction)
         img_h, img_w = results['img'].shape[:2]
 
+        for field in ('depth', 'depth_valid_mask'):
+            if field in results and results[field] is not None:
+                results[field] = mmcv.imflip(
+                    results[field], direction=self.direction)
+
         # flip bboxes
         if 'gt_bboxes' in results and len(results['gt_bboxes']) > 0:
             results['gt_bboxes'].flip_((img_h, img_w), direction=self.direction)
 
-        if self.direction != 'horizontal':
-            return results
-
-        # flip 9D pose annotations for horizontal flip
-        # flip intrinsic
+        # Apply the image reflection to K, never to the proper 3D pose.
         if 'intrinsic' in results:
             K = results['intrinsic']
-            if isinstance(K, list) and len(K) == 4:  # [fx, fy, cx, cy]
-                K[2] = img_w - 1 - K[2]
-            elif isinstance(K, np.ndarray) and K.shape == (3, 3):
-                K[0, 2] = img_w - 1 - K[0, 2]
+            intrinsic = np.asarray(K)
+            if intrinsic.shape == (4,):  # [fx, fy, cx, cy]
+                compact = intrinsic.astype(np.float32, copy=True)
+                if self.direction == 'horizontal':
+                    compact[0] = -compact[0]
+                    compact[2] = img_w - 1 - compact[2]
+                else:
+                    compact[1] = -compact[1]
+                    compact[3] = img_h - 1 - compact[3]
+                K = compact.tolist() if isinstance(K, list) else compact
+            elif intrinsic.shape in ((3, 3), (9,)):
+                matrix = intrinsic.astype(np.float32).reshape(3, 3)
+                if self.direction == 'horizontal':
+                    reflection = np.array(
+                        [[-1., 0., img_w - 1.],
+                         [0., 1., 0.],
+                         [0., 0., 1.]], dtype=np.float32)
+                else:
+                    reflection = np.array(
+                        [[1., 0., 0.],
+                         [0., -1., img_h - 1.],
+                         [0., 0., 1.]], dtype=np.float32)
+                reflected = reflection @ matrix
+                if intrinsic.shape == (9,):
+                    reflected = reflected.reshape(-1)
+                    K = reflected.tolist() if isinstance(K, list) else reflected
+                else:
+                    K = reflected
+            else:
+                raise ValueError(
+                    'intrinsic must be [fx, fy, cx, cy], a flattened 3x3, '
+                    'or a 3x3 matrix, '
+                    f'got shape {intrinsic.shape}')
             results['intrinsic'] = K
-
-        # flip translation
-        if 'translation' in results and len(results['translation']) > 0:
-            results['translation'][:, 0] *= -1
-
-        # flip rotation
-        if 'rotation' in results and len(results['rotation']) > 0:
-            # 6D representation: [c1, c2] where c1, c2 are first two columns of R
-            # For horizontal flip, R' = diag([-1, 1, 1]) @ R.
-            # This negates the first row of R.
-            results['rotation'][:, 0] *= -1
-            results['rotation'][:, 3] *= -1
 
         # flip center_2d
         if 'center_2d' in results and len(results['center_2d']) > 0:
-            results['center_2d'][:, 0] = img_w - 1 - results['center_2d'][:, 0]
+            axis = 0 if self.direction == 'horizontal' else 1
+            extent = img_w if axis == 0 else img_h
+            results['center_2d'][:, axis] = (
+                extent - 1 - results['center_2d'][:, axis])
 
         # Reflect the OBB Gaussian. F=diag(-1, 1) preserves xx/yy and
         # negates only the xy covariance, avoiding angle-wrap conventions.
         if 'obb_gaussian' in results and len(results['obb_gaussian']) > 0:
-            results['obb_gaussian'][:, 0] = (
-                img_w - 1 - results['obb_gaussian'][:, 0])
+            axis = 0 if self.direction == 'horizontal' else 1
+            extent = img_w if axis == 0 else img_h
+            results['obb_gaussian'][:, axis] = (
+                extent - 1 - results['obb_gaussian'][:, axis])
             results['obb_gaussian'][:, 3] *= -1
-
-        # flip T (4x4 transformation matrix)
-        if 'T' in results and len(results['T']) > 0:
-            # t' = M @ t
-            results['T'][:, 0, 3] *= -1
-            # R' = M @ R
-            results['T'][:, 0, :3] *= -1
 
         return results
 
@@ -582,11 +589,12 @@ class RandomFlipFor9DPose(BaseTransform):
 
 @TRANSFORMS.register_module()
 class RandomRotationFor9DPose(BaseTransform):
-    """Randomly rotate the image and update pose annotations.
+    """Rotate every image-space field with one projective transform.
 
-    This transform rotates the image around its center. The 3D pose of
-    each object is updated accordingly. Bounding boxes are recomputed
-    by projecting the 3D model corners.
+    The image-center rotation is represented by ``H`` and projection is
+    updated as ``K' = H K``. Camera-frame ``T``/rotation/translation/size/z
+    annotations remain unchanged. This avoids mixing an image-center 2D
+    rotation with a different camera-origin 3D rotation.
 
     Required Keys:
     - img
@@ -602,20 +610,20 @@ class RandomRotationFor9DPose(BaseTransform):
     Modified Keys:
     - img
     - gt_bboxes
-    - T
-    - translation
-    - rotation
+    - intrinsic
     - center_2d
-    - z
+    - obb_gaussian (optional)
+    - depth (optional)
+    - depth_valid_mask (optional)
 
     Args:
         prob (float): Probability of applying this transform. Defaults to 0.5.
         max_rotate_degree (float): Maximum degrees of rotation transform.
             Defaults to 10.
-        use_log_z (bool): Whether to use log scale for z. Defaults to False.
-        sym_ids (list[int]): List of class ids for symmetric objects.
-            The rotation of these objects will be canonicalized.
-            Defaults to `[0, 1, 3]` for NOCS.
+        use_log_z (bool): Retained for config compatibility; image-space
+            rotation does not change z. Defaults to False.
+        sym_ids (list[int]): Retained for config compatibility; canonical 3D
+            rotations do not change. Defaults to `[0, 1, 3]` for NOCS.
     """
 
     def __init__(self,
@@ -659,107 +667,73 @@ class RandomRotationFor9DPose(BaseTransform):
         img = results['img']
         h, w = img.shape[:2]
 
-        R_aug, rotation_degree = self._get_random_rotation_info()
+        _, rotation_degree = self._get_random_rotation_info()
 
-        # get 2D rotation matrix for image
         M = cv2.getRotationMatrix2D((w / 2, h / 2), rotation_degree, 1)
+        homography = np.vstack((M, [0., 0., 1.])).astype(np.float32)
 
-        # rotate image
         img = cv2.warpAffine(img, M, (w, h), borderValue=(0, 0, 0))
         results['img'] = img
+        results['img_shape'] = img.shape[:2]
 
         if 'depth' in results and results['depth'] is not None:
-            # also rotate depth image if it exists
             results['depth'] = cv2.warpAffine(
                 results['depth'],
                 M, (w, h),
                 borderValue=0,
                 flags=cv2.INTER_NEAREST)
+        if results.get('depth_valid_mask') is not None:
+            results['depth_valid_mask'] = cv2.warpAffine(
+                results['depth_valid_mask'].astype(np.uint8),
+                M, (w, h), borderValue=0,
+                flags=cv2.INTER_NEAREST).astype(bool)
 
-        # update annotations
-        if 'T' in results and len(results['T']) > 0:
-            intrinsic = results['intrinsic']
-            if isinstance(intrinsic, list) and len(intrinsic) == 4:
-                K = np.array([[intrinsic[0], 0, intrinsic[2]],
-                              [0, intrinsic[1], intrinsic[3]],
-                              [0, 0, 1]],
-                             dtype=np.float32)
-            elif isinstance(intrinsic,
-                            (list, np.ndarray)) and np.array(intrinsic).size == 9:
-                K = np.array(intrinsic).reshape(3, 3)
+        if 'intrinsic' in results:
+            intrinsic = np.asarray(results['intrinsic'])
+            if intrinsic.shape == (4,):
+                K = np.array(
+                    [[intrinsic[0], 0., intrinsic[2]],
+                     [0., intrinsic[1], intrinsic[3]],
+                     [0., 0., 1.]], dtype=np.float32)
+            elif intrinsic.shape == (9,):
+                K = intrinsic.astype(np.float32).reshape(3, 3)
+            elif intrinsic.shape == (3, 3):
+                K = intrinsic.astype(np.float32, copy=True)
             else:
                 raise ValueError(
-                    f'Invalid intrinsic shape: {np.array(intrinsic).shape}')
+                    f'Invalid intrinsic shape: {intrinsic.shape}')
+            results['intrinsic'] = homography @ K
 
-            num_instances = len(results['T'])
-            for i in range(num_instances):
-                # original pose
-                T = results['T'][i]
-                R = T[:3, :3]
-                t = T[:3, 3]
+        if 'center_2d' in results and len(results['center_2d']) > 0:
+            centers = np.concatenate((
+                np.asarray(results['center_2d'], dtype=np.float32),
+                np.ones((len(results['center_2d']), 1), dtype=np.float32),
+            ), axis=1)
+            results['center_2d'] = (centers @ homography.T)[:, :2]
 
-                # new pose
-                R_new = R_aug @ R
-                t_new = R_aug @ t
+        if 'obb_gaussian' in results and len(results['obb_gaussian']) > 0:
+            gaussians = np.asarray(
+                results['obb_gaussian'], dtype=np.float32).copy()
+            centers = np.concatenate((
+                gaussians[:, :2],
+                np.ones((len(gaussians), 1), dtype=np.float32),
+            ), axis=1)
+            gaussians[:, :2] = (centers @ homography.T)[:, :2]
+            covariance = np.empty((len(gaussians), 2, 2), dtype=np.float32)
+            covariance[:, 0, 0] = gaussians[:, 2]
+            covariance[:, 0, 1] = gaussians[:, 3]
+            covariance[:, 1, 0] = gaussians[:, 3]
+            covariance[:, 1, 1] = gaussians[:, 4]
+            linear = homography[:2, :2]
+            covariance = linear @ covariance @ linear.T
+            gaussians[:, 2] = covariance[:, 0, 0]
+            gaussians[:, 3] = covariance[:, 0, 1]
+            gaussians[:, 4] = covariance[:, 1, 1]
+            results['obb_gaussian'] = gaussians
 
-                # symmetry handling for symmetric objects
-                class_id = results['gt_bboxes_labels'][i]
-                if class_id in self.sym_ids:
-                    theta_x = R_new[0, 0] + R_new[2, 2]
-                    theta_y = R_new[0, 2] - R_new[2, 0]
-                    r_norm = np.sqrt(theta_x**2 + theta_y**2)
-                    if r_norm > 1e-6:
-                        s_map = np.array(
-                            [[theta_x / r_norm, 0.0, -theta_y / r_norm],
-                             [0.0, 1.0, 0.0],
-                             [theta_y / r_norm, 0.0, theta_x / r_norm]],
-                            dtype=np.float32)
-                        R_new = R_new @ s_map
-
-                # update instance annotations
-                results['T'][i, :3, :3] = R_new
-                results['T'][i, :3, 3] = t_new
-                if 'translation' in results:
-                    results['translation'][i] = t_new
-                if 'rotation' in results:
-                    results['rotation'][i] = [
-                        R_new.flatten()[j] for j in [0, 3, 6, 1, 4, 7]
-                    ]
-
-                if 'center_2d' in results:
-                    center_2d = K @ t_new / t_new[2]
-                    results['center_2d'][i] = center_2d[:2]
-
-                if 'z' in results:
-                    if self.use_log_z:
-                        results['z'][i] = np.log(t_new[2])
-                    else:
-                        results['z'][i] = t_new[2]
-
-            # update gt_bboxes by rotating 2D bboxes
-            if 'gt_bboxes' in results:
-                bboxes = results['gt_bboxes'].tensor.numpy()
-                new_bboxes = []
-                for bbox in bboxes:
-                    x1, y1, x2, y2 = bbox
-                    corners = np.array([[x1, y1, 1], [x2, y1, 1], [x1, y2, 1],
-                                        [x2, y2, 1]]).T
-                    rotated_corners = M @ corners
-                    x_min, y_min = rotated_corners.min(axis=1)
-                    x_max, y_max = rotated_corners.max(axis=1)
-
-                    x_min = max(0, x_min)
-                    y_min = max(0, y_min)
-                    x_max = min(w, x_max)
-                    y_max = min(h, y_max)
-                    new_bboxes.append([x_min, y_min, x_max, y_max])
-
-                if len(new_bboxes) > 0:
-                    results['gt_bboxes'] = HorizontalBoxes(
-                        np.array(new_bboxes, dtype=np.float32))
-                else:
-                    results['gt_bboxes'] = HorizontalBoxes(
-                        np.zeros((0, 4), dtype=np.float32))
+        if 'gt_bboxes' in results and len(results['gt_bboxes']) > 0:
+            results['gt_bboxes'].project_(homography)
+            results['gt_bboxes'].clip_([h, w])
 
         return results
 

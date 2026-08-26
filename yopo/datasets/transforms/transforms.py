@@ -2944,6 +2944,12 @@ class YOLOXHSVRandomAug(BaseTransform):
 
     def transform(self, results: dict) -> dict:
         img = results['img']
+        # Geometric transforms such as np.flip may return a negative-stride
+        # view. OpenCV accepts it as an input but rejects it as ``dst`` below.
+        # Materialize one C-contiguous buffer so this image-only transform can
+        # be safely composed after any flip without touching annotations.
+        if not img.flags.c_contiguous:
+            img = np.ascontiguousarray(img)
         hsv_gains = self._get_hsv_gains()
         img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV).astype(np.int16)
 

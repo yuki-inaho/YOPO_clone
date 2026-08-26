@@ -10,6 +10,7 @@ from .dice_loss import DiceLoss
 from .eqlv2_loss import EQLV2Loss
 from .focal_loss import FocalCustomLoss, FocalLoss, sigmoid_focal_loss
 from .gaussian_dist_loss import GDLoss
+from .gaussian_kfiou_loss import GaussianKFIoULoss
 from .projected_ellipsoid_loss import GaussianGWDLoss, ProjectedEllipsoidGWDLoss
 from .gaussian_focal_loss import GaussianFocalLoss
 from .gfocal_loss import DistributionFocalLoss, QualityFocalLoss
@@ -19,12 +20,16 @@ from .iou_loss import (BoundedIoULoss, CIoULoss, DIoULoss, EIoULoss, GIoULoss,
 from .kd_loss import KnowledgeDistillationKLDivLoss
 from .l2_loss import L2Loss
 from .margin_loss import MarginL2Loss
+from .matchability_aware_loss import (MatchabilityAwareLoss,
+                                      matchability_aware_loss)
 from .mse_loss import MSELoss, mse_loss
 from .multipos_cross_entropy_loss import MultiPosCrossEntropyLoss
 from .pisa_loss import carl_loss, isr_p
 from .pose_loss import ADDLoss
 from .positional_focal_loss import PositionalFocalLoss
 from .rotated_iou_loss import RotatedIoULoss
+from .rotation_6d_stiefel_loss import (Rotation6DStiefelLoss,
+                                       rotation_6d_stiefel_loss)
 from .seesaw_loss import SeesawLoss
 from .smooth_l1_loss import L1Loss, SmoothL1Loss, l1_loss, smooth_l1_loss
 from .triplet_loss import TripletLoss
@@ -45,5 +50,7 @@ __all__ = [
     'MarginL2Loss', 'MultiPosCrossEntropyLoss', 'L2Loss', 'TripletLoss',
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
     'ADDLoss', 'PositionalFocalLoss', 'RotatedIoULoss', 'GDLoss',
-    'GaussianGWDLoss', 'ProjectedEllipsoidGWDLoss',
+    'GaussianGWDLoss', 'GaussianKFIoULoss', 'ProjectedEllipsoidGWDLoss',
+    'MatchabilityAwareLoss', 'matchability_aware_loss',
+    'Rotation6DStiefelLoss', 'rotation_6d_stiefel_loss',
 ]

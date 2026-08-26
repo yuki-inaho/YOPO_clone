@@ -119,7 +119,9 @@ Phase 2が悪化した場合はPhase 1 bestをproduction候補として保持し
 
 ## 6. 評価・採用gate
 
-同じ181画像、IoU=0.50、score threshold=0.05で次を比較する。
+同じ181画像、IoU=0.50で次を比較する。`rbbox_mAP_50`はmodelが出力した全予測を
+score順に使うranked APであり、score thresholdを掛けない。score threshold=0.05は
+recall、precision、matched rIoUという運用点の指標だけに適用する。
 
 | gate | 判定 |
 |---|---|
@@ -168,3 +170,131 @@ visual evidence:
 可視化は「認識している候補を隠さない」目的でscore 0.05を使うため、各画像で150
 queryすべてが描画された。これは精度の主張ではなくcoverage確認用である。定量採用は
 上表の同一metric条件で行う。
+
+## 8. 2026-08-25 GT再監査とaugmentation参照調査
+
+表示対象だった`000001_valid_OL-004_00000016`をmanifest、DOTA label、元画像の
+3経路で再監査した。manifestの`box_count=6`とlabelの非空行6件は一致し、6件すべて
+class=`tomato`、difficulty=`0`である。座標からGT overlayと個別cropを再生成して
+目視した結果、赤果実4個と右端の緑果実2個を囲っていた。下側clusterの3 OBBは同一
+物体の重複ではなく、隣接する3果実の個別annotationである。
+
+```text
+train: 1,368 images / 94,605 tomato OBB / empty label 0
+test:    181 images /  9,034 tomato OBB / empty label 0
+sample: 000001_valid_OL-004_00000016 / 6 tomato OBB
+audit artifacts:
+  work_dirs/gt_audit_20260825/000001_valid_OL-004_00000016_gt_overlay.png
+  work_dirs/gt_audit_20260825/000001_valid_OL-004_00000016_gt_crops.png
+```
+
+比較対象として`/home/kasm-user/Desktop/rotated_rtmdet_jax`の`cu12` branch
+（`1dc5255`）を調査した。O2-DEIM train entrypointが選ぶ実運用profileは
+`tomato_jun30_mmrotate_weak`であり、縦flipを確率0.75で適用し、YOLOX HSVを毎sample
+適用する（実装順はflip→HSV）。任意角rotation、Mosaic、MixUpはこのprofileでは無効
+である。
+別profileの`o2deim_reference_geometric`はH/V/diagonalから排他的に1方向を合計
+確率0.75で選び、さらに±180度rotationを確率0.5で適用する。Dense O2O Mosaicは
+`o2deim_dense_o2o_mosaic`を明示選択した場合だけ確率0.5で有効になり、MixUpは
+O2-DEIM trainerが明示的に拒否する。
+
+参照repoのroot `pyproject.toml`にはactive YOLOX HSVが必要とするOpenCV、および
+reference photometric profileが必要とするAlbumentationsの依存宣言がない。そのため
+root uv環境の対象テストは21件pass、3件missing dependencyでfailした。また
+`requires-python >=3.11`に対し`scipy==1.18.0`がPython 3.12以上を要求するため、通常の
+再解決は失敗し、既存lockを使う`uv run --frozen`だけが起動した。この状態をYOPOへ
+そのまま移植せず、augmentation policyと依存契約を分離して参照する。
+
+参照repoのsourceはDesktopに残し、`.venv`、将来の`outputs`、`artifacts`、`data`、
+`datasets`、`temp`だけを`/workspace/kasm-user/rotated_rtmdet_jax`へsymlinkした。
+作成時点で`/workspace`は60 GiB中50 GiB使用（空き11 GiB、84%）に達しているため、
+既存の別projectを追加移動しない。YOPOの`.venv`と`work_dirs`は従来どおり
+`/workspace/YOPO_clone`に置き、source treeとarchiveは空き131 GiBのoverlay側へ
+分散する。
+
+## 9. 2026-08-25 weak DA FULL trainingとmetric再監査
+
+参照repoの実運用profileをYOPO用の独立configへ移植した。train pipelineは
+`Resize(800x600) -> vertical flip(p=0.75) -> YOLOX HSV(h=5,s=30,v=30)`、validationは
+augmentationなしである。Mosaic、MixUp、任意角rotationは使わない。既存configと
+checkpointを上書きせず、次の4 configへ分離した。
+
+```text
+rotated_deformable_detr_tomato_obb_corrected_da_weak_riou_stage1.py
+rotated_deformable_detr_tomato_obb_corrected_da_weak_gwd_stage2.py
+rotated_deformable_detr_tomato_obb_corrected_da_weak_smoke.py
+rotated_deformable_detr_tomato_obb_corrected_da_weak_inference.py
+```
+
+flip後の負stride画像をOpenCVの`dst`へ渡すとHSV変換が失敗したため、
+`YOLOXHSVRandomAug`は非contiguous入力だけをC-contiguous bufferへmaterializeする。
+HSVはRGB画素だけを変更し、bbox/labelには触れない。OpenCVは
+`opencv-python==4.11.0.86`へ固定し、`uv lock`と`uv sync --frozen`を完了した。
+
+従来metricは`process()`時点でscore<0.05を捨ててからAPを計算していた。これを全予測
+によるall-points APへ修正し、比較用にVOC07 11-point APも併記した。ignore GTは
+regular/ignoreを結合した最大IoUの所属で判定し、MMRotateと同じ優先関係にした。
+shape、label範囲、NaN/Infもmetric入口で検証する。旧GWD bestを新metricで再評価しても
+all-points mAP50は0.0960で変わらず、旧checkpoint比較は維持できた。
+
+RTX 5090 32 GiB、batch 32、FP16でsmoke、Rotated IoU 5 epoch、GWD 15 epochを完走
+した。peakは23,262 MiBで、NaN/Inf/OOMは0だった。
+
+| run | best epoch | all-points mAP50 | VOC07 AP50 | recall@.50/.05 | precision@.50/.05 | matched rIoU |
+|---|---:|---:|---:|---:|---:|---:|
+| 旧DAなし GWD再評価 | 15/15 | **0.0960** | 0.1089 | **0.3745** | **0.1246** | 0.6270 |
+| weak DA Rotated IoU | 4/5 | 0.0869 | 0.1546 | 0.3610 | 0.1202 | 0.6237 |
+| weak DA GWD | 14/15 | 0.0946 | 0.1287 | 0.3702 | 0.1232 | **0.6301** |
+
+weak DA GWDは旧DAなしbestに対してmAP50 `-0.0014`、matched rIoU `+0.0031`だった。
+単一seedかつtest-as-validationであるため「DAが一般に悪い」とは結論しないが、primary
+gateを超えなかったので既定production候補は旧DAなしbestのままとする。weak DA
+checkpointはgeometry改善を再検証するablation候補として保持する。
+
+```text
+weak DA Rotated IoU best:
+  work_dirs/rddetr_tomato_obb_corrected_da_weak_riou_stage1/selected_best.pth
+  -> best_rbbox_mAP_50_epoch_4.pth
+  sha256 1c90abea6e599756c9ad52b4606c15e35e2d81d84a1f41085c151abc4299ba3b
+weak DA GWD best:
+  work_dirs/rddetr_tomato_obb_corrected_da_weak_gwd_stage2/selected_best.pth
+  -> best_rbbox_mAP_50_epoch_14.pth
+  sha256 bbb3e8388b3c8058aac75375e68e41565fa884b572b7ae9025cbe408e26f4f44
+prediction dump:
+  work_dirs/rddetr_tomato_obb_corrected_da_weak_final_eval/predictions.pkl
+  sha256 84b32975bc88c267e904614756ebb867fc08b642fa21572c8853888b8efa14f2
+visual evidence:
+  work_dirs/rddetr_tomato_obb_corrected_da_weak_final_eval/overlays_score0p20/
+  score >= 0.20、各画像最大150 query、6 PNG + manifest.json
+  work_dirs/rddetr_tomato_obb_corrected_da_weak_final_eval/overlays_score0p20_rnms0p30/
+  同じ候補へrotated NMS IoU=0.30を適用、6 PNG + manifest.json
+```
+
+raw版は認識coverageを隠さず、rotated NMS版は同一果実に重なるqueryを減らして目視する
+用途である。NMSは保存済みcheckpointや上表のNMS-free ranked APには適用していない。
+
+## 10. OBB/RGB-D/3D annotation用DAの整合性監査
+
+専用幾何DAの共通契約を「画像座標の変換をhomography `H`で一度だけ表し、projectionは
+`K'=HK`、camera-frame 3D pose/size/zは不変」と定義した。これにより、画像中心の変換と
+camera原点の3D変換を混在させず、任意の3D点について`p'=K'[R|t]X=Hp`が成立する。
+
+| transform | 監査結果と対応 |
+|---|---|
+| `ResizeOBBGaussians` | centerを`(sx,sy)`、covarianceを`A Sigma A^T`で更新済み |
+| `RandomFlipFor9DPose` | 旧実装の`det(R)=-1`反射poseを廃止。RGB/depth/valid mask、2D bbox、center、OBB Gaussian、`K'=FK`を同期し、T/rotation/translationは保持 |
+| `RandomTranslatePixels` | 旧実装は画像の移動方向がbboxと逆で、3D translationと主点を二重更新していた。RGB/depth/mask、bbox、center、OBB Gaussian、`K'=HK`へ統一し、関連annotation filterも同じindexへ統一 |
+| `RandomRotationFor9DPose` | 旧実装は画像中心2D回転とcamera原点3D回転を混在。RGB/depth/mask、bbox、center、OBB Gaussian、full 3x3 `K'=HK`へ統一し、proper SE(3) poseを保持 |
+| `YOLOXHSVRandomAug` | image-only。負stride入力を安全に連結でき、annotationを変更しない |
+| `RandomAffinefor6DPose` | shear/scaleを含む旧実験実装。3D pose契約を満たす検証がなく現行configから未使用のため、再設計までは採用禁止 |
+
+flipは反転軸のfocal符号を含むprojective camera matrix、rotationはskewを含み得るfull
+3x3 matrixになる。これは通常の未加工camera calibrationではなく、augmentation後の
+画素から元のcamera rayへ正確に戻すためのprojection matrixである。pose assigner/lossは
+3x3 inverseを使うため、この表現をそのまま扱える。
+
+今回のRGB-only OBB FULL trainingは標準`RandomFlip`のverticalだけを使うが、
+`RotatedBoxes`の4隅が解析的な反転quadと一致することも検証した。専用3D DAについては
+horizontal/vertical projection、proper rotation、RGB/depth/mask、OBB Gaussian、
+translation、rotationの回帰テストを追加した。metric/loader/HSVを含む対象suiteは
+`29 passed`、ruffはall checks passed、`git diff --check`もpassした。

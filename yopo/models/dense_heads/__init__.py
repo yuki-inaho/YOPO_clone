@@ -18,6 +18,7 @@ from .detr_head import DETRHead
 from .dino_head import DINOHead
 from .rotated_deformable_detr_head import RotatedDeformableDETRHead
 from .rotated_detr_head import RotatedDETRHead
+from .rotated_rtmdet_head import RotatedRTMDetSepBNHead
 from .embedding_rpn_head import EmbeddingRPNHead
 from .fcos_head import FCOSHead
 from .fovea_head import FoveaHead
@@ -62,4 +63,5 @@ __all__ = [
     'RTMDetInsHead', 'RTMDetInsSepBNHead', 'ConditionalDETRHead', 'DINOHead',
     'ATSSVLFusionHead', 'DABDETRHead', 'DDQDETRHead', 'GroundingDINOHead',
     'RotatedDETRHead', 'RotatedDeformableDETRHead',
+    'RotatedRTMDetSepBNHead',
 ]

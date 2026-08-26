@@ -41,8 +41,12 @@ class DOTAOBBDataset(BaseDetDataset):
         img_shape: Known ``(height, width)`` shared by every image. Set to
             ``None`` to read the real shape from each image.
         img_suffixes: Ordered image extensions used to resolve label stems.
+        depth_suffixes: Optional depth extensions. When ``data_prefix`` also
+            contains ``depth_path``, every RGB/label stem must have one depth
+            file and ``depth_path`` is added to each sample.
         strict_loading: Fail on malformed/non-finite/degenerate annotations,
-            unknown classes, corrupt images, and image/label stem mismatch.
+            unknown classes, corrupt images/depth, shape disagreement, and
+            RGB/depth/label stem mismatch.
         diff_thr (int): Difficulty threshold; instances with difficulty
             larger than this are ignored. Defaults to 100.
     """
@@ -52,6 +56,7 @@ class DOTAOBBDataset(BaseDetDataset):
     def __init__(self,
                  img_shape: Optional[tuple[int, int]] = None,
                  img_suffixes: Sequence[str] = ('.jpg', '.jpeg', '.png'),
+                 depth_suffixes: Sequence[str] = ('.png',),
                  strict_loading: bool = True,
                  diff_thr: int = 100,
                  **kwargs):
@@ -62,37 +67,53 @@ class DOTAOBBDataset(BaseDetDataset):
                     f'img_shape must be positive (height, width), got '
                     f'{img_shape!r}')
             img_shape = tuple(int(value) for value in img_shape)
-        if not img_suffixes:
-            raise ValueError('img_suffixes must not be empty')
-        normalized_suffixes = []
-        for suffix in img_suffixes:
-            suffix = str(suffix).lower()
-            if not suffix.startswith('.'):
-                suffix = f'.{suffix}'
-            if suffix in normalized_suffixes:
-                raise ValueError(f'duplicate image suffix: {suffix}')
-            normalized_suffixes.append(suffix)
         self.img_shape = img_shape
-        self.img_suffixes = tuple(normalized_suffixes)
+        self.img_suffixes = self._normalize_suffixes(
+            img_suffixes, 'img_suffixes')
+        self.depth_suffixes = self._normalize_suffixes(
+            depth_suffixes, 'depth_suffixes')
         self.strict_loading = bool(strict_loading)
         self.diff_thr = diff_thr
         super().__init__(**kwargs)
 
-    def _image_by_stem(self) -> dict[str, Path]:
-        image_root = Path(self.data_prefix['img_path'])
-        image_by_stem: dict[str, Path] = {}
-        image_paths = sorted(path for path in image_root.iterdir()
-                             if path.is_file())
-        for suffix in self.img_suffixes:
-            for image_path in image_paths:
-                if image_path.suffix.lower() != suffix:
+    @staticmethod
+    def _normalize_suffixes(suffixes: Sequence[str],
+                            name: str) -> tuple[str, ...]:
+        if not suffixes:
+            raise ValueError(f'{name} must not be empty')
+        normalized_suffixes: list[str] = []
+        for suffix in suffixes:
+            suffix = str(suffix).lower()
+            if not suffix.startswith('.'):
+                suffix = f'.{suffix}'
+            if suffix in normalized_suffixes:
+                raise ValueError(f'duplicate {name} entry: {suffix}')
+            normalized_suffixes.append(suffix)
+        return tuple(normalized_suffixes)
+
+    @staticmethod
+    def _files_by_stem(root: Path, suffixes: Sequence[str],
+                       kind: str) -> dict[str, Path]:
+        files_by_stem: dict[str, Path] = {}
+        paths = sorted(path for path in root.iterdir() if path.is_file())
+        for suffix in suffixes:
+            for path in paths:
+                if path.suffix.lower() != suffix:
                     continue
-                if image_path.stem in image_by_stem:
+                if path.stem in files_by_stem:
                     raise ValueError(
-                        'multiple images share DOTA label stem '
-                        f'{image_path.stem!r}')
-                image_by_stem[image_path.stem] = image_path
-        return image_by_stem
+                        f'multiple {kind} files share DOTA label stem '
+                        f'{path.stem!r}')
+                files_by_stem[path.stem] = path
+        return files_by_stem
+
+    def _image_by_stem(self) -> dict[str, Path]:
+        return self._files_by_stem(
+            Path(self.data_prefix['img_path']), self.img_suffixes, 'image')
+
+    def _depth_by_stem(self) -> dict[str, Path]:
+        return self._files_by_stem(
+            Path(self.data_prefix['depth_path']), self.depth_suffixes, 'depth')
 
     def _image_shape(self, image_path: Path) -> tuple[int, int]:
         if self.img_shape is not None and not self.strict_loading:
@@ -106,6 +127,19 @@ class DOTAOBBDataset(BaseDetDataset):
                 f'DOTA image shape mismatch for {image_path}: expected '
                 f'{self.img_shape}, got {actual_shape}')
         return actual_shape
+
+    def _validate_depth(self, depth_path: Path,
+                        image_shape: tuple[int, int]) -> None:
+        if not self.strict_loading:
+            return
+        depth = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth is None:
+            raise ValueError(f'failed to decode DOTA depth: {depth_path}')
+        depth_shape = (int(depth.shape[0]), int(depth.shape[1]))
+        if depth_shape != image_shape:
+            raise ValueError(
+                f'DOTA RGB/depth shape mismatch for {depth_path}: '
+                f'rgb={image_shape}, depth={depth_shape}')
 
     def _parse_instance(self, line: str, txt_file: str, line_number: int,
                         cls_map: dict[str, int]):
@@ -167,6 +201,8 @@ class DOTAOBBDataset(BaseDetDataset):
         data_list = []
         txt_files = sorted(glob.glob(osp.join(self.ann_file, "*.txt")))
         image_by_stem = self._image_by_stem()
+        depth_by_stem = (
+            self._depth_by_stem() if 'depth_path' in self.data_prefix else None)
         label_stems = {Path(txt_file).stem for txt_file in txt_files}
         image_stems = set(image_by_stem)
         if self.strict_loading and label_stems != image_stems:
@@ -176,6 +212,15 @@ class DOTAOBBDataset(BaseDetDataset):
                 'DOTA image/label stem mismatch: '
                 f'missing_images={missing_images[:5]} '
                 f'missing_labels={missing_labels[:5]}')
+        if self.strict_loading and depth_by_stem is not None:
+            depth_stems = set(depth_by_stem)
+            if label_stems != depth_stems:
+                missing_depth = sorted(label_stems - depth_stems)
+                orphan_depth = sorted(depth_stems - label_stems)
+                raise FileNotFoundError(
+                    'DOTA RGB/depth/label stem mismatch: '
+                    f'missing_depth={missing_depth[:5]} '
+                    f'orphan_depth={orphan_depth[:5]}')
         for txt_file in txt_files:
             img_id = Path(txt_file).stem
             image_path = image_by_stem.get(img_id)
@@ -191,14 +236,21 @@ class DOTAOBBDataset(BaseDetDataset):
                     if instance is not None:
                         instances.append(instance)
             height, width = self._image_shape(image_path)
-            data_list.append({
+            data_info = {
                 "img_id": img_id,
                 "file_name": image_path.name,
                 "img_path": str(image_path),
                 "height": height,
                 "width": width,
                 "instances": instances,
-            })
+            }
+            if depth_by_stem is not None:
+                depth_path = depth_by_stem.get(img_id)
+                if depth_path is None:
+                    continue
+                self._validate_depth(depth_path, (height, width))
+                data_info['depth_path'] = str(depth_path)
+            data_list.append(data_info)
         return data_list
 
     def filter_data(self):

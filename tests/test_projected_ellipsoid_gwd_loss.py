@@ -11,6 +11,9 @@ from yopo.models.losses.projected_ellipsoid_loss import (
     normalized_gaussian_anisotropy_weights,
     project_ellipsoid_to_gaussian,
 )
+from yopo.models.dense_pose_heads.dino_9d_center2d_posehead import (
+    DINO9DCenter2DPoseHead,
+)
 
 
 def _intrinsic() -> torch.Tensor:
@@ -28,6 +31,62 @@ def _identity_6d(*, requires_grad: bool = False) -> torch.Tensor:
         dtype=torch.float64,
         requires_grad=requires_grad,
     )
+
+
+@pytest.mark.parametrize(
+    ('meta', 'expected'),
+    [
+        (
+            dict(
+                intrinsic=[500.0, 510.0, 320.0, 240.0],
+                scale_factor=(0.8, 0.75),
+                img_shape=(384, 640),
+                flip=False,
+            ),
+            [[400.0, 0.0, 256.0], [0.0, 382.5, 180.0], [0.0, 0.0, 1.0]],
+        ),
+        (
+            dict(
+                intrinsic=[-500.0, 510.0, 319.0, 240.0],
+                scale_factor=(0.8, 0.75),
+                img_shape=(384, 640),
+                flip=True,
+                flip_direction='horizontal',
+            ),
+            [[-400.0, 0.0, 383.0], [0.0, 382.5, 180.0], [0.0, 0.0, 1.0]],
+        ),
+        (
+            dict(
+                intrinsic=[500.0, -510.0, 320.0, 143.0],
+                scale_factor=(0.8, 0.75),
+                img_shape=(384, 640),
+                flip=True,
+                flip_direction='vertical',
+            ),
+            [[400.0, 0.0, 256.0], [0.0, -382.5, 203.0], [0.0, 0.0, 1.0]],
+        ),
+    ],
+)
+def test_training_intrinsic_is_mapped_to_current_image_pixels(meta, expected):
+    actual = DINO9DCenter2DPoseHead._image_space_intrinsic_matrix(
+        meta, torch.empty((), dtype=torch.float64))
+
+    torch.testing.assert_close(
+        actual, torch.tensor(expected, dtype=torch.float64))
+
+
+def test_training_intrinsic_rejects_unknown_flip_direction():
+    meta = dict(
+        intrinsic=[500.0, 510.0, 320.0, 240.0],
+        scale_factor=(0.8, 0.75),
+        img_shape=(384, 640),
+        flip=True,
+        flip_direction='diagonal',
+    )
+
+    with pytest.raises(ValueError, match='flip_direction'):
+        DINO9DCenter2DPoseHead._image_space_intrinsic_matrix(
+            meta, torch.empty(()))
 
 
 def test_exact_sphere_projection_matches_perspective_solution():

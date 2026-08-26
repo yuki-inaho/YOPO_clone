@@ -26,6 +26,25 @@ def _array(value: object) -> np.ndarray:
     return np.asarray(value)
 
 
+def threshold_key(value: float) -> str:
+    """Serialize a threshold without merging distinct sweep conditions."""
+    return f"{float(value):.12g}"
+
+
+def f1_score(precision: float, recall: float) -> float:
+    """Return the harmonic mean of precision and recall, or zero at 0/0."""
+    denominator = precision + recall
+    return 2.0 * precision * recall / denominator if denominator else 0.0
+
+
+def _validate_thresholds(values: tuple[float, ...], name: str) -> None:
+    if not values or any(
+        not np.isfinite(value) or value < 0.0 or value > 1.0
+        for value in values
+    ):
+        raise ValueError(f"{name} must contain finite values in [0, 1]")
+
+
 def pairwise_iou_xyxy(first: np.ndarray, second: np.ndarray) -> np.ndarray:
     """Return pairwise IoU for two finite ``xyxy`` arrays."""
     first = np.asarray(first, dtype=np.float64).reshape(-1, 4)
@@ -123,15 +142,45 @@ def summarize_selected_predictions(
         else np.empty(0, dtype=np.float64)
     )
     true_positives = int(accepted.size)
+    precision = true_positives / kept_count if kept_count else 0.0
+    recall = true_positives / gt_count if gt_count else 0.0
     return {
         "kept": kept_count,
         "mean_kept_per_image": kept_count / len(records),
         "true_positives": true_positives,
         "ground_truths": gt_count,
-        "precision": true_positives / kept_count if kept_count else 0.0,
-        "recall": true_positives / gt_count if gt_count else 0.0,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1_score(precision, recall),
         "mean_matched_iou": float(accepted.mean()) if accepted.size else 0.0,
     }
+
+
+def select_best_f1_selection(
+    candidates: list[dict[str, float | int | None]],
+) -> dict[str, float | int | None]:
+    """Select one candidate using a complete, deterministic quality ordering.
+
+    Higher F1, recall, and precision win, in that order. Remaining ties prefer
+    a lower score threshold, no NMS, then a lower numeric NMS IoU threshold.
+    """
+    if not candidates:
+        raise ValueError("at least one selection candidate is required")
+
+    def selection_key(
+        candidate: dict[str, float | int | None],
+    ) -> tuple[float, float, float, float, bool, float]:
+        nms_threshold = candidate["nms_iou_threshold"]
+        return (
+            float(candidate["f1"]),
+            float(candidate["recall"]),
+            float(candidate["precision"]),
+            -float(candidate["score_threshold"]),
+            nms_threshold is None,
+            -float(nms_threshold) if nms_threshold is not None else 0.0,
+        )
+
+    return max(candidates, key=selection_key)
 
 
 def _label_path(image_path: str) -> Path:
@@ -244,7 +293,11 @@ def diagnose_dump(
     nms_iou_thresholds: tuple[float, ...],
     match_iou_threshold: float,
 ) -> dict:
+    _validate_thresholds(score_thresholds, "score-thresholds")
+    _validate_thresholds(nms_iou_thresholds, "nms-iou-thresholds")
+    _validate_thresholds((match_iou_threshold,), "match-iou-threshold")
     selections = {}
+    candidates = []
     for score_threshold in score_thresholds:
         per_nms = {
             "none": summarize_selected_predictions(
@@ -254,18 +307,37 @@ def diagnose_dump(
                 match_iou_threshold=match_iou_threshold,
             )
         }
+        candidates.append({
+            "score_threshold": score_threshold,
+            "nms_iou_threshold": None,
+            **{
+                key: per_nms["none"][key]
+                for key in ("precision", "recall", "f1", "kept", "true_positives")
+            },
+        })
         for nms_threshold in nms_iou_thresholds:
-            per_nms[f"{nms_threshold:.1f}"] = summarize_selected_predictions(
+            per_nms[threshold_key(nms_threshold)] = summarize_selected_predictions(
                 records,
                 score_threshold=score_threshold,
                 nms_iou_threshold=nms_threshold,
                 match_iou_threshold=match_iou_threshold,
             )
-        selections[f"{score_threshold:.1f}"] = per_nms
+            candidates.append({
+                "score_threshold": score_threshold,
+                "nms_iou_threshold": nms_threshold,
+                **{
+                    key: per_nms[threshold_key(nms_threshold)][key]
+                    for key in (
+                        "precision", "recall", "f1", "kept", "true_positives"
+                    )
+                },
+            })
+        selections[threshold_key(score_threshold)] = per_nms
     return {
         "raw_score_alignment": summarize_raw_scores(
             records, match_iou_threshold),
         "selection_counterfactuals": selections,
+        "best_f1_selection": select_best_f1_selection(candidates),
     }
 
 
@@ -285,14 +357,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if not 0.0 <= args.match_iou_threshold <= 1.0:
-        raise ValueError("match-iou-threshold must be in [0, 1]")
-    for values, name in (
-        (args.score_thresholds, "score-thresholds"),
-        (args.nms_iou_thresholds, "nms-iou-thresholds"),
-    ):
-        if not values or any(value < 0.0 or value > 1.0 for value in values):
-            raise ValueError(f"{name} must contain values in [0, 1]")
+    _validate_thresholds(tuple(args.score_thresholds), "score-thresholds")
+    _validate_thresholds(tuple(args.nms_iou_thresholds), "nms-iou-thresholds")
+    _validate_thresholds((args.match_iou_threshold,), "match-iou-threshold")
 
     named_paths: dict[str, Path] = {}
     for item in args.prediction:
@@ -317,6 +384,10 @@ def main() -> None:
             "match_iou_threshold": args.match_iou_threshold,
             "nms": "counterfactual diagnostic only; raw dump and inference graph unchanged",
             "query_identity": "retained indices refer to the same 2D/OBB/3D query",
+            "best_f1_tie_break": (
+                "higher F1, then recall, then precision; lower score threshold; "
+                "no NMS; then lower numeric NMS IoU threshold"
+            ),
         },
         "dataset": summarize_dataset(reference_records),
         "runs": {

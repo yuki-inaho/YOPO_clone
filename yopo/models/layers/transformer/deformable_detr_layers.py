@@ -212,8 +212,12 @@ class DeformableDetrTransformerDecoder(DetrTransformerDecoder):
             if reg_branches is not None:
                 tmp_reg_preds = reg_branches[layer_id](output)
                 if reference_points.shape[-1] == 4:
-                    new_reference_points = tmp_reg_preds + inverse_sigmoid(
-                        reference_points)
+                    # Rotated heads regress xywha while deformable attention
+                    # consumes xywh references. Refine the spatial reference
+                    # with the first four coordinates and leave angle in the
+                    # prediction head.
+                    new_reference_points = tmp_reg_preds[..., :4] + \
+                        inverse_sigmoid(reference_points)
                     new_reference_points = new_reference_points.sigmoid()
                 else:
                     assert reference_points.shape[-1] == 2

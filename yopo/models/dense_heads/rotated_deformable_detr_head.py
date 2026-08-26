@@ -93,7 +93,9 @@ class RotatedDeformableDETRHead(DeformableDETRHead, RotatedDETRHead):
             hidden_state = hidden_states[layer_id]
             outputs_class = self.cls_branches[layer_id](hidden_state)
             tmp_reg_preds = self.reg_branches[layer_id](hidden_state)
-            if reference.shape[-1] in [4, 5]:
+            if reference.shape[-1] == 5:
+                tmp_reg_preds += reference
+            elif reference.shape[-1] == 4:
                 tmp_reg_preds[..., :4] += reference[..., :4]
             else:
                 assert reference.shape[-1] == 2

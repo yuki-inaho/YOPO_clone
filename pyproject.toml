@@ -40,7 +40,10 @@ dependencies = [
     "tqdm",
     "einops",
     "importlib-metadata",
-    "opencv-python",
+    # Exact OpenCV build used by YOLOXHSVRandomAug and DOTA quad -> rbox
+    # conversion. Pinning keeps photometric and geometric preprocessing
+    # reproducible across full-training environments.
+    "opencv-python==4.11.0.86",
     "pillow",
     # --- YOPO category-level 9D pose extras (yopo/datasets/pose_estimation,
     #     yopo/evaluation/metrics) ---
@@ -80,3 +83,9 @@ explicit = true
 [tool.ruff]
 line-length = 88
 target-version = "py310"
+
+[tool.pytest.ini_options]
+# Keep command-line/deployment utilities named test_*.py out of the unit-test
+# collection.  In particular, tools/deployment/test_torchserver.py is an
+# executable integration client that requires a separately running server.
+testpaths = ["tests"]
