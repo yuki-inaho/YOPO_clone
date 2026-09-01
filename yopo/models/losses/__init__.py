@@ -12,6 +12,12 @@ from .focal_loss import FocalCustomLoss, FocalLoss, sigmoid_focal_loss
 from .gaussian_dist_loss import GDLoss
 from .gaussian_kfiou_loss import GaussianKFIoULoss
 from .projected_ellipsoid_loss import GaussianGWDLoss, ProjectedEllipsoidGWDLoss
+from .gaucho3d_loss import (DualConicResidualLoss,
+                            Ellipse2DKLDLoss,
+                            DualQuadricProjectionGWDLoss,
+                            Ellipsoid3DGWDLoss, Ellipsoid3DKLDLoss,
+                            EllipsoidFreeSpaceLoss,
+                            RayEllipsoidSurfaceLoss)
 from .gaussian_focal_loss import GaussianFocalLoss
 from .gfocal_loss import DistributionFocalLoss, QualityFocalLoss
 from .ghm_loss import GHMC, GHMR
@@ -51,6 +57,9 @@ __all__ = [
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
     'ADDLoss', 'PositionalFocalLoss', 'RotatedIoULoss', 'GDLoss',
     'GaussianGWDLoss', 'GaussianKFIoULoss', 'ProjectedEllipsoidGWDLoss',
+    'Ellipsoid3DKLDLoss', 'Ellipsoid3DGWDLoss', 'Ellipse2DKLDLoss',
+    'DualQuadricProjectionGWDLoss', 'DualConicResidualLoss',
+    'RayEllipsoidSurfaceLoss', 'EllipsoidFreeSpaceLoss',
     'MatchabilityAwareLoss', 'matchability_aware_loss',
     'Rotation6DStiefelLoss', 'rotation_6d_stiefel_loss',
 ]
