@@ -16,10 +16,12 @@ from .nocs_metric import NOCSMetric
 from .openimages_metric import OpenImagesMetric
 from .ov_coco_metric import OVCocoMetric
 from .refexp_metric import RefExpMetric
+from .ellipse_rotated_iou_metric import EllipseEnvelopeRotatedIoUMetric
 from .rotated_iou_metric import RotatedIoUMetric
 from .voc_metric import VOCMetric
 
 __all__ = [
+    'EllipseEnvelopeRotatedIoUMetric',
     'CocoMetric', 'OpenImagesMetric', 'VOCMetric', 'LVISMetric',
     'CrowdHumanMetric', 'DumpProposals', 'CocoOccludedSeparatedMetric',
     'DumpDetResults', 'COCOCaptionMetric', 'RefExpMetric', 'gRefCOCOMetric',
