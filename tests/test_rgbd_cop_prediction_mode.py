@@ -96,7 +96,12 @@ def test_chain_mode_routes_chain_pose_to_primary_outputs():
     assert torch.all(outputs[3] == 2.0)
     assert torch.all(outputs[4] == 2.0)
     assert torch.all(outputs[5] == 2.0)
-    assert outputs[6:] == (None, None, None, None)
+    # Chain mode leaves the auxiliary parallel streams and the OBB slot empty.
+    assert outputs[6:10] == (None, None, None, None)
+    # The GauCho 3D and 2D slots are likewise empty while those branches
+    # are off.
+    assert outputs[10] is None
+    assert outputs[11] is None
     assert head.cop_chain_order == ("z", "size", "rotation")
 
 
