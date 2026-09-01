@@ -1,4 +1,4 @@
-"""Re-score an 800x600 checkpoint under the reference implementation's protocol.
+"""Re-score a 1024x768 checkpoint under the reference implementation's protocol.
 
 ``EllipseEnvelopeRotatedIoUMetric`` defaults to no suppression, which is the
 raw number every run in this work has logged.  The 2D reference this is measured
@@ -9,7 +9,7 @@ checkpoint the same weights read 0.6533 raw and 0.7113 suppressed.
 Both are reported here so neither can be quoted without the other.
 """
 
-_base_ = ["./train_800_fix_center_off.py"]
+_base_ = ["./train_1024_res.py"]
 
 _evaluator = [
     dict(type="NOCSMetric", prefix="legacy_nocs"),
