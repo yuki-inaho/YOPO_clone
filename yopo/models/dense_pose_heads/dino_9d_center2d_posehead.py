@@ -239,8 +239,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_ellipsoid: ConfigType = None,
             loss_ellipsoid_projection: ConfigType = None,
             loss_ellipsoid_max_axis: ConfigType = None,
+            loss_ellipse2d_corner: ConfigType = None,
+            loss_ellipse2d_angle: ConfigType = None,
             ellipsoid_gt_max_diameter: float = None,
             ellipsoid_max_diameter: float = None,
+            sensor_depth_scale: float = None,
+            sensor_depth_window: int = 2,
+            sensor_depth_anchor: bool = False,
+            sensor_depth_anchor_denoising: bool = True,
             distill_attributes: Tuple[str, ...] = (),
             center_teacher_source: str = 'pose_center',
             obb_center_teacher_checkpoint: str = None,
@@ -510,6 +516,29 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.loss_ellipsoid_max_axis = (
             MODELS.build(loss_ellipsoid_max_axis)
             if loss_ellipsoid_max_axis is not None else None)
+        # The ellipse KLD reduces to the Frobenius norm of L_p^{-1} L_g, which
+        # is nearly constant under rotation once the shape is near-circular --
+        # and these objects have a median aspect ratio of 1.20.  Measured: the
+        # angle error sits at 17 degrees and did not move when the KLD weight
+        # was tripled, while the metric, which compares envelope corners, still
+        # charges 0.20 of IoU for it.  This term supplies the orientation
+        # gradient the KLD structurally cannot.  Auxiliary, never a replacement.
+        self.loss_ellipse2d_corner = (
+            MODELS.build(loss_ellipse2d_corner)
+            if loss_ellipse2d_corner is not None else None)
+        if self.loss_ellipse2d_corner is not None and not self.gaucho_ellipse2d:
+            raise ValueError(
+                'loss_ellipse2d_corner requires gaucho_ellipse2d=True')
+        # Explicit, pi-periodic angle supervision, weighted by how identifiable
+        # the target's orientation is.  The reference implementation this work
+        # is measured against does exactly this rather than leaving orientation
+        # to the KLD, which has no rotation gradient for a near-circular shape.
+        self.loss_ellipse2d_angle = (
+            MODELS.build(loss_ellipse2d_angle)
+            if loss_ellipse2d_angle is not None else None)
+        if self.loss_ellipse2d_angle is not None and not self.gaucho_ellipse2d:
+            raise ValueError(
+                'loss_ellipse2d_angle requires gaucho_ellipse2d=True')
         # A bound on the physical size of the object, in metres.  Two distinct
         # jobs, deliberately separate knobs: ``ellipsoid_gt_max_diameter``
         # drops annotations larger than the objects can be from the 3D shape
@@ -523,6 +552,38 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 raise ValueError(f'{name} must be positive, got {value}')
         self.ellipsoid_gt_max_diameter = ellipsoid_gt_max_diameter
         self.ellipsoid_max_diameter = ellipsoid_max_diameter
+        # Metres per unit of the packed depth channel.  With it set, the
+        # emitted ellipsoid keeps its predicted bearing and shape but takes
+        # its *range* from the sensor, which measurement says is four times
+        # more accurate than the regressed one.  ``None`` leaves the model
+        # exactly as it was.
+        if sensor_depth_scale is not None and not sensor_depth_scale > 0.0:
+            raise ValueError(
+                'sensor_depth_scale must be positive, got '
+                f'{sensor_depth_scale}')
+        self.sensor_depth_scale = sensor_depth_scale
+        self.sensor_depth_window = int(sensor_depth_window)
+        # Structural anchor: the forward pass adds the sensor's depth at
+        # each query's predicted centre to the regressed z, so the network
+        # learns the residual and every consumer of z -- losses, matching,
+        # denoising, inference -- keeps seeing absolute metres unchanged.
+        # Measured basis: the depth channel reads the object centre to
+        # 5.3 mm where the regression is off by 21.9 mm, and range alone
+        # is a 15x factor on the shared 3D AP.
+        self.sensor_depth_anchor = bool(sensor_depth_anchor)
+        # Denoising queries are noised copies of the annotations, so the
+        # depth sampled at their displaced centre lands off the object and
+        # the residual is asked to undo a displacement it cannot see.
+        # ``cop_z_out`` is shared with the matching queries, so that
+        # correction leaks into them.  Turning this off leaves denoising
+        # regressing absolute depth exactly as before.
+        self.sensor_depth_anchor_denoising = bool(
+            sensor_depth_anchor_denoising)
+        self._num_denoising_queries = 0
+        if self.sensor_depth_anchor and self.sensor_depth_scale is None:
+            raise ValueError(
+                'sensor_depth_anchor requires sensor_depth_scale')
+        self.sensor_depth_map = None
         if self.loss_ellipsoid_max_axis is not None and \
                 not self.gaucho_ellipsoid:
             raise ValueError(
@@ -787,6 +848,57 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     **self.cop_depth_context_cfg,
                 )
 
+
+    @torch.no_grad()
+    def _sample_depth_anchor(self, centres_norm: Tensor) -> Tensor:
+        """Metric depth at each query's predicted centre, as a constant.
+
+        ``centres_norm`` is ``(bs, num_queries, 2)`` in normalized image
+        coordinates and arrives detached: giving the sampling location a
+        gradient would let the centre go shopping for convenient depths.
+
+        A 5x5 median around the centre, valid pixels only -- the same window
+        the offline measurement used when it found 5.3 mm.  A centre with no
+        valid return in its window falls back to the image's own median valid
+        depth, so the residual the network learns keeps meaning "correction to
+        an approximately right range" instead of flipping between residual and
+        absolute regression on the 3.6% of centres the sensor misses.
+        """
+        depth_map = self.sensor_depth_map
+        batch, queries = centres_norm.shape[:2]
+        if depth_map is None:
+            return centres_norm.new_zeros(batch, queries, 1)
+        depth = depth_map[:, 0].float()
+        height, width = depth.shape[-2:]
+        x = (centres_norm[..., 0].float() * width).round().long()
+        y = (centres_norm[..., 1].float() * height).round().long()
+        x = x.clamp(0, width - 1)
+        y = y.clamp(0, height - 1)
+
+        window = self.sensor_depth_window
+        samples = []
+        for dy in range(-window, window + 1):
+            for dx in range(-window, window + 1):
+                yy = (y + dy).clamp(0, height - 1)
+                xx = (x + dx).clamp(0, width - 1)
+                flat = (yy * width + xx).reshape(batch, queries)
+                samples.append(torch.gather(
+                    depth.reshape(batch, -1), 1, flat))
+        stacked = torch.stack(samples, dim=-1)
+        stacked = torch.where(stacked > 0, stacked,
+                              torch.full_like(stacked, float("nan")))
+        measured = stacked.nanmedian(dim=-1).values
+
+        fallback = []
+        for index in range(batch):
+            valid = depth[index][depth[index] > 0]
+            fallback.append(valid.median() if valid.numel()
+                            else depth.new_tensor(0.0))
+        fallback = torch.stack(fallback).unsqueeze(-1).expand(batch, queries)
+        anchored = torch.where(torch.isfinite(measured), measured, fallback)
+        return (anchored * self.sensor_depth_scale).unsqueeze(-1).to(
+            centres_norm.dtype)
+
     def _init_distillation_teachers(self) -> None:
         """Delegate frozen teacher adaptation to the distillation module."""
         self._last_distillation_targets = {}
@@ -1030,6 +1142,22 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 tmp_obb_aux = None
 
 
+            if (self.sensor_depth_anchor and tmp_reg_z_preds is not None
+                    and self.sensor_depth_map is not None):
+                # The network's z output becomes a residual: what leaves the
+                # head is anchor + delta, still absolute metres, so no loss,
+                # target, matcher or decoder changes meaning.  Zero-initialised
+                # z outputs therefore start the model at exactly "trust the
+                # sensor", and training can only improve on that.
+                anchor = self._sample_depth_anchor(
+                    tmp_reg_centers_2d_preds.detach())
+                split = self._num_denoising_queries
+                if split:
+                    anchor = torch.cat(
+                        (torch.zeros_like(anchor[:, :split]),
+                         anchor[:, split:]), dim=1)
+                tmp_reg_z_preds = tmp_reg_z_preds + anchor
+
             all_layers_outputs_classes.append(outputs_class)
             all_layers_outputs_coords.append(outputs_coord)
             all_layers_outputs_centers_2d.append(tmp_reg_centers_2d_preds)
@@ -1173,6 +1301,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     batch_img_metas[image_index], rescale=rescale)
         return predictions
 
+
     def _attach_gaucho_predictions(self, result, outs, image_index,
                                    bbox_index, query_labels, img_meta,
                                    rescale: bool) -> None:
@@ -1281,6 +1410,11 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             batch_img_metas.append(data_sample.metainfo)
             batch_gt_instances.append(data_sample.gt_instances)
 
+        # ``forward`` cannot see ``dn_meta``; the split is needed there to
+        # keep the depth anchor off the denoising queries.
+        self._num_denoising_queries = (
+            int(dn_meta['num_denoising_queries'])
+            if dn_meta and not self.sensor_depth_anchor_denoising else 0)
         outs = self(
             hidden_states,
             references,
@@ -1607,6 +1741,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         losses_ellipse2d = transposed[14] if len(transposed) > 14 else empty
         losses_ellipsoid_max_axis = (
             transposed[15] if len(transposed) > 15 else empty)
+        losses_ellipse2d_corner = (
+            transposed[16] if len(transposed) > 16 else empty)
+        losses_ellipse2d_angle = (
+            transposed[17] if len(transposed) > 17 else empty)
 
         losses_rotation_frame = None
         if self.loss_rotation_frame is not None:
@@ -1659,6 +1797,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if self.loss_ellipsoid_max_axis is not None:
             loss_dict['loss_ellipsoid_max_axis'] = \
                 losses_ellipsoid_max_axis[-1]
+        if self.loss_ellipse2d_corner is not None:
+            loss_dict['loss_ellipse2d_corner'] = losses_ellipse2d_corner[-1]
+        if self.loss_ellipse2d_angle is not None:
+            loss_dict['loss_ellipse2d_angle'] = losses_ellipse2d_angle[-1]
         if self._uses_auxiliary_chain:
             loss_dict['loss_size_chain'] = losses_size_chain[-1]
             loss_dict['loss_rotation_chain'] = losses_rotation_chain[-1]
@@ -1700,6 +1842,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             if self.loss_ellipsoid_max_axis is not None:
                 loss_dict[f'd{num_dec_layer}.loss_ellipsoid_max_axis'] = \
                     losses_ellipsoid_max_axis[i]
+            if self.loss_ellipse2d_corner is not None:
+                loss_dict[f'd{num_dec_layer}.loss_ellipse2d_corner'] = \
+                    losses_ellipse2d_corner[i]
+            if self.loss_ellipse2d_angle is not None:
+                loss_dict[f'd{num_dec_layer}.loss_ellipse2d_angle'] = \
+                    losses_ellipse2d_angle[i]
             if self._uses_auxiliary_chain:
                 loss_dict[f'd{num_dec_layer}.loss_size_chain'] = losses_size_chain[i]
                 loss_dict[f'd{num_dec_layer}.loss_rotation_chain'] = losses_rotation_chain[i]
@@ -2328,10 +2476,20 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         # ── GauCho-2D amodal ellipse loss ─────────────────────────────
         loss_ellipse2d = z_preds.new_tensor(0.0)
+        loss_ellipse2d_corner = z_preds.new_tensor(0.0)
+        loss_ellipse2d_angle = z_preds.new_tensor(0.0)
         if ellipse_cholesky is not None:
             loss_ellipse2d = self.loss_ellipse2d(
                 ellipse_mean, ellipse_cholesky, obb_gaussian_targets,
                 weight=obb_gaussian_weights, avg_factor=num_total_pos)
+            if self.loss_ellipse2d_corner is not None:
+                loss_ellipse2d_corner = self.loss_ellipse2d_corner(
+                    ellipse_mean, ellipse_sigma, obb_gaussian_targets,
+                    weight=obb_gaussian_weights, avg_factor=num_total_pos)
+            if self.loss_ellipse2d_angle is not None:
+                loss_ellipse2d_angle = self.loss_ellipse2d_angle(
+                    ellipse_sigma, obb_gaussian_targets,
+                    weight=obb_gaussian_weights, avg_factor=num_total_pos)
 
         # ── GauCho-3D ellipsoid losses ────────────────────────────────
         loss_ellipsoid = z_preds.new_tensor(0.0)
@@ -2441,7 +2599,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 loss_rotation, loss_sizes, loss_projection, loss_obb_aux,
                 loss_size_chain, loss_rotation_chain, loss_z_chain,
                 loss_ellipsoid, loss_ellipsoid_projection, loss_ellipse2d,
-                loss_ellipsoid_max_axis)
+                loss_ellipsoid_max_axis, loss_ellipse2d_corner,
+                loss_ellipse2d_angle)
 
     def get_targets(self, cls_scores_list: List[Tensor], bbox_preds_list: List[Tensor],
                     centers_2d_preds_list: List[Tensor], z_preds_list: List[Tensor],
