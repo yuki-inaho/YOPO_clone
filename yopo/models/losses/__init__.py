@@ -12,6 +12,7 @@ from .focal_loss import FocalCustomLoss, FocalLoss, sigmoid_focal_loss
 from .gaussian_dist_loss import GDLoss
 from .gaussian_kfiou_loss import GaussianKFIoULoss
 from .projected_ellipsoid_loss import GaussianGWDLoss, ProjectedEllipsoidGWDLoss
+from .ellipse_centre_loss import EllipseCentreLoss
 from .ellipse_angle_loss import EllipseAngleGeodesicLoss
 from .ellipse_envelope_corner_loss import EllipseEnvelopeCornerLoss
 from .parallel_box3d_kld_loss import ParallelOrientedBox3DKLDLoss
@@ -61,7 +62,7 @@ __all__ = [
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
     'ADDLoss', 'PositionalFocalLoss', 'RotatedIoULoss', 'GDLoss',
     'GaussianGWDLoss', 'GaussianKFIoULoss', 'ProjectedEllipsoidGWDLoss',
-    'Ellipsoid3DKLDLoss', 'Ellipsoid3DGWDLoss', 'EllipsoidMaxAxisLoss', 'ParallelOrientedBox3DKLDLoss', 'EllipseEnvelopeCornerLoss', 'EllipseAngleGeodesicLoss',
+    'Ellipsoid3DKLDLoss', 'Ellipsoid3DGWDLoss', 'EllipsoidMaxAxisLoss', 'ParallelOrientedBox3DKLDLoss', 'EllipseEnvelopeCornerLoss', 'EllipseAngleGeodesicLoss', 'EllipseCentreLoss',
     'Ellipse2DKLDLoss',
     'DualQuadricProjectionGWDLoss', 'DualConicResidualLoss',
     'RayEllipsoidSurfaceLoss', 'EllipsoidFreeSpaceLoss',

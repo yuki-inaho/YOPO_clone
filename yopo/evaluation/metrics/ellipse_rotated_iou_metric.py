@@ -151,9 +151,19 @@ class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
                  gt_field: str = "obb_gaussians",
                  nms_iou_threshold: Optional[float] = None,
                  geometry_oracle: bool = False,
+                 oracle_fields: str = "all",
                  **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.geometry_oracle = bool(geometry_oracle)
+        # Which part of the geometry the oracle supplies.  Replacing all of
+        # it says what the detector could reach; replacing one piece says
+        # what fixing that piece would be worth, in AP rather than in IoU.
+        allowed = {"all", "centre", "size", "angle", "size_angle"}
+        if oracle_fields not in allowed:
+            raise ValueError(
+                f"oracle_fields must be one of {sorted(allowed)}, got "
+                f"{oracle_fields!r}")
+        self.oracle_fields = oracle_fields
         if nms_iou_threshold is not None and not 0.0 < nms_iou_threshold <= 1.0:
             raise ValueError(
                 "nms_iou_threshold must be in (0, 1] or None, got "
@@ -242,7 +252,17 @@ class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
                 # geometry can rescue, and leaving it keeps that honest.
                 touches = best_iou > 0
                 pred_boxes = pred_boxes.clone()
-                pred_boxes[touches] = gt_boxes[best_gt[touches]]
+                matched_gt = gt_boxes[best_gt[touches]]
+                if self.oracle_fields == "all":
+                    pred_boxes[touches] = matched_gt
+                else:
+                    rows = torch.nonzero(touches).flatten()
+                    if self.oracle_fields in ("centre",):
+                        pred_boxes[rows, 0:2] = matched_gt[:, 0:2]
+                    if self.oracle_fields in ("size", "size_angle"):
+                        pred_boxes[rows, 2:4] = matched_gt[:, 2:4]
+                    if self.oracle_fields in ("angle", "size_angle"):
+                        pred_boxes[rows, 4] = matched_gt[:, 4]
 
             self.results.append(
                 dict(

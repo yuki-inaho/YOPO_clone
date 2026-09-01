@@ -241,6 +241,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_ellipsoid_max_axis: ConfigType = None,
             loss_ellipse2d_corner: ConfigType = None,
             loss_ellipse2d_angle: ConfigType = None,
+            loss_ellipse2d_centre: ConfigType = None,
             ellipsoid_gt_max_diameter: float = None,
             ellipsoid_max_diameter: float = None,
             sensor_depth_scale: float = None,
@@ -539,6 +540,17 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if self.loss_ellipse2d_angle is not None and not self.gaucho_ellipse2d:
             raise ValueError(
                 'loss_ellipse2d_angle requires gaucho_ellipse2d=True')
+        # Replacing the matched predictions' centre with the annotation's and
+        # re-scoring is worth +0.064 mAP50, against +0.019 for the extent and
+        # +0.002 for the angle.  The KLD's own centre term is normalised by the
+        # predicted covariance and so barely pulls; this charges the centre in
+        # units of the target's size instead.
+        self.loss_ellipse2d_centre = (
+            MODELS.build(loss_ellipse2d_centre)
+            if loss_ellipse2d_centre is not None else None)
+        if self.loss_ellipse2d_centre is not None and not self.gaucho_ellipse2d:
+            raise ValueError(
+                'loss_ellipse2d_centre requires gaucho_ellipse2d=True')
         # A bound on the physical size of the object, in metres.  Two distinct
         # jobs, deliberately separate knobs: ``ellipsoid_gt_max_diameter``
         # drops annotations larger than the objects can be from the 3D shape
@@ -1745,6 +1757,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             transposed[16] if len(transposed) > 16 else empty)
         losses_ellipse2d_angle = (
             transposed[17] if len(transposed) > 17 else empty)
+        losses_ellipse2d_centre = (
+            transposed[18] if len(transposed) > 18 else empty)
 
         losses_rotation_frame = None
         if self.loss_rotation_frame is not None:
@@ -1801,6 +1815,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_dict['loss_ellipse2d_corner'] = losses_ellipse2d_corner[-1]
         if self.loss_ellipse2d_angle is not None:
             loss_dict['loss_ellipse2d_angle'] = losses_ellipse2d_angle[-1]
+        if self.loss_ellipse2d_centre is not None:
+            loss_dict['loss_ellipse2d_centre'] = losses_ellipse2d_centre[-1]
         if self._uses_auxiliary_chain:
             loss_dict['loss_size_chain'] = losses_size_chain[-1]
             loss_dict['loss_rotation_chain'] = losses_rotation_chain[-1]
@@ -1848,6 +1864,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             if self.loss_ellipse2d_angle is not None:
                 loss_dict[f'd{num_dec_layer}.loss_ellipse2d_angle'] = \
                     losses_ellipse2d_angle[i]
+            if self.loss_ellipse2d_centre is not None:
+                loss_dict[f'd{num_dec_layer}.loss_ellipse2d_centre'] = \
+                    losses_ellipse2d_centre[i]
             if self._uses_auxiliary_chain:
                 loss_dict[f'd{num_dec_layer}.loss_size_chain'] = losses_size_chain[i]
                 loss_dict[f'd{num_dec_layer}.loss_rotation_chain'] = losses_rotation_chain[i]
@@ -2478,6 +2497,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         loss_ellipse2d = z_preds.new_tensor(0.0)
         loss_ellipse2d_corner = z_preds.new_tensor(0.0)
         loss_ellipse2d_angle = z_preds.new_tensor(0.0)
+        loss_ellipse2d_centre = z_preds.new_tensor(0.0)
         if ellipse_cholesky is not None:
             loss_ellipse2d = self.loss_ellipse2d(
                 ellipse_mean, ellipse_cholesky, obb_gaussian_targets,
@@ -2489,6 +2509,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             if self.loss_ellipse2d_angle is not None:
                 loss_ellipse2d_angle = self.loss_ellipse2d_angle(
                     ellipse_sigma, obb_gaussian_targets,
+                    weight=obb_gaussian_weights, avg_factor=num_total_pos)
+            if self.loss_ellipse2d_centre is not None:
+                loss_ellipse2d_centre = self.loss_ellipse2d_centre(
+                    ellipse_mean, obb_gaussian_targets,
                     weight=obb_gaussian_weights, avg_factor=num_total_pos)
 
         # ── GauCho-3D ellipsoid losses ────────────────────────────────
@@ -2600,7 +2624,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 loss_size_chain, loss_rotation_chain, loss_z_chain,
                 loss_ellipsoid, loss_ellipsoid_projection, loss_ellipse2d,
                 loss_ellipsoid_max_axis, loss_ellipse2d_corner,
-                loss_ellipse2d_angle)
+                loss_ellipse2d_angle, loss_ellipse2d_centre)
 
     def get_targets(self, cls_scores_list: List[Tensor], bbox_preds_list: List[Tensor],
                     centers_2d_preds_list: List[Tensor], z_preds_list: List[Tensor],
