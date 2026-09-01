@@ -391,9 +391,18 @@ class GauCho3DSharedMatchMetric(BaseMetric):
                  match_iou_threshold: float = 0.50,
                  iou_3d_thresholds: Sequence[float] = (0.10, 0.20, 0.25, 0.50),
                  num_classes: int = 1,
+                 depth_oracle: bool = False,
                  collect_device: str = "cpu",
                  prefix: Optional[str] = None) -> None:
         super().__init__(collect_device=collect_device, prefix=prefix)
+        # Replaces only the *range* of each matched prediction with the
+        # annotation's, keeping its bearing, its shape and everything
+        # else.  The 3D residual is entirely range -- 21.9 mm along the
+        # line of sight against 2.2 mm across it, on 18 mm objects -- and
+        # the depth channel already holds that answer to within 5.7 mm at
+        # the annotated centre.  This says what fixing the depth branch
+        # would be worth before the architecture is changed for it.
+        self.depth_oracle = bool(depth_oracle)
         if not 0.0 < match_iou_threshold <= 1.0:
             raise ValueError("match_iou_threshold must lie in (0, 1]")
         if nms_iou_threshold is not None and not 0.0 < nms_iou_threshold <= 1.0:
@@ -469,6 +478,15 @@ class GauCho3DSharedMatchMetric(BaseMetric):
             for (pred_index, gt_index, iou), margin in zip(pairs, margins):
                 predicted_center = frame["pred_centers"][pred_index].astype(
                     np.float64)
+                if self.depth_oracle:
+                    target_range = float(np.linalg.norm(
+                        frame["gt_centers"][gt_index].astype(np.float64)))
+                    predicted_range = float(np.linalg.norm(
+                        predicted_center))
+                    if predicted_range > 0.0:
+                        predicted_center = (predicted_center
+                                            / predicted_range
+                                            * target_range)
                 predicted_sigma = 0.5 * (
                     frame["pred_sigmas"][pred_index].astype(np.float64)
                     + frame["pred_sigmas"][pred_index].astype(np.float64).T)

@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any, Optional, Sequence
 
 import torch
-from mmcv.ops import nms_rotated
+from mmcv.ops import box_iou_rotated, nms_rotated
 
 from yopo.registry import METRICS
 
@@ -25,6 +25,7 @@ from .rotated_iou_metric import RotatedIoUMetric, _as_cpu_tensor, _field
 __all__ = [
     "EllipseEnvelopeRotatedIoUMetric",
     "compact_gaussian_to_obb",
+    "ellipse_error_decomposition",
     "rescale_compact_gaussian",
 ]
 
@@ -83,6 +84,36 @@ def compact_gaussian_to_obb(compact: torch.Tensor) -> torch.Tensor:
     return torch.stack((cx, cy, 2.0 * major, 2.0 * minor, theta), dim=-1)
 
 
+
+def ellipse_error_decomposition(predicted: torch.Tensor,
+                                target: torch.Tensor) -> dict:
+    """Split the gap between two matched rotated boxes into its causes.
+
+    A single mean IoU says a prediction is loose without saying how.  Raising
+    the ellipse loss weight threefold moved the matched IoU by 0.0006, which
+    means the residual is structural rather than a matter of optimisation
+    pressure -- so it has to be decomposed before anything else is tried.
+
+    Both inputs are ``(cx, cy, w, h, theta)`` with ``w >= h`` by construction of
+    :func:`compact_gaussian_to_obb`.  Angles are compared modulo pi, because an
+    extent has no front and a box rotated by pi is the same box.
+    """
+    centre_error = (predicted[:, :2] - target[:, :2]).norm(dim=-1)
+    target_scale = (target[:, 2] * target[:, 3]).clamp_min(1e-9).sqrt()
+    angle = (predicted[:, 4] - target[:, 4]).remainder(torch.pi)
+    angle = torch.minimum(angle, torch.pi - angle)
+    return {
+        "centre_error_px": centre_error,
+        "centre_error_rel": centre_error / target_scale,
+        "long_ratio": predicted[:, 2] / target[:, 2].clamp_min(1e-9),
+        "short_ratio": predicted[:, 3] / target[:, 3].clamp_min(1e-9),
+        "area_ratio": ((predicted[:, 2] * predicted[:, 3])
+                       / (target[:, 2] * target[:, 3]).clamp_min(1e-9)),
+        "aspect_ratio_pred": predicted[:, 2] / predicted[:, 3].clamp_min(1e-9),
+        "aspect_ratio_gt": target[:, 2] / target[:, 3].clamp_min(1e-9),
+        "angle_error_deg": angle * (180.0 / torch.pi),
+    }
+
 @METRICS.register_module()
 class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
     """Rotated AP between predicted ellipse envelopes and annotated OBBs.
@@ -103,14 +134,26 @@ class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
     defaults to ``score_thr=0.2`` with ``nms_cfg=dict(type="nms",
     iou_threshold=0.5)``.  Scoring an unsuppressed 256-query emission against
     those is not a like-for-like comparison.
+
+    ``geometry_oracle`` answers a different question from the rest of this
+    class: not how good the geometry is, but how much of the remaining gap
+    it could possibly close.  Every prediction that overlaps an annotation
+    at all has its box replaced by that annotation's box, while its score,
+    its class and its existence as a duplicate are left alone.  The
+    resulting AP is what this detector would score with *perfect* ellipse
+    geometry, so the distance from there to the target is the part geometry
+    cannot reach -- detection, ranking and duplication.  A recall at a loose
+    IoU threshold is not the same thing and does not bound the achievable AP.
     """
 
     def __init__(self,
                  pred_field: str = "ellipse_obb",
                  gt_field: str = "obb_gaussians",
                  nms_iou_threshold: Optional[float] = None,
+                 geometry_oracle: bool = False,
                  **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self.geometry_oracle = bool(geometry_oracle)
         if nms_iou_threshold is not None and not 0.0 < nms_iou_threshold <= 1.0:
             raise ValueError(
                 "nms_iou_threshold must be in (0, 1] or None, got "
@@ -183,6 +226,24 @@ class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
                 _as_cpu_tensor(_field(pred, "labels"), torch.long),
             )
 
+            if self.geometry_oracle and len(pred_boxes) and len(gt_boxes):
+                gt_labels_cpu = _as_cpu_tensor(
+                    _field(gt, "labels"), torch.long)
+                ious = box_iou_rotated(pred_boxes.float(),
+                                       gt_boxes.float(), mode="iou",
+                                       aligned=False, clockwise=True)
+                same_class = (pred_labels[:, None]
+                              == gt_labels_cpu[None, :])
+                ious = torch.where(same_class, ious,
+                                   torch.zeros_like(ious))
+                best_iou, best_gt = ious.max(dim=1)
+                # Only a prediction that already touches its object is
+                # snapped; one that overlaps nothing is a false positive no
+                # geometry can rescue, and leaving it keeps that honest.
+                touches = best_iou > 0
+                pred_boxes = pred_boxes.clone()
+                pred_boxes[touches] = gt_boxes[best_gt[touches]]
+
             self.results.append(
                 dict(
                     pred_bboxes=pred_boxes,
@@ -194,3 +255,73 @@ class EllipseEnvelopeRotatedIoUMetric(RotatedIoUMetric):
                     ignore_bboxes=torch.empty((0, 5)),
                     ignore_labels=torch.empty((0,), dtype=torch.long),
                 ))
+
+    def compute_metrics(self, results: list) -> dict:
+        """Ranked AP, plus a breakdown of where the residual overlap goes.
+
+        A mean matched IoU of 0.70 says predictions are loose without saying
+        how, and tripling the ellipse loss weight moved it by 0.0006 -- so the
+        residual is structural, and the only way forward is to see whether it
+        sits in the centre, the extent, or the orientation.  The matching here
+        is the same greedy, score-ordered, one-GT-per-prediction rule the AP
+        above uses, so the decomposition describes exactly the pairs that were
+        counted as true positives.
+        """
+        metrics = super().compute_metrics(results)
+
+        decomposed: dict[str, list[torch.Tensor]] = {}
+        for result in results:
+            predicted = result['pred_bboxes']
+            target = result['gt_bboxes']
+            if predicted.numel() == 0 or target.numel() == 0:
+                continue
+            keep = result['pred_scores'] >= self.score_thr
+            if not bool(keep.any()):
+                continue
+            predicted = predicted[keep]
+            scores = result['pred_scores'][keep]
+            ious = box_iou_rotated(predicted.float(), target.float(),
+                                   mode='iou', aligned=False, clockwise=True)
+            taken = torch.zeros(len(target), dtype=torch.bool)
+            pairs: list[tuple[int, int]] = []
+            for index in torch.argsort(scores, descending=True).tolist():
+                candidates = torch.where(taken, torch.full_like(ious[index], -1.0),
+                                         ious[index])
+                best = int(candidates.argmax())
+                if float(candidates[best]) >= self.iou_thr:
+                    taken[best] = True
+                    pairs.append((index, best))
+            if not pairs:
+                continue
+            pred_index = torch.tensor([a for a, _ in pairs])
+            gt_index = torch.tensor([b for _, b in pairs])
+            for key, value in ellipse_error_decomposition(
+                    predicted[pred_index], target[gt_index]).items():
+                decomposed.setdefault(key, []).append(value)
+
+        for key, chunks in decomposed.items():
+            values = torch.cat(chunks)
+            metrics[f'{key}_median'] = float(values.median())
+            metrics[f'{key}_p90'] = float(values.quantile(0.9))
+
+        # Is the orientation error reducible at all?  For a near-circular
+        # annotation the OBB's orientation is barely identified -- the
+        # annotator's choice is close to arbitrary -- so an angle error there
+        # is a property of the data, not a deficiency of the model.  Splitting
+        # the angle error by the *ground truth* aspect ratio separates the two:
+        # if elongated objects are already accurate and only round ones are
+        # wrong, there is nothing left to learn.
+        if 'angle_error_deg' in decomposed and 'aspect_ratio_gt' in decomposed:
+            angle = torch.cat(decomposed['angle_error_deg'])
+            aspect = torch.cat(decomposed['aspect_ratio_gt'])
+            for low, high, name in ((1.0, 1.1, 'round'),
+                                    (1.1, 1.3, 'mid'),
+                                    (1.3, 1.6, 'oval'),
+                                    (1.6, float('inf'), 'elongated')):
+                band = (aspect >= low) & (aspect < high)
+                count = int(band.sum())
+                metrics[f'angle_by_aspect_{name}_count'] = float(count)
+                if count:
+                    metrics[f'angle_by_aspect_{name}_median'] = float(
+                        angle[band].median())
+        return metrics
