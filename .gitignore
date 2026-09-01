@@ -121,3 +121,6 @@ work_dirs/
 *.pth
 *.py~
 *.sh~
+
+# Conversation transcripts extracted for review; not source.
+temp/session_extracts/
