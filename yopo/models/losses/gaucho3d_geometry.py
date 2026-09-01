@@ -51,6 +51,8 @@ __all__ = [
     "block_cholesky3d",
     "sigma_from_cholesky",
     "ellipsoid_from_rotation_size",
+    "clamp_sigma_max_axis",
+    "ellipsoid_max_diameter",
     "ellipsoid_to_dual_quadric",
     "project_dual_quadric",
     "dual_conic_to_gaussian",
@@ -354,6 +356,56 @@ def ellipsoid_from_rotation_size(rotation: Tensor, size: Tensor) -> Tensor:
     radii_squared = (size * 0.5).square()
     sigma = rotation @ torch.diag_embed(radii_squared) @ rotation.transpose(-1, -2)
     return (sigma + sigma.transpose(-1, -2)) * 0.5
+
+
+def clamp_sigma_max_axis(sigma: Tensor, max_diameter: float, *,
+                         eps: float = DEFAULT_EPS):
+    """Cap the longest axis of an ellipsoid at a physical bound.
+
+    A soft training penalty makes an over-large ellipsoid expensive; it cannot
+    make one impossible, because a finite loss always has a finite optimum that
+    may sit past the bound.  Where the bound is a fact about the world rather
+    than a preference -- these fruit do not exceed 5 cm -- the guarantee belongs
+    at the output.
+
+    ``Sigma``'s eigenvalues are the squared semi-axes, so capping them at
+    ``(max_diameter/2)^2`` and reassembling caps the extent while leaving the
+    orientation and the shorter axes untouched.  Rows that were already inside
+    the bound are returned unmodified rather than reassembled, so the operation
+    is exactly the identity on them.
+
+    This is an inference-time projection.  It is deliberately not part of any
+    training graph: ``eigh``'s backward divides by eigenvalue gaps and would
+    produce NaN for the near-spherical shapes this data is full of.
+
+    Returns ``(clamped_sigma, was_clamped)``.
+    """
+    if not max_diameter > 0.0:
+        raise ValueError(f"max_diameter must be positive, got {max_diameter}")
+    _check_matrix(sigma, 3, "sigma")
+    symmetric = (sigma + sigma.transpose(-1, -2)) * 0.5
+    eigenvalues, eigenvectors = torch.linalg.eigh(symmetric)
+    limit = (0.5 * max_diameter) ** 2
+    was_clamped = eigenvalues[..., -1] > limit
+    capped = eigenvalues.clamp(min=eps, max=limit)
+    rebuilt = (eigenvectors @ torch.diag_embed(capped)
+               @ eigenvectors.transpose(-1, -2))
+    rebuilt = (rebuilt + rebuilt.transpose(-1, -2)) * 0.5
+    return torch.where(was_clamped[..., None, None], rebuilt,
+                       symmetric), was_clamped
+
+
+def ellipsoid_max_diameter(sigma: Tensor, *, eps: float = DEFAULT_EPS) -> Tensor:
+    """Full extent of the ellipsoid along its longest axis: ``2 sqrt(lambda_max)``.
+
+    ``eigvalsh`` rather than ``eigh``: with eigenvectors discarded the backward
+    is ``V diag(g) V^T`` and never divides by an eigenvalue gap, so this stays
+    finite for a sphere.  ``tests/test_gaucho3d_max_axis.py`` pins that.
+    """
+    _check_matrix(sigma, 3, "sigma")
+    symmetric = (sigma + sigma.transpose(-1, -2)) * 0.5
+    largest = torch.linalg.eigvalsh(symmetric)[..., -1]
+    return 2.0 * largest.clamp_min(eps).sqrt()
 
 
 def ellipsoid_to_dual_quadric(center: Tensor, sigma: Tensor) -> Tensor:

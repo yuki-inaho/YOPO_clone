@@ -12,7 +12,7 @@ from .iou2d_calculator import (BboxOverlaps2D, BboxOverlaps2D_GLIP,
 from .match_cost import (BBoxL1Cost, BinaryFocalLossCost, ClassificationCost,
                          CrossEntropyLossCost, DiceCost, FocalLossCost,
                          IoUCost, RBoxL1Cost, CenterL1Cost, GDCost,
-                         OBBChamferCost, RotatedIoUCost)
+                         Ellipse2DKLDCost, OBBChamferCost, RotatedIoUCost)
 from .max_iou_assigner import MaxIoUAssigner
 from .multi_instance_assigner import MultiInstanceAssigner
 from .point_assigner import PointAssigner
@@ -34,6 +34,6 @@ __all__ = [
     'DynamicSoftLabelAssigner',
     'MultiInstanceAssigner', 'BboxOverlaps2D_GLIP',
     'O2MHungarianAssigner', 'RBoxL1Cost', 'CenterL1Cost', 'GDCost',
-    'RotatedIoUCost',
+    'RotatedIoUCost', 'Ellipse2DKLDCost',
     'OBBChamferCost',
 ]

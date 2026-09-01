@@ -27,6 +27,7 @@ from torch import Tensor, nn
 from yopo.registry import MODELS
 from .gaucho3d_geometry import (
     DEFAULT_EPS,
+    ellipsoid_max_diameter,
     obb_gaussian_to_cholesky2d,
     project_ellipsoid_dual_quadric,
     ray_ellipsoid_roots,
@@ -45,6 +46,7 @@ __all__ = [
     "ellipsoid_gwd",
     "Ellipsoid3DKLDLoss",
     "Ellipsoid3DGWDLoss",
+    "EllipsoidMaxAxisLoss",
     "DualQuadricProjectionGWDLoss",
     "DualConicResidualLoss",
     "RayEllipsoidSurfaceLoss",
@@ -203,7 +205,12 @@ class _WeightedLoss(nn.Module):
         avg_factor: Optional[int],
         name: str,
     ) -> Tensor:
-        invalid_count = (~valid).sum()
+        # Background and otherwise unsupervised rows commonly carry a zero
+        # placeholder covariance.  They are not "invalid positive samples";
+        # only geometry that has non-zero supervision weight may trigger the
+        # hard-failure policy.
+        active = weight > 0
+        invalid_count = (active & ~valid).sum()
         self.last_invalid_count = invalid_count.detach()
         if self.fail_on_invalid:
             # ``.item()`` forces a device sync, so it is only paid when the
@@ -329,6 +336,71 @@ class Ellipsoid3DGWDLoss(_WeightedLoss):
         return self._finalize(
             per_sample, weight, valid, reduction, avg_factor,
             "Ellipsoid3DGWDLoss")
+
+
+@MODELS.register_module()
+class EllipsoidMaxAxisLoss(nn.Module):
+    """One-sided penalty on an ellipsoid longer than the objects can physically be.
+
+    This encodes a fact about the world, not a preference about shape: the fruit
+    in this dataset do not exceed roughly 5 cm across.  The penalty is exactly
+    zero below the bound, so it never competes with the shape KLD on the 99% of
+    annotations that are 2--4 cm; it only removes the escape route that the KLD
+    centre term was previously paying for, where an ellipsoid grows along the
+    line of sight until it covers a centre it could not place correctly.
+
+    A soft term cannot guarantee the bound -- see
+    :func:`clamp_sigma_max_axis` for the inference-time projection that does.
+    The two are meant to be used together: learn the constraint, then enforce it.
+
+    ``ReLU(d/d_max - 1)^2`` rather than a hinge on the raw excess so the units
+    are relative and the gradient vanishes smoothly at the boundary instead of
+    switching on discontinuously.
+    """
+
+    def __init__(
+        self,
+        max_diameter: float = 0.05,
+        loss_weight: float = 0.25,
+        reduction: str = "mean",
+        eps: float = DEFAULT_EPS,
+    ) -> None:
+        super().__init__()
+        if not max_diameter > 0.0:
+            raise ValueError(
+                f"max_diameter must be positive, got {max_diameter}")
+        _check_reduction(reduction)
+        self.max_diameter = float(max_diameter)
+        self.loss_weight = float(loss_weight)
+        self.reduction = reduction
+        self.eps = float(eps)
+        self.last_violation_count = None
+
+    def forward(
+        self,
+        predicted_cholesky: Tensor,
+        weight: Optional[Tensor] = None,
+        avg_factor: Optional[int] = None,
+        reduction_override: Optional[str] = None,
+    ) -> Tensor:
+        reduction = reduction_override or self.reduction
+        _check_reduction(reduction)
+        sigma = sigma_from_cholesky(predicted_cholesky)
+        diameter = ellipsoid_max_diameter(sigma, eps=self.eps)
+        violation = torch.relu(diameter / self.max_diameter - 1.0)
+        self.last_violation_count = (violation > 0).sum().detach()
+        if weight is None:
+            weight = violation.new_ones(violation.shape)
+        if weight.ndim > violation.ndim:
+            weight = weight.mean(dim=-1)
+        # A non-finite factor cannot be allowed to poison the batch; it is
+        # dropped here rather than clamped, so the count stays honest.
+        finite = torch.isfinite(violation)
+        per_sample = torch.where(finite, violation.square(),
+                                 torch.zeros_like(violation))
+        return self.loss_weight * weight_reduce_loss(
+            per_sample, weight * finite.to(weight.dtype), reduction=reduction,
+            avg_factor=avg_factor)
 
 
 @MODELS.register_module()

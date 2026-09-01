@@ -8,6 +8,10 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from yopo.models.losses.gaucho3d_geometry import (
+    obb_gaussian_to_cholesky2d,
+)
+from yopo.models.losses.gaucho3d_loss import ellipse_kld_from_cholesky
 from yopo.models.losses.projected_ellipsoid_loss import (
     gaussian_wasserstein_distance,
 )
@@ -71,10 +75,12 @@ class MatchabilityQualityPolicy(nn.Module):
     Args:
         num_classes: Foreground class count.  Labels in
             ``[0, num_classes - 1]`` are matched positives.
-        source: ``'hbb_iou'``, ``'obb_gwd'``, or ``'blend'``.
+        source: ``'hbb_iou'``, ``'obb_gwd'``, ``'blend'``,
+            ``'ellipse_kld'``, or ``'ellipse_kld_blend'``.
         obb_weight: OBB fraction in ``'blend'`` mode.
         normalize: Normalize Gaussian Wasserstein distance by Gaussian scale.
         include_center: Include compact-Gaussian center displacement in GWD.
+        ellipse_symmetric: Average both KLD directions for ellipse quality.
         tau: GWD quality denominator in ``1 / (tau + distance)``.  It must be
             at least one so the quality cannot exceed one.
         missing_obb: Behavior when an OBB-dependent source receives no OBB
@@ -84,7 +90,9 @@ class MatchabilityQualityPolicy(nn.Module):
         eps: Numerical threshold forwarded to GWD validity checks.
     """
 
-    _SOURCES = frozenset({'hbb_iou', 'obb_gwd', 'blend'})
+    _SOURCES = frozenset({
+        'hbb_iou', 'obb_gwd', 'blend',
+        'ellipse_kld', 'ellipse_kld_blend'})
     _MISSING_OBB = frozenset({'error', 'hbb_iou'})
 
     def __init__(self,
@@ -93,6 +101,7 @@ class MatchabilityQualityPolicy(nn.Module):
                  obb_weight: float = 0.5,
                  normalize: bool = True,
                  include_center: bool = False,
+                 ellipse_symmetric: bool = True,
                  tau: float = 1.0,
                  missing_obb: str = 'error',
                  fail_on_invalid: bool = True,
@@ -121,6 +130,7 @@ class MatchabilityQualityPolicy(nn.Module):
         self.obb_weight = float(obb_weight)
         self.normalize = bool(normalize)
         self.include_center = bool(include_center)
+        self.ellipse_symmetric = bool(ellipse_symmetric)
         self.tau = float(tau)
         self.missing_obb = missing_obb
         self.fail_on_invalid = bool(fail_on_invalid)
@@ -244,6 +254,61 @@ class MatchabilityQualityPolicy(nn.Module):
         quality[positive] = selected_quality.to(dtype=quality.dtype)
         return quality.detach()
 
+    def _ellipse_quality(self,
+                         labels: Tensor,
+                         hbb_quality: Tensor,
+                         predictions: Tensor | None,
+                         targets: Tensor | None) -> Tensor:
+        """Symmetric GauCho KLD quality on aligned positive queries."""
+        if (predictions is None) != (targets is None):
+            raise ValueError(
+                'obb_predictions and obb_targets must be provided together')
+        if predictions is None:
+            if self.missing_obb == 'hbb_iou':
+                return hbb_quality
+            raise ValueError(
+                f'source={self.source!r} requires compact Gaussian ellipse '
+                'inputs; set missing_obb="hbb_iou" for an explicit fallback')
+
+        self._validate_obb_pair(labels, predictions, targets)
+        positive = _positive_mask(labels.detach(), self.num_classes)
+        quality = hbb_quality.new_zeros(len(labels))
+        if not bool(positive.any().item()):
+            return quality.detach()
+
+        work_predictions = _low_precision_to_float(
+            predictions.detach()[positive])
+        work_targets = _low_precision_to_float(targets.detach()[positive])
+        pred_mean, pred_cholesky, pred_valid = \
+            obb_gaussian_to_cholesky2d(work_predictions, eps=self.eps)
+        target_mean, target_cholesky, target_valid = \
+            obb_gaussian_to_cholesky2d(work_targets, eps=self.eps)
+        if not self.include_center:
+            pred_mean = target_mean
+        distance = ellipse_kld_from_cholesky(
+            pred_mean, pred_cholesky, target_mean, target_cholesky,
+            eps=self.eps)
+        if self.ellipse_symmetric:
+            reverse = ellipse_kld_from_cholesky(
+                target_mean, target_cholesky, pred_mean, pred_cholesky,
+                eps=self.eps)
+            distance = 0.5 * (distance + reverse)
+        valid = pred_valid & target_valid & torch.isfinite(distance)
+        if self.fail_on_invalid and bool((~valid).any().item()):
+            raise RuntimeError(
+                'matchability quality received '
+                f'{int((~valid).sum().item())}/{int(valid.numel())} invalid '
+                'positive compact Gaussian ellipse pairs')
+
+        selected_quality = 1.0 / (self.tau + distance)
+        selected_quality = torch.nan_to_num(
+            selected_quality, nan=0.0, posinf=1.0, neginf=0.0)
+        selected_quality = torch.where(
+            valid, selected_quality.clamp(min=0.0, max=1.0),
+            torch.zeros_like(selected_quality))
+        quality[positive] = selected_quality.to(dtype=quality.dtype)
+        return quality.detach()
+
     def forward(self,
                 labels: Tensor,
                 bbox_predictions: Tensor,
@@ -261,18 +326,24 @@ class MatchabilityQualityPolicy(nn.Module):
         if self.source == 'blend' and self.obb_weight == 0.0:
             return hbb_quality
 
-        obb_quality = self._obb_quality(
-            labels, hbb_quality, obb_predictions, obb_targets)
+        ellipse_source = self.source in {
+            'ellipse_kld', 'ellipse_kld_blend'}
+        quality_from_geometry = (
+            self._ellipse_quality(
+                labels, hbb_quality, obb_predictions, obb_targets)
+            if ellipse_source else
+            self._obb_quality(
+                labels, hbb_quality, obb_predictions, obb_targets))
         if obb_predictions is None:
             # Explicit HBB fallback is a full policy fallback, rather than an
             # artificial blend that scales valid HBB quality by 1 - weight.
-            return obb_quality
-        if self.source == 'obb_gwd':
-            return obb_quality
+            return quality_from_geometry
+        if self.source in {'obb_gwd', 'ellipse_kld'}:
+            return quality_from_geometry
 
         quality = (
             (1.0 - self.obb_weight) * hbb_quality
-            + self.obb_weight * obb_quality)
+            + self.obb_weight * quality_from_geometry)
         positive = _positive_mask(labels, self.num_classes)
         quality = torch.where(
             positive, quality.clamp(min=0.0, max=1.0),

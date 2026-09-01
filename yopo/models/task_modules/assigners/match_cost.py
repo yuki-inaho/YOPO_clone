@@ -1425,6 +1425,108 @@ class GDCost(BaseMatchCost):
 
 
 @TASK_UTILS.register_module()
+class Ellipse2DKLDCost(BaseMatchCost):
+    """Match cost on the GauCho ellipse, so matching sees what is evaluated.
+
+    The assigner currently selects queries on the horizontal box alone -- focal
+    score, L1 and GIoU -- and the ellipse loss is then applied to whatever it
+    picked.  When the reported metric is a rotated ellipse envelope, the choice
+    of *which* query owns an annotation is being made by a criterion blind to
+    orientation and elongation, which is the property being scored.
+
+    Symmetric KLD by default, not the loss's one-sided direction.
+    ``D_KL(gt || pred)`` alone is reduced by predicting a large, vague ellipse
+    that merely covers the annotation, so a one-sided cost would prefer exactly
+    the oversized predictions this work removed from the 3D branch.  The
+    symmetric form penalizes covering as well as missing.
+
+    Consumes ``pred_instances.ellipse_gaussians`` -- compact Gaussians
+    ``(x, y, sigma_xx, sigma_xy, sigma_yy)`` shaped ``(num_queries,
+    num_classes, 5)`` -- and pairs each annotation against the prediction for
+    *its own* class, so a classwise head is scored on the branch that would
+    actually be read out for that label.
+    """
+
+    def __init__(self,
+                 weight: Union[float, int] = 1.0,
+                 tau: float = 1.0,
+                 symmetric: bool = True,
+                 eps: float = 1e-7) -> None:
+        super().__init__(weight=weight)
+        if tau < 1.0:
+            raise ValueError(f"tau must be at least one, got {tau}")
+        self.tau = float(tau)
+        self.symmetric = bool(symmetric)
+        self.eps = float(eps)
+
+    def __call__(self,
+                 pred_instances: InstanceData,
+                 gt_instances: InstanceData,
+                 img_meta: Optional[dict] = None,
+                 **kwargs) -> Tensor:
+        from yopo.models.losses.gaucho3d_geometry import (
+            obb_gaussian_to_cholesky2d)
+        from yopo.models.losses.gaucho3d_loss import ellipse_kld_from_cholesky
+
+        if not hasattr(pred_instances, "ellipse_gaussians"):
+            raise KeyError(
+                "Ellipse2DKLDCost needs pred_instances.ellipse_gaussians; the "
+                "head attaches it only when gaucho_ellipse2d is enabled")
+        gaussians = pred_instances.ellipse_gaussians
+        if gaussians.ndim != 3 or gaussians.shape[-1] != 5:
+            raise ValueError(
+                "ellipse_gaussians must have shape (num_queries, num_classes, "
+                f"5), got {tuple(gaussians.shape)}")
+        compact_gt = gt_instances.obb_gaussians
+        labels = gt_instances.labels.long()
+        num_pred, num_gt = gaussians.shape[0], compact_gt.shape[0]
+        if num_pred == 0 or num_gt == 0:
+            return gaussians.new_zeros((num_pred, num_gt))
+
+        # Triangular solve and log have no bfloat16 CUDA kernel, and matching
+        # runs inside the autocast region of the forward pass.
+        with torch.autocast(device_type=gaussians.device.type, enabled=False):
+            # Class selection collapses the cross product to (N, M) directly:
+            # annotation j is only ever compared against the branch for its own
+            # label, never against a class it does not belong to.
+            selected = gaussians.float()[:, labels, :]
+            mean_p, cholesky_p, valid_p = obb_gaussian_to_cholesky2d(
+                selected.reshape(-1, 5), eps=self.eps)
+            mean_p = mean_p.view(num_pred, num_gt, 2)
+            cholesky_p = cholesky_p.view(num_pred, num_gt, 2, 2)
+            valid_p = valid_p.view(num_pred, num_gt)
+
+            mean_g, cholesky_g, valid_g = obb_gaussian_to_cholesky2d(
+                compact_gt.float(), eps=self.eps)
+            mean_g = mean_g.unsqueeze(0).expand(num_pred, num_gt, 2)
+            cholesky_g = cholesky_g.unsqueeze(0).expand(
+                num_pred, num_gt, 2, 2)
+
+            # A degenerate Gaussian on either side has no ellipse to compare.
+            # Both are replaced with the identity so the solve stays finite,
+            # and the pair is zeroed afterwards -- this term abstains rather
+            # than pushing a NaN through the assignment.
+            identity = torch.eye(2, dtype=cholesky_p.dtype,
+                                 device=cholesky_p.device)
+            usable = valid_p & valid_g.unsqueeze(0).expand(num_pred, num_gt)
+            safe_p = torch.where(usable[..., None, None], cholesky_p, identity)
+            safe_g = torch.where(usable[..., None, None], cholesky_g, identity)
+
+            distance = ellipse_kld_from_cholesky(
+                mean_p, safe_p, mean_g, safe_g, eps=self.eps)
+            if self.symmetric:
+                distance = 0.5 * (distance + ellipse_kld_from_cholesky(
+                    mean_g, safe_g, mean_p, safe_p, eps=self.eps))
+            # Bounded into [0, 1) exactly as ``Ellipse2DKLDLoss`` bounds its
+            # own distance, so no single pair can dominate the focal and L1
+            # terms this cost sits beside.
+            bounded = 1.0 - 1.0 / (self.tau + distance.clamp_min(0.0))
+            bounded = torch.where(usable & torch.isfinite(bounded), bounded,
+                                  torch.zeros_like(bounded))
+            return bounded * self.weight
+
+
+@TASK_UTILS.register_module()
 class RotatedIoUCost(BaseMatchCost):
     """Rotated IoU match cost for rotated bboxes."""
 

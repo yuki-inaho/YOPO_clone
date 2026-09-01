@@ -22,6 +22,7 @@ from ..layers import inverse_sigmoid
 from ..losses import QualityFocalLoss
 from ..losses.gaucho3d_geometry import (cholesky3d_from_raw,
                                         dual_plane_cholesky3d,
+                                        clamp_sigma_max_axis,
                                         ellipsoid_from_rotation_size,
                                         front_margin,
                                         gaussian_to_ellipse2d,
@@ -232,10 +233,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             gaucho_classwise: bool = True,
             gaucho_use_bbox_conditioning: bool = True,
             gaucho_ellipse2d: bool = False,
+            gaucho_ellipse2d_dn: bool = False,
             expose_gaucho_predictions: bool = False,
             loss_ellipse2d: ConfigType = None,
             loss_ellipsoid: ConfigType = None,
             loss_ellipsoid_projection: ConfigType = None,
+            loss_ellipsoid_max_axis: ConfigType = None,
+            ellipsoid_gt_max_diameter: float = None,
+            ellipsoid_max_diameter: float = None,
             distill_attributes: Tuple[str, ...] = (),
             center_teacher_source: str = 'pose_center',
             obb_center_teacher_checkpoint: str = None,
@@ -281,6 +286,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             self.assigner = TASK_UTILS.build(assigner)
             if train_cfg.get('sampler', None) is not None:
                 raise RuntimeError('DETR do not build sampler.')
+        self._assigner_uses_ellipse = self._match_costs_use_ellipse(train_cfg)
         self.num_classes = num_classes
         self.embed_dims = embed_dims
         self.num_reg_fcs = num_reg_fcs
@@ -481,6 +487,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.gaucho_use_bbox_conditioning = bool(gaucho_use_bbox_conditioning)
         self.gaucho_eps = 1e-7
         self.gaucho_ellipse2d = bool(gaucho_ellipse2d)
+        self.gaucho_ellipse2d_dn = bool(gaucho_ellipse2d_dn)
         self.expose_gaucho_predictions = bool(expose_gaucho_predictions)
         self.loss_ellipse2d = (
             MODELS.build(loss_ellipse2d)
@@ -488,12 +495,38 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if self.gaucho_ellipse2d != (self.loss_ellipse2d is not None):
             raise ValueError(
                 'gaucho_ellipse2d and loss_ellipse2d must be enabled together')
+        if self.gaucho_ellipse2d_dn and not self.gaucho_ellipse2d:
+            raise ValueError(
+                'gaucho_ellipse2d_dn requires gaucho_ellipse2d=True')
+        if self._assigner_uses_ellipse and not self.gaucho_ellipse2d:
+            raise ValueError(
+                'Ellipse2DKLDCost requires gaucho_ellipse2d=True')
         self.loss_ellipsoid = (
             MODELS.build(loss_ellipsoid)
             if loss_ellipsoid is not None else None)
         self.loss_ellipsoid_projection = (
             MODELS.build(loss_ellipsoid_projection)
             if loss_ellipsoid_projection is not None else None)
+        self.loss_ellipsoid_max_axis = (
+            MODELS.build(loss_ellipsoid_max_axis)
+            if loss_ellipsoid_max_axis is not None else None)
+        # A bound on the physical size of the object, in metres.  Two distinct
+        # jobs, deliberately separate knobs: ``ellipsoid_gt_max_diameter``
+        # drops annotations larger than the objects can be from the 3D shape
+        # supervision, and ``ellipsoid_max_diameter`` caps the emitted
+        # ellipsoid at inference.  Both default to off, so a config that does
+        # not ask for them is bit-identical to before.
+        for name, value in (('ellipsoid_gt_max_diameter',
+                             ellipsoid_gt_max_diameter),
+                            ('ellipsoid_max_diameter', ellipsoid_max_diameter)):
+            if value is not None and not value > 0.0:
+                raise ValueError(f'{name} must be positive, got {value}')
+        self.ellipsoid_gt_max_diameter = ellipsoid_gt_max_diameter
+        self.ellipsoid_max_diameter = ellipsoid_max_diameter
+        if self.loss_ellipsoid_max_axis is not None and \
+                not self.gaucho_ellipsoid:
+            raise ValueError(
+                'loss_ellipsoid_max_axis requires gaucho_ellipsoid=True')
         if not self.gaucho_ellipsoid and (
                 self.loss_ellipsoid is not None or
                 self.loss_ellipsoid_projection is not None):
@@ -1186,6 +1219,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     rows, query_labels]
             cholesky3d = self._gaucho_cholesky(raw3d)
             sigma3d = sigma_from_cholesky(cholesky3d)
+            if self.ellipsoid_max_diameter is not None:
+                # The soft training term makes an oversized ellipsoid
+                # expensive; only this makes it impossible.  Both the corrected
+                # shape and whether it was corrected are exposed, so the clamp
+                # rate is auditable instead of invisible.
+                sigma3d, clamped = clamp_sigma_max_axis(
+                    sigma3d, self.ellipsoid_max_diameter)
+                result.ellipsoid_clamped = clamped
             result.ellipsoid_shapes = sigma3d
             result.ellipsoid_symmetry = symmetry_class(sigma3d)
             if hasattr(result, 'translations'):
@@ -1385,8 +1426,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             all_m_ellipsoid = all_layers_ellipsoid_preds
         if all_layers_ellipse2d_preds is not None and dn_meta is not None:
             n_dn = dn_meta['num_denoising_queries']
+            all_dn_ellipse2d = all_layers_ellipse2d_preds[:, :, :n_dn, :]
             all_m_ellipse2d = all_layers_ellipse2d_preds[:, :, n_dn:, :]
         else:
+            all_dn_ellipse2d = None
             all_m_ellipse2d = all_layers_ellipse2d_preds
 
         loss_dict = self.loss_by_feat_simple(
@@ -1430,13 +1473,23 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         if all_layers_denoising_cls_scores is not None:
             # calculate denoising loss from all decoder layers
-            (dn_losses_cls, dn_losses_bbox, dn_losses_iou,
-             dn_losses_centers_2d, dn_losses_z, dn_losses_rotation, dn_losses_sizes) = \
-            self.loss_dn(all_layers_denoising_cls_scores, all_layers_denoising_bbox_preds,
+            dn_losses = self.loss_dn(all_layers_denoising_cls_scores, all_layers_denoising_bbox_preds,
                         all_layers_denoising_centers_2d_preds, all_layers_denoising_z_preds,
                         all_layers_denoising_rotation_preds, all_layers_denoising_sizes_preds,
                         batch_gt_instances=batch_gt_instances, batch_img_metas=batch_img_metas,
-                        dn_meta=dn_meta)
+                        dn_meta=dn_meta,
+                        all_layers_denoising_ellipse2d_preds=all_dn_ellipse2d)
+            # A subclass or test double may still return the historical
+            # 7-tuple, without the denoising ellipse term.  Tolerated the same
+            # way ``loss_by_feat_single``'s own arity growth is a few lines
+            # below, so that adding a loss never silently becomes a breaking
+            # change for an override.
+            (dn_losses_cls, dn_losses_bbox, dn_losses_iou,
+             dn_losses_centers_2d, dn_losses_z, dn_losses_rotation,
+             dn_losses_sizes) = dn_losses[:7]
+            dn_losses_ellipse2d = (
+                dn_losses[7] if len(dn_losses) > 7
+                else [None] * len(dn_losses_cls))
             # collate denoising loss
             loss_dict['dn_loss_cls'] = dn_losses_cls[-1]
             loss_dict['dn_loss_bbox'] = dn_losses_bbox[-1]
@@ -1445,12 +1498,16 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             loss_dict['dn_loss_z'] = dn_losses_z[-1]
             loss_dict['dn_loss_rotation'] = dn_losses_rotation[-1]
             loss_dict['dn_loss_size'] = dn_losses_sizes[-1]
+            if self.gaucho_ellipse2d_dn:
+                loss_dict['dn_loss_ellipse2d'] = dn_losses_ellipse2d[-1]
 
             for num_dec_layer, (loss_cls_i, loss_bbox_i, loss_iou_i, 
-                               loss_centers_2d_i, loss_z_i, loss_rotation_i, loss_sizes_i) in \
+                               loss_centers_2d_i, loss_z_i, loss_rotation_i,
+                               loss_sizes_i, loss_ellipse2d_i) in \
                     enumerate(zip(dn_losses_cls[:-1], dn_losses_bbox[:-1], dn_losses_iou[:-1],
                                  dn_losses_centers_2d[:-1], dn_losses_z[:-1],
-                                 dn_losses_rotation[:-1], dn_losses_sizes[:-1])):
+                                 dn_losses_rotation[:-1], dn_losses_sizes[:-1],
+                                 dn_losses_ellipse2d[:-1])):
                 loss_dict[f'd{num_dec_layer}.dn_loss_cls'] = loss_cls_i
                 loss_dict[f'd{num_dec_layer}.dn_loss_bbox'] = loss_bbox_i
                 loss_dict[f'd{num_dec_layer}.dn_loss_iou'] = loss_iou_i
@@ -1458,6 +1515,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 loss_dict[f'd{num_dec_layer}.dn_loss_z'] = loss_z_i
                 loss_dict[f'd{num_dec_layer}.dn_loss_rotation'] = loss_rotation_i
                 loss_dict[f'd{num_dec_layer}.dn_loss_size'] = loss_sizes_i
+                if self.gaucho_ellipse2d_dn:
+                    loss_dict[f'd{num_dec_layer}.dn_loss_ellipse2d'] = \
+                        loss_ellipse2d_i
 
         return loss_dict
 
@@ -1545,6 +1605,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         losses_ellipsoid_projection = (
             transposed[13] if len(transposed) > 13 else empty)
         losses_ellipse2d = transposed[14] if len(transposed) > 14 else empty
+        losses_ellipsoid_max_axis = (
+            transposed[15] if len(transposed) > 15 else empty)
 
         losses_rotation_frame = None
         if self.loss_rotation_frame is not None:
@@ -1594,6 +1656,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         if self.loss_ellipsoid_projection is not None:
             loss_dict['loss_ellipsoid_projection'] = \
                 losses_ellipsoid_projection[-1]
+        if self.loss_ellipsoid_max_axis is not None:
+            loss_dict['loss_ellipsoid_max_axis'] = \
+                losses_ellipsoid_max_axis[-1]
         if self._uses_auxiliary_chain:
             loss_dict['loss_size_chain'] = losses_size_chain[-1]
             loss_dict['loss_rotation_chain'] = losses_rotation_chain[-1]
@@ -1632,6 +1697,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             if self.loss_ellipsoid_projection is not None:
                 loss_dict[f'd{num_dec_layer}.loss_ellipsoid_projection'] = \
                     losses_ellipsoid_projection[i]
+            if self.loss_ellipsoid_max_axis is not None:
+                loss_dict[f'd{num_dec_layer}.loss_ellipsoid_max_axis'] = \
+                    losses_ellipsoid_max_axis[i]
             if self._uses_auxiliary_chain:
                 loss_dict[f'd{num_dec_layer}.loss_size_chain'] = losses_size_chain[i]
                 loss_dict[f'd{num_dec_layer}.loss_rotation_chain'] = losses_rotation_chain[i]
@@ -1643,17 +1711,25 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 all_layers_denoising_centers_2d_preds: Tensor, all_layers_denoising_z_preds: Tensor,
                 all_layers_denoising_rotation_preds: Tensor, all_layers_denoising_sizes_preds: Tensor,
                 batch_gt_instances: InstanceList, batch_img_metas: List[dict],
-                dn_meta: Dict[str, int]) -> Tuple[List[Tensor]]:
+                dn_meta: Dict[str, int],
+                all_layers_denoising_ellipse2d_preds: Tensor = None
+                ) -> Tuple[List[Tensor]]:
         """Calculate denoising loss."""
+        ellipse_inputs = (
+            all_layers_denoising_ellipse2d_preds
+            if all_layers_denoising_ellipse2d_preds is not None else
+            [None] * len(all_layers_denoising_cls_scores))
         return multi_apply(self._loss_dn_single, all_layers_denoising_cls_scores,
                           all_layers_denoising_bbox_preds, all_layers_denoising_centers_2d_preds,
                           all_layers_denoising_z_preds, all_layers_denoising_rotation_preds,
-                          all_layers_denoising_sizes_preds, batch_gt_instances=batch_gt_instances,
+                          all_layers_denoising_sizes_preds, ellipse_inputs,
+                          batch_gt_instances=batch_gt_instances,
                           batch_img_metas=batch_img_metas, dn_meta=dn_meta)
 
     def _loss_dn_single(self, dn_cls_scores: Tensor, dn_bbox_preds: Tensor,
                         dn_centers_2d_preds: Tensor, dn_z_preds: Tensor,
                         dn_rotation_preds: Tensor, dn_sizes_preds: Tensor,
+                        dn_ellipse2d_preds: Tensor,
                         batch_gt_instances: InstanceList, batch_img_metas: List[dict],
                         dn_meta: Dict[str, int]) -> Tuple[Tensor]:
         """Denoising loss for outputs from a single decoder layer."""
@@ -1663,6 +1739,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
          dn_z_targets_list, dn_z_weights_list,
          dn_rotation_targets_list, dn_rotation_weights_list,
          dn_sizes_targets_list, dn_sizes_weights_list,
+         dn_obb_gaussian_targets_list, dn_obb_gaussian_weights_list,
          num_total_pos, num_total_neg) = cls_reg_targets
         
         labels = torch.cat(labels_list, 0)
@@ -1677,6 +1754,10 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         rotation_weights = torch.cat(dn_rotation_weights_list, 0)
         sizes_targets = torch.cat(dn_sizes_targets_list, 0)
         sizes_weights = torch.cat(dn_sizes_weights_list, 0)
+        obb_gaussian_targets = torch.cat(
+            dn_obb_gaussian_targets_list, 0)
+        obb_gaussian_weights = torch.cat(
+            dn_obb_gaussian_weights_list, 0)
 
         # classification loss
         cls_scores = dn_cls_scores.reshape(-1, self.cls_out_channels)
@@ -1730,7 +1811,9 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # rotation_preds = dn_rotation_preds.reshape(-1, 6)
         if self.classwise_rotation:
             rotation_preds = dn_rotation_preds.reshape(-1, self.num_classes, self.rot_dim)
-            rotation_preds = rotation_preds[torch.arange(rotation_preds.size(0)), indexing_labels]
+            rotation_preds = rotation_preds[
+                torch.arange(rotation_preds.size(0),
+                             device=rotation_preds.device), indexing_labels]
         else:
             rotation_preds = dn_rotation_preds.reshape(-1, self.rot_dim)
         loss_rotation = self.loss_rotation(rotation_preds, rotation_targets, rotation_weights, labels=labels, avg_factor=num_total_pos)
@@ -1739,12 +1822,32 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # sizes_preds = dn_sizes_preds.reshape(-1, 3)
         if self.classwise_sizes:
             sizes_preds = dn_sizes_preds.reshape(-1, self.num_classes, 3)
-            sizes_preds = sizes_preds[torch.arange(sizes_preds.size(0)), indexing_labels]
+            sizes_preds = sizes_preds[
+                torch.arange(sizes_preds.size(0), device=sizes_preds.device),
+                indexing_labels]
         else:
             sizes_preds = dn_sizes_preds.reshape(-1, 3)
         loss_sizes = self.loss_sizes(sizes_preds, sizes_targets, sizes_weights, avg_factor=num_total_pos)
 
-        return loss_cls, loss_bbox, loss_iou, loss_centers_2d, loss_z, loss_rotation, loss_sizes
+        loss_ellipse2d = dn_bbox_preds.sum() * 0.0
+        if self.gaucho_ellipse2d_dn and dn_ellipse2d_preds is not None:
+            if self.gaucho_classwise:
+                raw2d = dn_ellipse2d_preds.reshape(
+                    -1, self.num_classes, 5)
+                raw2d = raw2d[
+                    torch.arange(raw2d.size(0), device=raw2d.device),
+                    indexing_labels]
+            else:
+                raw2d = dn_ellipse2d_preds.reshape(-1, 5)
+            box_px = (bbox_preds * factors).detach()
+            mean, cholesky, _ = self._decode_gaucho_ellipse2d(
+                raw2d, box_px)
+            loss_ellipse2d = self.loss_ellipse2d(
+                mean, cholesky, obb_gaussian_targets,
+                weight=obb_gaussian_weights, avg_factor=num_total_pos)
+
+        return (loss_cls, loss_bbox, loss_iou, loss_centers_2d, loss_z,
+                loss_rotation, loss_sizes, loss_ellipse2d)
 
     def get_dn_targets(self, batch_gt_instances: InstanceList, batch_img_metas: List[dict],
                        dn_meta: Dict[str, int]) -> tuple:
@@ -1754,6 +1857,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
          z_targets_list, z_weights_list,
          rotation_targets_list, rotation_weights_list,
          sizes_targets_list, sizes_weights_list,
+         obb_gaussian_targets_list, obb_gaussian_weights_list,
          pos_inds_list, neg_inds_list) = multi_apply(
              self._get_dn_targets_single, batch_gt_instances, batch_img_metas, dn_meta=dn_meta)
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
@@ -1763,6 +1867,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 z_targets_list, z_weights_list,
                 rotation_targets_list, rotation_weights_list,
                 sizes_targets_list, sizes_weights_list,
+                obb_gaussian_targets_list, obb_gaussian_weights_list,
                 num_total_pos, num_total_neg)
 
     def _get_dn_targets_single(self, gt_instances: InstanceData, img_meta: dict,
@@ -1820,6 +1925,17 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         sizes_weights = torch.zeros(num_denoising_queries, 3, device=device)
         sizes_weights[pos_inds] = 1.0
 
+        obb_gaussian_targets = torch.zeros(
+            num_denoising_queries, 5, device=device)
+        obb_gaussian_weights = torch.zeros(
+            num_denoising_queries, device=device)
+        if self.gaucho_ellipse2d_dn:
+            if 'obb_gaussians' not in gt_instances:
+                raise KeyError(
+                    'DN ellipse supervision requires '
+                    'gt_instances.obb_gaussians')
+            obb_gaussian_weights[pos_inds] = 1.0
+
         # Set targets for positive samples
         gt_bboxes_normalized = gt_bboxes / factor
         gt_bboxes_targets = bbox_xyxy_to_cxcywh(gt_bboxes_normalized)
@@ -1831,10 +1947,14 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         z_targets[pos_inds] = gt_z.repeat([num_groups, 1])
         rotation_targets[pos_inds] = gt_rotations.repeat([num_groups, 1])
         sizes_targets[pos_inds] = gt_sizes.repeat([num_groups, 1])
+        if self.gaucho_ellipse2d_dn:
+            obb_gaussian_targets[pos_inds] = \
+                gt_instances.obb_gaussians.repeat([num_groups, 1])
 
         return (labels, label_weights, bbox_targets, bbox_weights,
                 centers_2d_targets, centers_2d_weights, z_targets, z_weights,
                 rotation_targets, rotation_weights, sizes_targets, sizes_weights,
+                obb_gaussian_targets, obb_gaussian_weights,
                 pos_inds, neg_inds)
 
     @property
@@ -1876,6 +1996,21 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             return self.gaucho_size_prior * cholesky3d_from_raw(raw)
         return self.gaucho_size_prior * dual_plane_cholesky3d(
             raw, fix_rc_zero=self.gaucho_dual_plane_fix_rc_zero)
+
+    @staticmethod
+    def _match_costs_use_ellipse(train_cfg) -> bool:
+        """Does any configured match cost consume the predicted ellipse?"""
+        if not train_cfg:
+            return False
+        for key in ('assigner', 'encoder_assigner'):
+            assigner = train_cfg.get(key) if hasattr(train_cfg, 'get') else None
+            if not assigner:
+                continue
+            for cost in assigner.get('match_costs', ()) or ():
+                if isinstance(cost, dict) and \
+                        cost.get('type') == 'Ellipse2DKLDCost':
+                    return True
+        return False
 
     def _decode_gaucho_ellipse2d(
             self, raw: Tensor, box_px: Tensor
@@ -1961,11 +2096,16 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         z_preds_list = [z_preds[i] for i in range(num_imgs)]
         rotation_preds_list = [rotation_preds[i] for i in range(num_imgs)]
         sizes_preds_list = [sizes_preds[i] for i in range(num_imgs)]
+        ellipse2d_preds_list = (
+            [ellipse2d_preds[i] for i in range(num_imgs)]
+            if self._assigner_uses_ellipse and ellipse2d_preds is not None
+            else None)
 
         cls_reg_targets = self.get_targets(cls_scores_list, bbox_preds_list,
                                           centers_2d_preds_list, z_preds_list,
                                           rotation_preds_list, sizes_preds_list,  
                                           batch_gt_instances, batch_img_metas,
+                                          ellipse2d_preds_list,
                                           assigner=assigner,
                                           pose_for_matching=pose_supervision)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
@@ -2003,6 +2143,28 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             factors.append(factor)
         factors = torch.cat(factors, 0)
         flat_bbox_preds = bbox_preds.reshape(-1, 4)
+        indexing_labels = labels.clone()
+        indexing_labels[indexing_labels == self.num_classes] = 0
+
+        # Decode the matched class channel once.  The same ellipse then drives
+        # both the KLD regression objective and, when configured, the
+        # matchability score target.  This prevents classification confidence
+        # from continuing to rank only HBB quality while evaluation ranks the
+        # ellipse envelope.
+        ellipse_mean = ellipse_cholesky = ellipse_sigma = None
+        if self.loss_ellipse2d is not None and ellipse2d_preds is not None:
+            if self.gaucho_classwise:
+                raw2d = ellipse2d_preds.reshape(
+                    -1, self.num_classes, 5)
+                raw2d = raw2d[
+                    torch.arange(raw2d.size(0), device=raw2d.device),
+                    indexing_labels]
+            else:
+                raw2d = ellipse2d_preds.reshape(-1, 5)
+            box_px = (flat_bbox_preds * factors).detach()
+            ellipse_mean, ellipse_cholesky, ellipse_sigma = \
+                self._decode_gaucho_ellipse2d(raw2d, box_px)
+
         flat_obb_aux_preds = None
         normalized_obb_targets = None
         if obb_aux_preds is not None:
@@ -2017,6 +2179,23 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             cls_avg_factor = reduce_mean(cls_scores.new_tensor([cls_avg_factor]))
         cls_avg_factor = max(cls_avg_factor, 1)
 
+        quality_geometry_predictions = flat_obb_aux_preds
+        quality_geometry_targets = normalized_obb_targets
+        if self.uses_quality_target and \
+                self.quality_target_policy.source in {
+                    'ellipse_kld', 'ellipse_kld_blend'}:
+            if ellipse_sigma is not None:
+                quality_geometry_predictions = torch.stack(
+                    (ellipse_mean[:, 0], ellipse_mean[:, 1],
+                     ellipse_sigma[:, 0, 0], ellipse_sigma[:, 0, 1],
+                     ellipse_sigma[:, 1, 1]), dim=-1)
+                quality_geometry_targets = obb_gaussian_targets
+            else:
+                # Encoder proposals have no ellipse branch.  A config can make
+                # this explicit with missing_obb='hbb_iou'.
+                quality_geometry_predictions = None
+                quality_geometry_targets = None
+
         loss_cls = self._classification_loss(
             cls_scores=cls_scores,
             labels=labels,
@@ -2024,8 +2203,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             bbox_predictions=flat_bbox_preds,
             bbox_targets=bbox_targets,
             avg_factor=cls_avg_factor,
-            obb_predictions=flat_obb_aux_preds,
-            obb_targets=normalized_obb_targets,
+            obb_predictions=quality_geometry_predictions,
+            obb_targets=quality_geometry_targets,
         )
 
         num_total_pos = loss_cls.new_tensor([num_total_pos])
@@ -2050,10 +2229,6 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # z loss
         z_preds = z_preds.reshape(-1, 1)
         loss_z = self.loss_z(z_preds, z_targets, z_weights, avg_factor=num_total_pos)
-
-        # indexing labels for rotation and sizes. background labels are replaced with 0
-        indexing_labels = labels.clone()
-        indexing_labels[indexing_labels == self.num_classes] = 0
 
         # rotation loss
         # rotation_preds = rotation_preds.reshape(-1, 6)
@@ -2153,20 +2328,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
         # ── GauCho-2D amodal ellipse loss ─────────────────────────────
         loss_ellipse2d = z_preds.new_tensor(0.0)
-        if self.loss_ellipse2d is not None and ellipse2d_preds is not None:
-            if self.gaucho_classwise:
-                raw2d = ellipse2d_preds.reshape(-1, self.num_classes, 5)
-                raw2d = raw2d[torch.arange(raw2d.size(0),
-                                           device=raw2d.device),
-                              indexing_labels]
-            else:
-                raw2d = ellipse2d_preds.reshape(-1, 5)
-
-            # Detached at the call site: the ellipse objective must not
-            # reshape the box branch through its own reference frame.
-            box_px = (flat_bbox_preds * factors).detach()
-            ellipse_mean, ellipse_cholesky, _ = self._decode_gaucho_ellipse2d(
-                raw2d, box_px)
+        if ellipse_cholesky is not None:
             loss_ellipse2d = self.loss_ellipse2d(
                 ellipse_mean, ellipse_cholesky, obb_gaussian_targets,
                 weight=obb_gaussian_weights, avg_factor=num_total_pos)
@@ -2174,6 +2336,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # ── GauCho-3D ellipsoid losses ────────────────────────────────
         loss_ellipsoid = z_preds.new_tensor(0.0)
         loss_ellipsoid_projection = z_preds.new_tensor(0.0)
+        loss_ellipsoid_max_axis = z_preds.new_tensor(0.0)
         if self.loss_ellipsoid is not None and ellipsoid_preds is not None:
             if self.gaucho_classwise:
                 raw = ellipsoid_preds.reshape(-1, self.num_classes, 6)
@@ -2230,10 +2393,32 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     # Left in float32 on purpose: summing them with the bf16
                     # siblings promotes to float32 anyway, and casting back
                     # down would discard the range this island exists to keep.
+                    # An annotation larger than the objects can physically be
+                    # is an annotation error, not a large fruit.  Forcing the
+                    # shape KLD to reproduce it fights the max-axis bound
+                    # directly, so it is dropped from 3D shape supervision --
+                    # and only from that: the same instance still teaches
+                    # detection, the 2D ellipse and the centre.
+                    shape_weight = None
+                    if self.ellipsoid_gt_max_diameter is not None:
+                        gt_extent = sizes_targets[positive].float().max(
+                            dim=-1).values
+                        shape_weight = (
+                            gt_extent <= self.ellipsoid_gt_max_diameter
+                        ).to(predicted_cholesky.dtype)
+
                     loss_ellipsoid = self.loss_ellipsoid(
                         predicted_center, predicted_cholesky,
                         target_center, target_cholesky,
+                        weight=shape_weight,
                         avg_factor=num_total_pos)
+
+                    if self.loss_ellipsoid_max_axis is not None:
+                        # Applied to every positive, including the ones the
+                        # shape term ignores: the physical bound does not stop
+                        # applying because an annotation is wrong.
+                        loss_ellipsoid_max_axis = self.loss_ellipsoid_max_axis(
+                            predicted_cholesky, avg_factor=num_total_pos)
 
                     if self.loss_ellipsoid_projection is not None:
                         loss_ellipsoid_projection = \
@@ -2249,19 +2434,26 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 loss_ellipsoid = raw.sum() * 0.0
                 if self.loss_ellipsoid_projection is not None:
                     loss_ellipsoid_projection = raw.sum() * 0.0
+                if self.loss_ellipsoid_max_axis is not None:
+                    loss_ellipsoid_max_axis = raw.sum() * 0.0
 
         return (loss_cls, loss_bbox, loss_iou, loss_centers_2d, loss_z,
                 loss_rotation, loss_sizes, loss_projection, loss_obb_aux,
                 loss_size_chain, loss_rotation_chain, loss_z_chain,
-                loss_ellipsoid, loss_ellipsoid_projection, loss_ellipse2d)
+                loss_ellipsoid, loss_ellipsoid_projection, loss_ellipse2d,
+                loss_ellipsoid_max_axis)
 
     def get_targets(self, cls_scores_list: List[Tensor], bbox_preds_list: List[Tensor],
                     centers_2d_preds_list: List[Tensor], z_preds_list: List[Tensor],
                     rotation_preds_list: List[Tensor], sizes_preds_list: List[Tensor],
                     batch_gt_instances: InstanceList,
-                    batch_img_metas: List[dict], assigner=None,
+                    batch_img_metas: List[dict],
+                    ellipse2d_preds_list: List[Tensor] = None,
+                    assigner=None,
                     pose_for_matching: bool = True) -> tuple:
         """Compute regression and classification targets for a batch image."""
+        if ellipse2d_preds_list is None:
+            ellipse2d_preds_list = [None] * len(batch_img_metas)
         (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
          centers_2d_targets_list, centers_2d_weights_list,
          z_targets_list, z_weights_list,
@@ -2273,6 +2465,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                                       centers_2d_preds_list, z_preds_list,
                                       rotation_preds_list, sizes_preds_list,
                                       batch_gt_instances, batch_img_metas,
+                                      ellipse2d_preds_list,
                                       assigner=assigner,
                                       pose_for_matching=pose_for_matching)
         num_total_pos = sum((inds.numel() for inds in pos_inds_list))
@@ -2381,7 +2574,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             self, cls_score: Tensor, bbox_pred: Tensor,
             centers_2d_pred: Tensor, z_pred: Tensor,
             rotation_pred: Tensor, sizes_pred: Tensor, img_meta: dict,
-            pose_for_matching: bool = True) -> InstanceData:
+            pose_for_matching: bool = True,
+            ellipse2d_pred: Tensor = None) -> InstanceData:
         """Build the exact prediction structure consumed by the assigner.
 
         Keeping this conversion in one place lets offline diagnostics inspect
@@ -2392,8 +2586,34 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         num_bboxes = bbox_pred.size(0)
         bbox_pred_unnorm = bbox_cxcywh_to_xyxy(bbox_pred) * factor
 
+        ellipse_fields = {}
+        if self._assigner_uses_ellipse and ellipse2d_pred is not None:
+            if self.gaucho_classwise:
+                raw2d = ellipse2d_pred.reshape(
+                    num_bboxes, self.num_classes, 5)
+                box_shape = (bbox_pred * factor).detach().unsqueeze(1)
+            else:
+                raw2d = ellipse2d_pred.reshape(num_bboxes, 5)
+                box_shape = (bbox_pred * factor).detach()
+            # Decoded exactly as the loss decodes it, against the query's own
+            # box in pixels and detached for the same reason: matching must not
+            # reshape the box branch through the ellipse chart.  Classwise
+            # predictions retain all class channels here: each GT column, not
+            # the query's pre-assignment argmax, selects the relevant channel
+            # inside Ellipse2DKLDCost.
+            mean, _, sigma = self._decode_gaucho_ellipse2d(
+                raw2d, box_shape)
+            compact = torch.stack(
+                (mean[..., 0], mean[..., 1], sigma[..., 0, 0],
+                 sigma[..., 0, 1], sigma[..., 1, 1]), dim=-1)
+            if not self.gaucho_classwise:
+                compact = compact.unsqueeze(1).expand(
+                    num_bboxes, self.num_classes, 5)
+            ellipse_fields = dict(ellipse_gaussians=compact)
+
         if not pose_for_matching:
-            return InstanceData(scores=cls_score, bboxes=bbox_pred_unnorm)
+            return InstanceData(scores=cls_score, bboxes=bbox_pred_unnorm,
+                                **ellipse_fields)
 
         centers_2d_px = centers_2d_pred * centers_2d_pred.new_tensor(
             [img_w, img_h])
@@ -2422,7 +2642,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             bboxes=bbox_pred_unnorm,
             translations=t_recovered,
             rotations=rotation_pred,
-            sizes=sizes_pred)
+            sizes=sizes_pred,
+            **ellipse_fields)
 
     def matching_diagnostics(
             self, cls_score: Tensor, bbox_pred: Tensor,
@@ -2458,6 +2679,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                            centers_2d_pred: Tensor, z_pred: Tensor,
                            rotation_pred: Tensor, sizes_pred: Tensor,
                            gt_instances: InstanceData, img_meta: dict,
+                           ellipse2d_pred: Tensor = None,
                            assigner=None,
                            pose_for_matching: bool = True) -> tuple:
         """Compute regression and classification targets for one image."""
@@ -2467,7 +2689,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         pred_instances = self._build_matching_pred_instances(
             cls_score, bbox_pred, centers_2d_pred, z_pred,
             rotation_pred, sizes_pred, img_meta,
-            pose_for_matching=pose_for_matching)
+            pose_for_matching=pose_for_matching,
+            ellipse2d_pred=ellipse2d_pred)
 
         active_assigner = assigner or self.assigner
         assign_result = active_assigner.assign(

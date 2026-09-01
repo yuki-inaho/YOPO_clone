@@ -16,6 +16,7 @@ from .gaucho3d_loss import (DualConicResidualLoss,
                             Ellipse2DKLDLoss,
                             DualQuadricProjectionGWDLoss,
                             Ellipsoid3DGWDLoss, Ellipsoid3DKLDLoss,
+                            EllipsoidMaxAxisLoss,
                             EllipsoidFreeSpaceLoss,
                             RayEllipsoidSurfaceLoss)
 from .gaussian_focal_loss import GaussianFocalLoss
@@ -57,7 +58,8 @@ __all__ = [
     'DDQAuxLoss', 'CrossEntropyCustomLoss', 'FocalCustomLoss',
     'ADDLoss', 'PositionalFocalLoss', 'RotatedIoULoss', 'GDLoss',
     'GaussianGWDLoss', 'GaussianKFIoULoss', 'ProjectedEllipsoidGWDLoss',
-    'Ellipsoid3DKLDLoss', 'Ellipsoid3DGWDLoss', 'Ellipse2DKLDLoss',
+    'Ellipsoid3DKLDLoss', 'Ellipsoid3DGWDLoss', 'EllipsoidMaxAxisLoss',
+    'Ellipse2DKLDLoss',
     'DualQuadricProjectionGWDLoss', 'DualConicResidualLoss',
     'RayEllipsoidSurfaceLoss', 'EllipsoidFreeSpaceLoss',
     'MatchabilityAwareLoss', 'matchability_aware_loss',
