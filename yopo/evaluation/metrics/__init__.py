@@ -17,11 +17,14 @@ from .openimages_metric import OpenImagesMetric
 from .ov_coco_metric import OVCocoMetric
 from .refexp_metric import RefExpMetric
 from .ellipse_rotated_iou_metric import EllipseEnvelopeRotatedIoUMetric
+from .gaucho3d_shared_match_metric import (GauCho3DSharedMatchMetric,
+                                           ProjectedEllipsoidRotatedIoUMetric)
 from .rotated_iou_metric import RotatedIoUMetric
 from .voc_metric import VOCMetric
 
 __all__ = [
-    'EllipseEnvelopeRotatedIoUMetric',
+    'EllipseEnvelopeRotatedIoUMetric', 'GauCho3DSharedMatchMetric',
+    'ProjectedEllipsoidRotatedIoUMetric',
     'CocoMetric', 'OpenImagesMetric', 'VOCMetric', 'LVISMetric',
     'CrowdHumanMetric', 'DumpProposals', 'CocoOccludedSeparatedMetric',
     'DumpDetResults', 'COCOCaptionMetric', 'RefExpMetric', 'gRefCOCOMetric',
