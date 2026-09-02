@@ -84,3 +84,75 @@ test CONFIG CKPT: check-venv
 # Full training wrapper (needs the real dataset under data/).
 train CONFIG WORKDIR="work_dirs/train": check-venv
     "{{ PYTHON_EXEC }}" tools/train.py "{{ CONFIG }}" --work-dir "{{ WORKDIR }}"
+
+# ============================================================================
+# Viewer (opt-in) — Open3D RGB-D point cloud with the predicted 3D ellipsoids,
+# and a 2D view of the same ellipsoids projected onto the image.
+#
+# Open3D is not part of `just sync`: it drags in a GUI/GL stack a training or
+# CI box has no use for.  `just viewer-sync` adds it, everything else the
+# viewer needs is already a runtime dependency.
+#
+# The bundle under VIEWER_BUNDLE is generated, not tracked.  Regenerate it for
+# whichever checkpoint you want to look at with `just viewer-export`.
+# ============================================================================
+
+VIEWER_DIR := "tools/viewer"
+VIEWER_BUNDLE := "work_dirs/viewer_bundle"
+VIEWER_SCORE := "0.35"
+
+# Install the viewer's extra dependency into the existing venv.
+#
+# Deliberately `uv pip install` and not `uv sync --group viewer`: a full sync
+# re-resolves the whole project and would reinstall mmcv from the sm_120 URL
+# this pyproject targets.  A box running a different architecture -- an sm_89
+# card with the locally built wheel under wheels/, say -- would lose every
+# CUDA op (rotated IoU, rotated NMS, deformable attention) to that swap.  The
+# group above stays the declaration of what the viewer needs; this installs
+# exactly that and touches nothing else.
+#
+# On a machine whose GPU matches pyproject, `uv sync --group viewer` is
+# equivalent and may be preferred.
+viewer-sync: check-venv
+    uv pip install --python "{{ PYTHON_EXEC }}" open3d==0.19.0
+    @"{{ PYTHON_EXEC }}" -c "import mmcv; from mmcv.ops import box_iou_rotated; \
+        import torch; box_iou_rotated( \
+            torch.zeros(1, 5, device='cuda'), torch.zeros(1, 5, device='cuda')); \
+        print('mmcv CUDA ops still working')" \
+        || echo "WARNING: mmcv CUDA ops broke; check the installed wheel"
+    @echo "viewer deps installed; run 'just viewer-export CONFIG CKPT' next."
+
+# Fail early with an actionable message rather than an ImportError mid-render.
+check-viewer: check-venv
+    @"{{ PYTHON_EXEC }}" -c "import open3d" 2>/dev/null \
+        || { echo "open3d missing. Run: just viewer-sync"; exit 1; }
+
+# Build a 10-frame bundle (RGB, depth, predictions) from a checkpoint.
+# Use the run's own dumped config so anchor settings come along; passing the
+# training config from temp/ leaves the depth anchor off.
+viewer-export CONFIG CKPT FRAMES="10" NMS="0.20": check-venv
+    "{{ PYTHON_EXEC }}" "{{ VIEWER_DIR }}/export_from_yopo.py" \
+        "{{ CONFIG }}" "{{ CKPT }}" "{{ VIEWER_BUNDLE }}" \
+        --num-frames {{ FRAMES }} --nms-iou-threshold {{ NMS }} \
+        --max-predictions 128
+
+# 3D viewer.  Arrow keys move between frames; see tools/viewer/README.md.
+viewer SCORE=VIEWER_SCORE: check-viewer
+    PYTHONPATH="{{ VIEWER_DIR }}" "{{ PYTHON_EXEC }}" -m gaucho3d_viewer.app \
+        --bundle "{{ VIEWER_BUNDLE }}" --score-threshold {{ SCORE }}
+
+# 2D viewer: projected ellipses on the RGB frame, with confidence labels.
+viewer-2d SCORE=VIEWER_SCORE: check-venv
+    PYTHONPATH="{{ VIEWER_DIR }}" "{{ PYTHON_EXEC }}" -m gaucho3d_viewer.two_d \
+        --bundle "{{ VIEWER_BUNDLE }}" --score-threshold {{ SCORE }}
+
+# Static PNGs plus a contact sheet, no GUI required.
+viewer-overlays SCORE=VIEWER_SCORE: check-venv
+    PYTHONPATH="{{ VIEWER_DIR }}" "{{ PYTHON_EXEC }}" -m gaucho3d_viewer.two_d \
+        --bundle "{{ VIEWER_BUNDLE }}" --score-threshold {{ SCORE }} \
+        --save-dir "{{ VIEWER_BUNDLE }}/overlays"
+
+# Read-only check that the bundle loads and every frame renders.
+viewer-validate SCORE=VIEWER_SCORE: check-viewer
+    PYTHONPATH="{{ VIEWER_DIR }}" "{{ PYTHON_EXEC }}" -m gaucho3d_viewer.app \
+        --bundle "{{ VIEWER_BUNDLE }}" --score-threshold {{ SCORE }} --validate-only
