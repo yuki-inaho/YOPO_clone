@@ -30,8 +30,21 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
             query generator. Defaults to `None`.
     """
 
-    def __init__(self, *args, dn_cfg: OptConfigType = None, **kwargs) -> None:
+    def __init__(self, *args, dn_cfg: OptConfigType = None,
+                 dense_aux_head: OptConfigType = None,
+                 dense_aux_loss_weight: float = 1.0, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        # A dense, training-only head on the neck features.  Measurement says
+        # the 2D limit is positional: three independent centre estimates -- the
+        # box, ``centers_2d`` and the ellipse -- all sit at 0.087 of object
+        # scale, so the shared representation, not any one branch, is what runs
+        # out.  A one-to-one matcher gives each object a single positive; this
+        # gives the same features many, the way the dense reference detector
+        # does.  Inference is untouched: nothing here is read at predict time.
+        self.dense_aux_loss_weight = float(dense_aux_loss_weight)
+        self.dense_aux_head = (
+            MODELS.build(dense_aux_head) if dense_aux_head is not None
+            else None)
         assert self.as_two_stage, 'as_two_stage must be True for DINO'
         assert self.with_box_refine, 'with_box_refine must be True for DINO'
 
@@ -85,6 +98,75 @@ class DINO9DCenter2DPose(DeformablePoseDETR):
         nn.init.xavier_uniform_(self.memory_trans_fc.weight)
         nn.init.xavier_uniform_(self.query_embedding.weight)
         normal_(self.level_embed)
+
+    def loss(self, batch_inputs: Tensor, batch_data_samples):
+        """Main losses, plus the dense auxiliary when one is configured."""
+        img_feats = self.extract_feat(batch_inputs)
+        head_inputs_dict = self.forward_transformer(img_feats,
+                                                    batch_data_samples)
+        losses = self.bbox_head.loss(
+            **head_inputs_dict, batch_data_samples=batch_data_samples)
+
+        if self.dense_aux_head is not None:
+            features = (img_feats['fused_features']
+                        if isinstance(img_feats, dict) else img_feats)
+            aux = self.dense_aux_head.loss(
+                features, self._rotated_aux_samples(batch_data_samples))
+            weight = self.dense_aux_loss_weight
+            for name, value in aux.items():
+                key = f'dense_aux_{name}'
+                # The head also reports counters such as ``num_pos``.  mmengine
+                # sums every value whose key contains "loss", so a counter that
+                # is passed through unfiltered would be added to the objective;
+                # it is kept for the log but detached and left unweighted.
+                if 'loss' not in name:
+                    losses[key] = (value.detach()
+                                   if torch.is_tensor(value) else value)
+                    continue
+                losses[key] = (
+                    [v * weight for v in value]
+                    if isinstance(value, (list, tuple)) else value * weight)
+        return losses
+
+    def _rotated_aux_samples(self, batch_data_samples):
+        """Re-express the annotations as rotated boxes for the dense auxiliary.
+
+        The dense head assigns on oriented boxes and calls ``regularize_boxes``
+        on them, while this detector's samples carry horizontal ones.  The
+        oriented annotation is already present as the compact Gaussian the
+        ellipse branch is trained against, so it is decoded here rather than
+        approximated from the horizontal box -- otherwise the auxiliary would be
+        supervising a different target from the head it is meant to help.
+
+        A shallow copy per sample: the originals must reach the main head with
+        their horizontal boxes untouched.
+        """
+        from mmengine.structures import InstanceData
+
+        from yopo.evaluation.metrics.ellipse_rotated_iou_metric import (
+            compact_gaussian_to_obb)
+        from yopo.structures.bbox import RotatedBoxes
+
+        converted = []
+        for sample in batch_data_samples:
+            gt = sample.gt_instances
+            if not hasattr(gt, 'obb_gaussians'):
+                raise ValueError(
+                    'dense_aux_head needs obb_gaussians on the annotations; '
+                    'load them with with_obb_gaussian=True')
+            compact = gt.obb_gaussians
+            boxes = (compact_gaussian_to_obb(compact.float())
+                     if compact.numel() else compact.new_zeros((0, 5)))
+            aux = sample.new()
+            aux.set_metainfo(sample.metainfo)
+            aux.gt_instances = InstanceData(
+                bboxes=RotatedBoxes(boxes.to(compact.device)),
+                labels=gt.labels)
+            aux.ignored_instances = InstanceData(
+                bboxes=RotatedBoxes(boxes.new_zeros((0, 5))),
+                labels=gt.labels.new_zeros((0,)))
+            converted.append(aux)
+        return converted
 
     def _unnormalized_depth(self, batch_inputs: Tensor) -> Tensor:
         """Undo the preprocessor's normalization of the depth channel.

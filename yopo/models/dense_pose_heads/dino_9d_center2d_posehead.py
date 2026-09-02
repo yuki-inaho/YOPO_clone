@@ -1497,19 +1497,29 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         flat_bbox_predictions = bbox_predictions.reshape(-1, 4)
         num_positive = int((labels < self.num_classes).sum())
         cls_avg_factor = max(num_positive, 1)
-        loss_cls = self.o2m_aux_loss_cls(
-            flat_cls_scores, labels, torch.ones_like(labels),
-            avg_factor=cls_avg_factor)
+        # ``sigmoid_focal_loss`` has no bfloat16 CUDA kernel, and these configs
+        # train under bfloat16 AMP, so this branch raised NotImplementedError on
+        # its first iteration -- which is presumably why it has never run.  A
+        # float32 island around the loss is the same fix the 3D geometry losses
+        # needed for ``torch.linalg``; it costs nothing, because the tensors
+        # here are one decoder layer's worth of queries.
+        with torch.autocast(device_type=flat_cls_scores.device.type,
+                            enabled=False):
+            loss_cls = self.o2m_aux_loss_cls(
+                flat_cls_scores.float(), labels, torch.ones_like(labels),
+                avg_factor=cls_avg_factor)
 
         factors = torch.cat(factors)
         pred_xyxy = bbox_cxcywh_to_xyxy(flat_bbox_predictions) * factors
         target_xyxy = bbox_cxcywh_to_xyxy(bbox_targets) * factors
-        loss_bbox = self.loss_bbox(
-            flat_bbox_predictions, bbox_targets, bbox_weights,
-            avg_factor=cls_avg_factor)
-        loss_iou = self.loss_iou(
-            pred_xyxy, target_xyxy, bbox_weights,
-            avg_factor=cls_avg_factor)
+        with torch.autocast(device_type=flat_cls_scores.device.type,
+                            enabled=False):
+            loss_bbox = self.loss_bbox(
+                flat_bbox_predictions.float(), bbox_targets.float(),
+                bbox_weights.float(), avg_factor=cls_avg_factor)
+            loss_iou = self.loss_iou(
+                pred_xyxy.float(), target_xyxy.float(), bbox_weights.float(),
+                avg_factor=cls_avg_factor)
         weight = self.o2m_aux_loss_weight
         return {
             'loss_o2m_cls': loss_cls * weight,
