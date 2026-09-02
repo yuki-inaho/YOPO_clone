@@ -234,6 +234,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             gaucho_use_bbox_conditioning: bool = True,
             gaucho_ellipse2d: bool = False,
             gaucho_ellipse2d_dn: bool = False,
+            gaucho_ellipse2d_reference_detach: bool = True,
             expose_gaucho_predictions: bool = False,
             loss_ellipse2d: ConfigType = None,
             loss_ellipsoid: ConfigType = None,
@@ -495,6 +496,17 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.gaucho_eps = 1e-7
         self.gaucho_ellipse2d = bool(gaucho_ellipse2d)
         self.gaucho_ellipse2d_dn = bool(gaucho_ellipse2d_dn)
+        # The ellipse decodes as ``box_centre + offset * extent``.  With the
+        # reference detached, the ellipse objective cannot reach the box
+        # branch, so the offset has to absorb the box centre's error without
+        # being able to observe it -- and measurably does not: the predicted
+        # ellipse centre carries the same 0.0866 relative error as the box
+        # centre it is built on, and no loss added to the ellipse chart has
+        # moved it.  Detaching stays right for the *assigner*, where a
+        # gradient has no business flowing at all; this flag governs only
+        # the regression path.
+        self.gaucho_ellipse2d_reference_detach = bool(
+            gaucho_ellipse2d_reference_detach)
         self.expose_gaucho_predictions = bool(expose_gaucho_predictions)
         self.loss_ellipse2d = (
             MODELS.build(loss_ellipse2d)
@@ -2016,7 +2028,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     indexing_labels]
             else:
                 raw2d = dn_ellipse2d_preds.reshape(-1, 5)
-            box_px = (bbox_preds * factors).detach()
+            box_px = self._ellipse_reference(bbox_preds * factors)
             mean, cholesky, _ = self._decode_gaucho_ellipse2d(
                 raw2d, box_px)
             loss_ellipse2d = self.loss_ellipse2d(
@@ -2189,6 +2201,15 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     return True
         return False
 
+    def _ellipse_reference(self, box_px: Tensor) -> Tensor:
+        """The reference box the ellipse chart is built on, for the loss path.
+
+        See ``gaucho_ellipse2d_reference_detach``.  Assigner and inference call
+        the decoder directly and are unaffected.
+        """
+        return box_px.detach() if self.gaucho_ellipse2d_reference_detach \
+            else box_px
+
     def _decode_gaucho_ellipse2d(
             self, raw: Tensor, box_px: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -2338,7 +2359,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     indexing_labels]
             else:
                 raw2d = ellipse2d_preds.reshape(-1, 5)
-            box_px = (flat_bbox_preds * factors).detach()
+            box_px = self._ellipse_reference(flat_bbox_preds * factors)
             ellipse_mean, ellipse_cholesky, ellipse_sigma = \
                 self._decode_gaucho_ellipse2d(raw2d, box_px)
 
