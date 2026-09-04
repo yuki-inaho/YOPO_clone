@@ -338,6 +338,12 @@ def test_obb_diagnostic_predictions_are_opt_in_and_spd():
         dim=-1).reshape(-1, 2, 2)
     assert compact.shape == (2, 5)
     assert torch.linalg.eigvalsh(sigma).min() > 0
+    assert diagnostic_result.obb_aux_obb.shape == (2, 5)
+    assert torch.isfinite(diagnostic_result.obb_aux_obb).all()
+    assert torch.allclose(
+        diagnostic_result.obb_aux_obb[:, :2],
+        torch.full((2, 2), 16.0),
+    )
 
 
 def test_obb_diagnostic_predictions_require_obb_head():
@@ -1222,6 +1228,9 @@ def test_chain_pre_decoder_skips_encoder_pose_branches():
     chain_cfg = Config.fromfile(
         "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_cop_stage2_obb_depth.py"
     )
+    chain_cfg.model.bbox_head.distill_attributes = ()
+    chain_cfg.model.bbox_head.pose_teacher_checkpoint = None
+    chain_cfg.model.bbox_head.obb_center_teacher_checkpoint = None
     chain = MODELS.build(chain_cfg.model).eval()
     layer_id = chain.decoder.num_layers
     chain.bbox_head.reg_z_branch[layer_id] = _FailIfCalled()
@@ -1233,6 +1242,9 @@ def test_chain_pre_decoder_skips_encoder_pose_branches():
     parallel_cfg = Config.fromfile(
         "configs/yopo/nocs_custom_fruit_rgbd_3dbbox_parallel_control.py"
     )
+    parallel_cfg.model.bbox_head.distill_attributes = ()
+    parallel_cfg.model.bbox_head.pose_teacher_checkpoint = None
+    parallel_cfg.model.bbox_head.obb_center_teacher_checkpoint = None
     parallel = MODELS.build(parallel_cfg.model).eval()
     layer_id = parallel.decoder.num_layers
     parallel.bbox_head.reg_z_branch[layer_id] = _FailIfCalled()

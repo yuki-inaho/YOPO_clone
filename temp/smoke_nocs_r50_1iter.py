@@ -128,18 +128,9 @@ default_hooks = dict(
 )
 
 # ── LR scheduler ─────────────────────────────────────────────────────────────
-# Keep MultiStepLR (same type as the base config) but move the milestone
-# beyond max_epochs=1 so the LR never actually decays during the smoke run.
-param_scheduler = [
-    dict(
-        type='MultiStepLR',
-        begin=0,
-        end=max_epochs,
-        by_epoch=True,
-        milestones=[9999],   # unreachable with max_epochs=1
-        gamma=0.1,
-    )
-]
+# AMUSE is schedule-free; an external MMEngine scheduler would overwrite the
+# optimizer's per-step learning-rate bookkeeping.
+param_scheduler = []
 
 # ── Work directory ────────────────────────────────────────────────────────────
 work_dir = 'work_dirs/smoke_nocs_r50_1iter'

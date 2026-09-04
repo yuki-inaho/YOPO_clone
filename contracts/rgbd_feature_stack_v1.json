@@ -1,0 +1,87 @@
+{
+  "contract_name": "rgbd_hgnetv2_hybrid_pafpn",
+  "schema_version": 1,
+  "fingerprint_sha256": "ceebb8ae52cbe05b670e0c80073197242771186a906be509ae51d0cadcc6e4d8",
+  "input": {
+    "channel_order": ["red", "green", "blue", "depth"],
+    "channels": 4,
+    "canonical_activation_layout": "NHWC",
+    "canonical_kernel_layout": "HWIO"
+  },
+  "normalization": {
+    "rgb_divisor": 255.0,
+    "depth_divisor": 1000.0,
+    "depth_unit": "metre",
+    "invalid_depth_value": 0.0
+  },
+  "backbone": {
+    "family": "PP-HGNetV2",
+    "use_learnable_affine_block": true,
+    "normalization_layer": {
+      "type": "batch_norm",
+      "epsilon": 0.00001,
+      "running_statistics": "frozen_during_training",
+      "affine": true
+    },
+    "rgb_variant": "hgnetv2_b2",
+    "rgb_input_channels": 3,
+    "depth_variant": "hgnetv2_b0",
+    "depth_input_channels": 1,
+    "out_indices": [1, 2, 3],
+    "levels": [
+      {"name": "p3", "stride": 8, "rgb_channels": 384, "depth_channels": 256, "fused_channels": 384},
+      {"name": "p4", "stride": 16, "rgb_channels": 768, "depth_channels": 512, "fused_channels": 768},
+      {"name": "p5", "stride": 32, "rgb_channels": 1536, "depth_channels": 1024, "fused_channels": 1536}
+    ]
+  },
+  "fusion": {
+    "equation": "rgb + beta[level] * conv1x1(depth)",
+    "adapter_kernel": [1, 1],
+    "adapter_bias": false,
+    "beta_shape": [3],
+    "beta_initial_value": 0.0,
+    "requires_exact_spatial_match": true
+  },
+  "feature_stack": {
+    "projection_channels": 256,
+    "projection_kernel": [1, 1],
+    "aifi_levels": ["p5"],
+    "aifi_layers": 1,
+    "aifi_heads": 8,
+    "aifi_ffn_channels": 1024,
+    "position_encoding": "2d_sine_cosine_10000",
+    "top_down": {
+      "resize": "nearest_half_pixel_exact_target_size",
+      "concat_order": ["fine", "coarse_upsampled"],
+      "kernel": [3, 3],
+      "padding": 1,
+      "activation": "silu"
+    },
+    "bottom_up": {
+      "downsample": "sum_pool_2x2_stride2_same_divide4_then_nearest_half_pixel_exact_target_size",
+      "concat_order": ["current", "previous_downsampled"],
+      "kernel": [3, 3],
+      "padding": 1,
+      "activation": "silu"
+    },
+    "output_levels": ["p3", "p4", "p5"],
+    "flatten_order": "level_then_row_major",
+    "level_start_indices": "exclusive_prefix_sum_height_times_width",
+    "derived_output": {
+      "name": "p6",
+      "stride": 64,
+      "source": "p5",
+      "operation": "conv3x3_stride2_padding1",
+      "shared": false,
+      "transfer_excluded": true
+    }
+  },
+  "transfer": {
+    "shared_levels": ["p3", "p4", "p5"],
+    "transpose_rules": {
+      "conv": "HWIO_to_OIHW",
+      "dense": "IO_to_OI"
+    },
+    "excluded": ["p6", "task_heads", "decoder"]
+  }
+}

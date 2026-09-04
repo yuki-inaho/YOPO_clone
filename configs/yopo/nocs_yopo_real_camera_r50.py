@@ -103,12 +103,14 @@ model = dict(
     test_cfg=dict(max_per_img=300))  # 100 for DeformDETR
 
 
-# optimizer
+# optimizer: AMUSE (official kjeiun/amuse update rule; schedule-free)
 optim_wrapper = dict(
-    type='OptimWrapper',
+    type='yopo.engine.optimizers.amuse.AmuseOptimWrapper',
     optimizer=dict(
-        type='AdamW',
+        type='yopo.engine.optimizers.amuse.AmuseOptimizer',
         lr=0.0001,  # 0.0002 for DeformDETR
+        aux_lr=0.0001,
+        warmup_steps=100,
         weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)})
@@ -122,15 +124,10 @@ train_cfg = dict(
 val_cfg = dict(type='ValLoop')
 test_cfg = dict(type='TestLoop')
 
-param_scheduler = [
-    dict(
-        type='MultiStepLR',
-        begin=0,
-        end=max_epochs,
-        by_epoch=True,
-        milestones=[11],
-        gamma=0.1)
-]
+# AMUSE is schedule-free; do not attach an external LR scheduler.
+param_scheduler = []
+
+custom_hooks = [dict(type='ScheduleFreeOptimizerModeHook')]
 
 # NOTE: `auto_scale_lr` is for automatically scaling LR,
 # USER SHOULD NOT CHANGE ITS VALUES.

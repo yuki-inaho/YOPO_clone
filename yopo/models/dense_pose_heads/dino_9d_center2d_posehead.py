@@ -72,6 +72,47 @@ def _compact_gaussian_from_raw_cholesky(raw_obb: Tensor) -> Tensor:
         dim=-1)
 
 
+def _compact_gaussian_to_obb(compact: Tensor) -> Tensor:
+    """Convert ``(cx, cy, xx, xy, yy)`` to ``(cx, cy, w, h, theta)``."""
+    if compact.ndim != 2 or compact.shape[-1] != 5:
+        raise ValueError(
+            'compact Gaussians must have shape (N, 5), got '
+            f'{tuple(compact.shape)}')
+    cx, cy, xx, xy, yy = compact.unbind(dim=-1)
+    trace = xx + yy
+    discriminant = ((xx - yy).square() + 4.0 * xy.square()).clamp_min(0.0).sqrt()
+    major = ((trace + discriminant) * 0.5).clamp_min(0.0).sqrt()
+    minor = ((trace - discriminant) * 0.5).clamp_min(0.0).sqrt()
+    theta = 0.5 * torch.atan2(2.0 * xy, xx - yy)
+    return torch.stack((cx, cy, 2.0 * major, 2.0 * minor, theta), dim=-1)
+
+
+def _obb_aux_to_image_space(
+        compact: Tensor, boxes_cxcywh: Tensor, img_meta: dict,
+        *, rescale: bool) -> Tensor:
+    """Attach HBB centres and map normalized OBB covariance to image pixels."""
+    if compact.shape != (len(boxes_cxcywh), 5):
+        raise ValueError('OBB auxiliary and selected box shapes do not align')
+    img_h, img_w = img_meta['img_shape'][:2]
+    output = compact.clone()
+    output[:, 0] = boxes_cxcywh[:, 0] * img_w
+    output[:, 1] = boxes_cxcywh[:, 1] * img_h
+    output[:, 2] *= img_w * img_w
+    output[:, 3] *= img_w * img_h
+    output[:, 4] *= img_h * img_h
+    if rescale and 'scale_factor' in img_meta:
+        scale = output.new_tensor(img_meta['scale_factor']).flatten()
+        if scale.numel() < 2:
+            raise ValueError('scale_factor must contain x/y scales')
+        sx, sy = scale[0], scale[1]
+        output[:, 0] /= sx
+        output[:, 1] /= sy
+        output[:, 2] /= sx.square()
+        output[:, 3] /= sx * sy
+        output[:, 4] /= sy.square()
+    return output
+
+
 def aligned_iou_quality_targets(
         labels: Tensor,
         bbox_predictions: Tensor,
@@ -1288,6 +1329,11 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 rescale: bool = True,
                 depth_features=None) -> InstanceList:
         """Predict poses and optionally expose query OBBs for diagnostics."""
+        # Prediction has no denoising-query prefix. ``loss`` stores the
+        # prefix length only so the optional training-time anchor can leave
+        # denoising queries on their absolute-depth contract; clear it before
+        # inference so the first matching query is never mistaken for DN.
+        self._num_denoising_queries = 0
         batch_img_metas = [
             data_sample.metainfo for data_sample in batch_data_samples
         ]
@@ -1318,7 +1364,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 _, bbox_index = scores.topk(max_per_img)
                 query_labels = query_labels[bbox_index]
             if obb_predictions is not None:
-                result.obb_gaussians = obb_predictions[image_index][bbox_index]
+                selected_obb = obb_predictions[image_index][bbox_index]
+                result.obb_gaussians = selected_obb
+                selected_boxes = outs[1][-1][image_index][bbox_index]
+                image_obb = _obb_aux_to_image_space(
+                    selected_obb, selected_boxes,
+                    batch_img_metas[image_index], rescale=rescale)
+                result.obb_aux_obb = _compact_gaussian_to_obb(image_obb)
             if expose_gaucho:
                 self._attach_gaucho_predictions(
                     result, outs, image_index, bbox_index, query_labels,

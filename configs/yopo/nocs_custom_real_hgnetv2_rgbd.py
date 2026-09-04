@@ -98,7 +98,16 @@ model = dict(
 load_from = None
 
 optim_wrapper = dict(
-    type='OptimWrapper',
-    optimizer=dict(type='AdamW', lr=0.0001, weight_decay=0.0001),
+    type='yopo.engine.optimizers.amuse.AmuseOptimWrapper',
+    optimizer=dict(
+        type='yopo.engine.optimizers.amuse.AmuseOptimizer',
+        lr=0.0001,
+        aux_lr=0.0001,
+        warmup_steps=100,
+        weight_decay=0.0001),
     clip_grad=dict(max_norm=0.1, norm_type=2),
     paramwise_cfg=dict(custom_keys={'backbone': dict(lr_mult=0.1)}))
+
+# AMUSE is schedule-free.
+param_scheduler = []
+custom_hooks = [dict(type='ScheduleFreeOptimizerModeHook')]
