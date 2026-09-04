@@ -1,5 +1,6 @@
 """Contracts for the shared B2/B0 RGB-D YOPO curriculum."""
 
+from copy import deepcopy
 from pathlib import Path
 
 from mmengine.config import Config
@@ -99,3 +100,52 @@ def test_projection_stage_reports_2d_and_shared_3d_projection_metrics() -> None:
     assert projection.val_evaluator[-2].prefix == 'projection'
     assert projection.val_evaluator[-1].type == 'GauCho3DSharedMatchMetric'
     assert projection.val_evaluator[-1].prefix == 'projection'
+
+
+def test_stage10_reverse_kld_and_two_update_smoke_contracts() -> None:
+    stage10 = Config.fromfile(
+        CONFIG_DIR / 'nocs_fruits_2026_rgbd_shared_stage10_reverse_kld.py'
+    )
+    smoke = Config.fromfile(
+        CONFIG_DIR /
+        'nocs_fruits_2026_rgbd_shared_stage10_reverse_kld_capacity_smoke.py'
+    )
+
+    assert stage10.model.bbox_head.loss_ellipsoid.direction == (
+        'prediction_to_target'
+    )
+    assert stage10.max_epochs == 15
+    assert stage10.train_cfg.max_epochs == 15
+    assert stage10.train_cfg.val_interval == 5
+    assert stage10.train_dataloader.batch_size == 24
+    assert stage10.optim_wrapper.type.endswith('AmpAmuseOptimWrapper')
+
+    assert smoke.train_cfg.type == 'IterBasedTrainLoop'
+    assert smoke.train_cfg.max_iters == 2
+    assert smoke.train_dataloader.batch_size == 24
+    assert smoke.val_dataloader is None
+    assert smoke.val_cfg is None
+    assert smoke.val_evaluator is None
+    assert smoke.load_from.endswith(
+        'best_projection_shared_AP_25_epoch_5.pth'
+    )
+
+
+def test_stage10_changes_only_kld_direction_and_epoch_cap_from_stage8() -> None:
+    stage8 = Config.fromfile(
+        CONFIG_DIR / 'nocs_fruits_2026_rgbd_shared_stage8_sensor_depth_anchor.py'
+    ).to_dict()
+    stage10 = Config.fromfile(
+        CONFIG_DIR / 'nocs_fruits_2026_rgbd_shared_stage10_reverse_kld.py'
+    ).to_dict()
+
+    normalized = deepcopy(stage10)
+    direction = normalized['model']['bbox_head']['loss_ellipsoid'].pop(
+        'direction'
+    )
+    assert direction == 'prediction_to_target'
+    assert normalized['max_epochs'] == 15
+    assert normalized['train_cfg']['max_epochs'] == 15
+    normalized['max_epochs'] = stage8['max_epochs']
+    normalized['train_cfg']['max_epochs'] = stage8['train_cfg']['max_epochs']
+    assert normalized == stage8

@@ -233,7 +233,9 @@ class Ellipsoid3DKLDLoss(_WeightedLoss):
     Both prediction and target are supplied as ``(center, cholesky)``.  The
     target factor comes from ``cholesky(Sigma_g)`` where ``Sigma_g`` is built
     from the annotation's rotation and extent; the network itself never
-    regresses a rotation.
+    regresses a rotation.  ``target_to_prediction`` preserves the historical
+    ``KL(target || prediction)`` behavior; ``prediction_to_target`` swaps the
+    two Gaussian roles without changing reduction or invalid-value handling.
     """
 
     def __init__(
@@ -242,11 +244,18 @@ class Ellipsoid3DKLDLoss(_WeightedLoss):
         reduction: str = "mean",
         tau: float = 1.0,
         include_center: bool = True,
+        direction: str = "target_to_prediction",
         fail_on_invalid: bool = True,
         eps: float = DEFAULT_EPS,
     ) -> None:
         super().__init__(loss_weight, reduction, tau, fail_on_invalid, eps)
         self.include_center = bool(include_center)
+        if direction not in {
+                "target_to_prediction", "prediction_to_target"}:
+            raise ValueError(
+                "direction must be 'target_to_prediction' or "
+                "'prediction_to_target'")
+        self.direction = direction
 
     def forward(
         self,
@@ -266,9 +275,17 @@ class Ellipsoid3DKLDLoss(_WeightedLoss):
             weight = weight.mean(dim=-1)
         self.last_positive_count = (weight > 0).sum().detach()
 
+        if self.direction == "target_to_prediction":
+            first_center, first_cholesky = (
+                predicted_center, predicted_cholesky)
+            second_center, second_cholesky = target_center, target_cholesky
+        else:
+            first_center, first_cholesky = target_center, target_cholesky
+            second_center, second_cholesky = (
+                predicted_center, predicted_cholesky)
         distance = ellipsoid_kld_from_cholesky(
-            predicted_center, predicted_cholesky, target_center,
-            target_cholesky, include_center=self.include_center, eps=self.eps)
+            first_center, first_cholesky, second_center, second_cholesky,
+            include_center=self.include_center, eps=self.eps)
         valid = (
             torch.isfinite(distance)
             & torch.isfinite(predicted_cholesky).all(dim=-1).all(dim=-1)

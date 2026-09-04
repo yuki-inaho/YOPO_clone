@@ -367,6 +367,62 @@ def test_kld_loss_is_bounded_and_differentiable(generator):
     assert torch.isfinite(center.grad).all()
 
 
+def test_ellipsoid_kld_direction_is_backward_compatible_and_reversible():
+    predicted_center = torch.tensor([[0.01, -0.02, 0.45]], dtype=DTYPE)
+    target_center = torch.tensor([[0.0, 0.0, 0.40]], dtype=DTYPE)
+    predicted_cholesky = torch.diag_embed(
+        torch.tensor([[0.02, 0.03, 0.05]], dtype=DTYPE))
+    target_cholesky = torch.diag_embed(
+        torch.tensor([[0.04, 0.025, 0.01]], dtype=DTYPE))
+
+    default = Ellipsoid3DKLDLoss(loss_weight=1.0)(
+        predicted_center, predicted_cholesky, target_center, target_cholesky)
+    explicit = Ellipsoid3DKLDLoss(
+        loss_weight=1.0, direction="target_to_prediction")(
+            predicted_center, predicted_cholesky, target_center,
+            target_cholesky)
+    reverse = Ellipsoid3DKLDLoss(
+        loss_weight=1.0, direction="prediction_to_target")(
+            predicted_center, predicted_cholesky, target_center,
+            target_cholesky)
+    reverse_distance = ellipsoid_kld_from_cholesky(
+        target_center, target_cholesky, predicted_center,
+        predicted_cholesky)
+    reverse_reference = 1.0 - 1.0 / (1.0 + reverse_distance)
+
+    assert torch.equal(default, explicit)
+    assert torch.allclose(reverse, reverse_reference.mean(), atol=1e-12)
+    assert not torch.allclose(explicit, reverse)
+
+
+def test_ellipsoid_kld_rejects_unknown_direction():
+    with pytest.raises(ValueError, match="direction"):
+        Ellipsoid3DKLDLoss(direction="symmetric")
+
+
+def test_reverse_ellipsoid_kld_removes_center_driven_scale_inflation():
+    def log_scale_gradient(direction):
+        log_scale = torch.zeros(1, 3, dtype=DTYPE, requires_grad=True)
+        radius = 0.01
+        predicted_cholesky = torch.diag_embed(
+            radius * torch.exp(log_scale))
+        target_cholesky = torch.diag_embed(
+            torch.full((1, 3), radius, dtype=DTYPE))
+        predicted_center = torch.tensor([[0.0, 0.0, 0.44]], dtype=DTYPE)
+        target_center = torch.tensor([[0.0, 0.0, 0.40]], dtype=DTYPE)
+        loss = Ellipsoid3DKLDLoss(
+            include_center=True, direction=direction)(
+                predicted_center, predicted_cholesky, target_center,
+                target_cholesky)
+        loss.backward()
+        return log_scale.grad[0]
+
+    historical = log_scale_gradient("target_to_prediction")
+    reverse = log_scale_gradient("prediction_to_target")
+    assert historical[2] < -1e-3
+    assert torch.equal(reverse, torch.zeros_like(reverse))
+
+
 def test_gwd_loss_is_finite_near_a_sphere():
     """Gradients must survive the r1 -> r2 -> r3 limit."""
     rotation = torch.eye(3).expand(8, 3, 3).contiguous()
