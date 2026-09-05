@@ -195,6 +195,36 @@ bash tools/dist_train.sh configs/yopo/nocs_yopo_real_camera_swinl_finetune_real.
   --cfg-options load_from=work_dirs/nocs_yopo_real_camera_swinl/epoch_12.pth
 ```
 
+## RGB-D stage selection and reverse-KLD smoke
+
+For the fruit RGB-D curriculum, the selected production model remains stage 8:
+`configs/yopo/nocs_fruits_2026_rgbd_shared_stage8_sensor_depth_anchor.py`. Stage 10 is
+an experimental follow-up that changes only the direct ellipsoid KLD direction to
+prediction-to-target and caps training at 15 epochs:
+`configs/yopo/nocs_fruits_2026_rgbd_shared_stage10_reverse_kld.py`.
+
+Run the two-update B24 capacity smoke from a stage-8 best checkpoint as a weights-only
+initialization. `resume=False` intentionally creates a fresh optimizer; the inherited
+training settings keep AMUSE, BF16, all loss families, and ellipsoid center learning.
+
+```bash
+: "${YOPO_DATA_ROOT:?set YOPO_DATA_ROOT to the preprocessed RGB-D dataset}"
+: "${YOPO_STAGE8_BEST:?set YOPO_STAGE8_BEST to the stage-8 best checkpoint}"
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+.venv/bin/python tools/train.py \
+  configs/yopo/nocs_fruits_2026_rgbd_shared_stage10_reverse_kld_capacity_smoke.py \
+  --work-dir work_dirs/stage10_reverse_kld_capacity_smoke \
+  --cfg-options load_from="$YOPO_STAGE8_BEST" resume=False \
+    train_dataloader.dataset.data_root="$YOPO_DATA_ROOT/" \
+    val_dataloader.dataset.data_root="$YOPO_DATA_ROOT/"
+```
+
+Do not promote a reverse-KLD checkpoint on one metric alone. The measured follow-up was
+rejected because no single validation epoch simultaneously met shared AP25 `>=0.2218`,
+strict 3D IoU25 `>=0.1960`, and projection AP50 `>=0.8388` with the 2D guards. Keep the
+revalidated stage-8 best in that case. The rejected stage-9 `include_center=False` and
+ellipsoid-only freeze are not part of stage 10.
+
 ## Evaluation
 
 ```bash
