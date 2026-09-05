@@ -11,6 +11,11 @@ from mmengine.config import Config
 
 from yopo.models.backbones.yolo26 import YOLO26MBackbone
 from yopo.utils.jax_yolo26_transfer import convert_jax_yolo26_backbone_arrays
+from yopo.utils.yolo26_frontend_calibration import (
+    factor_depth_adapter,
+    fit_ridge_projection,
+    fit_ridge_projection_from_moments,
+)
 from yopo.utils.yolo26_rgbd_initialization import select_stage8_reuse_state
 
 
@@ -221,3 +226,73 @@ def test_yolo26m_rgbd_capacity_and_resume_gate_configs_are_bounded() -> None:
     assert gate.train_cfg.val_interval == 100
     assert gate.default_hooks.checkpoint.by_epoch is False
     assert gate.default_hooks.checkpoint.interval == 100
+
+
+def test_calibrated_full_changes_only_the_weight_source() -> None:
+    original = Config.fromfile(
+        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage1_full.py"
+    ).to_dict()
+    calibrated = Config.fromfile(
+        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage2_calibrated_full.py"
+    ).to_dict()
+
+    assert calibrated["load_from"].endswith(
+        "yolo26m_rgbd_frontend_calibrated_train64.pth"
+    )
+    calibrated["load_from"] = original["load_from"]
+
+    assert calibrated == original
+
+
+def test_ridge_projection_recovers_a_known_channel_map() -> None:
+    generator = torch.Generator().manual_seed(20260906)
+    source = torch.randn(512, 5, generator=generator, dtype=torch.float64)
+    expected = torch.randn(3, 5, generator=generator, dtype=torch.float64)
+    target = source @ expected.T
+
+    fitted = fit_ridge_projection(source, target, ridge=1e-12)
+    fitted_from_moments = fit_ridge_projection_from_moments(
+        source.T @ source,
+        source.T @ target,
+        ridge=1e-12,
+    )
+
+    torch.testing.assert_close(fitted, expected, rtol=1e-8, atol=1e-8)
+    torch.testing.assert_close(fitted_from_moments, fitted, rtol=0, atol=0)
+
+
+def test_depth_adapter_factorization_preserves_teacher_projected_depth() -> None:
+    generator = torch.Generator().manual_seed(3407)
+    student_projection = torch.randn(3, 5, generator=generator, dtype=torch.float64)
+    teacher_projection = torch.randn(3, 4, generator=generator, dtype=torch.float64)
+    teacher_adapter = torch.randn(4, 2, generator=generator, dtype=torch.float64)
+
+    student_adapter = factor_depth_adapter(
+        student_projection,
+        teacher_projection,
+        teacher_adapter,
+        ridge=1e-12,
+    )
+
+    torch.testing.assert_close(
+        student_projection @ student_adapter,
+        teacher_projection @ teacher_adapter,
+        rtol=1e-8,
+        atol=1e-8,
+    )
+
+
+@pytest.mark.parametrize("failure", ["shape", "nonfinite", "ridge"])
+def test_ridge_projection_fails_closed(failure: str) -> None:
+    source = torch.ones(8, 4, dtype=torch.float64)
+    target = torch.ones(8, 3, dtype=torch.float64)
+    ridge = 1e-4
+    if failure == "shape":
+        target = target[:-1]
+    elif failure == "nonfinite":
+        source[0, 0] = torch.nan
+    else:
+        ridge = -1.0
+
+    with pytest.raises(ValueError):
+        fit_ridge_projection(source, target, ridge=ridge)
