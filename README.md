@@ -38,6 +38,12 @@ Current YOPO entry points are in:
 |---|---|---:|---:|---:|---|
 | YOPO Swin-L | [file](configs/yopo/housecat6d_yopo_swinl.py) | 71.3 | 34.8 | 33.3 | [link](https://github.com/pitin-ev/YOPO/releases/download/v1.0.0/housecat6d_yopo_swinl.pth) |
 
+### Fruit RGB-D (custom validation split)
+
+| Model | HBB AP50 | Ellipse AP50 | Projection AP50 | Shared AP25 | Strict 3D IoU25 | Best-only bundle |
+|---|---:|---:|---:|---:|---:|---|
+| YOPO YOLO26m RGB-D | 0.8622 | 0.8614 | 0.8342 | 0.2679 | 0.1915 | [tar.zst](https://github.com/yuki-inaho/YOPO_clone/releases/download/yolo26m-rgbd-20260906/yopo_yolo26m_rgbd_best_20260906.tar.zst) |
+
 ## Quickstart (uv + RTX 5090 / cu128)
 
 The `rgb-d` branch uses **uv** with a repo-local Python 3.10 venv, PyTorch
@@ -195,9 +201,54 @@ bash tools/dist_train.sh configs/yopo/nocs_yopo_real_camera_swinl_finetune_real.
   --cfg-options load_from=work_dirs/nocs_yopo_real_camera_swinl/epoch_12.pth
 ```
 
-## RGB-D stage selection and reverse-KLD smoke
+## Fruit RGB-D YOLO26m production model
 
-For the fruit RGB-D curriculum, the selected production model remains stage 8:
+The selected model uses the accepted DEIMv2 JAX model's official-pretrained
+YOLO26m backbone layers 0-10 as the YOPO RGB branch. It retains the existing
+HGNetV2-B0 depth branch, residual fusion, PortableHybridEncoder, and YOPO query
+decoder/2D/3D heads. It does **not** use the native YOLO Detect/OBB head or the
+YOLO head-side PAN/FPN.
+
+The run used batch 24, BF16, AMUSE, validation every five epochs, and early
+stopping on shared AP25. Epoch 10 was selected; training stopped normally at
+epoch 30 after four non-improving validation records. Independent evaluation
+on 181 images reproduced HBB AP50 `0.8622128367`, ellipse AP50 `0.8613967896`,
+projection AP50 `0.8342097371`, shared AP25 `0.2679015474`, and strict 3D IoU25
+`0.1914560553`, with zero invalid projection/ellipsoid predictions.
+
+The archive contains exactly one model checkpoint plus its resolved config,
+metrics, manifest, public work record, and design. It excludes datasets,
+optimizer state, raw logs, and intermediate or rejected checkpoints.
+
+```bash
+gh release download yolo26m-rgbd-20260906 \
+  --repo yuki-inaho/YOPO_clone \
+  --pattern 'yopo_yolo26m_rgbd_best_20260906.tar.zst'
+sha256sum yopo_yolo26m_rgbd_best_20260906.tar.zst
+# Expected: 31fe6dcfae643d87b542bd438cc9a63dc1b63f24f7616cca2b46a3dc41e00f90
+tar --zstd -xf yopo_yolo26m_rgbd_best_20260906.tar.zst
+sha256sum --check \
+  yopo_yolo26m_rgbd_best_20260906/MANIFEST.sha256
+```
+
+The model-only checkpoint SHA256 is
+`831c82632adf1beff15327f0f633570c08cf18d4b3e06660b97792b5157b4ad0`.
+See the [work record](diary/workdoc_2026-09-06_yolo26m_rgbd_training.md) and
+[transfer design](diary/design_yolo26m_rgbd_transfer.md) for the strict
+250-leaf transfer, train-only boundary calibration, commands, and full metrics.
+
+Evaluate after extracting the archive:
+
+```bash
+YOPO_BEST="$PWD/yopo_yolo26m_rgbd_best_20260906/yopo_yolo26m_rgbd_best_epoch10.pth"
+uv run python tools/test.py \
+  configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage2_calibrated_full.py \
+  "$YOPO_BEST"
+```
+
+### Legacy stage selection and reverse-KLD smoke
+
+Before the YOLO26m transfer, the selected RGB-D baseline was stage 8:
 `configs/yopo/nocs_fruits_2026_rgbd_shared_stage8_sensor_depth_anchor.py`. Stage 10 is
 an experimental follow-up that changes only the direct ellipsoid KLD direction to
 prediction-to-target and caps training at 15 epochs:
