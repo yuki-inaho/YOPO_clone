@@ -244,8 +244,9 @@ class YOLO26Backbone(BaseModule):
         init_cfg: dict | None = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
-        if in_channels != 3:
-            raise ValueError("YOLO26Backbone requires exactly three RGB channels")
+        if in_channels not in (1, 3):
+            raise ValueError("YOLO26Backbone requires one depth or three RGB channels")
+        self.in_channels = in_channels
         if scale not in _SCALE_CHANNELS:
             raise ValueError("scale must be one of 'n', 's', or 'm'")
         indices = tuple(return_idx)
@@ -262,7 +263,7 @@ class YOLO26Backbone(BaseModule):
         early_c3k = scale == "m"
         self.layers = nn.ModuleDict(
             {
-                "0": _ConvNormAct(3, channels[0], 3, stride=2),
+                "0": _ConvNormAct(in_channels, channels[0], 3, stride=2),
                 "1": _ConvNormAct(channels[0], channels[1], 3, stride=2),
                 "2": _C3k2(channels[1], channels[2], c3k=early_c3k, expansion=0.25),
                 "3": _ConvNormAct(channels[2], channels[3], 3, stride=2),
@@ -287,9 +288,10 @@ class YOLO26Backbone(BaseModule):
         return self
 
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
-        if inputs.ndim != 4 or inputs.shape[1] != 3:
+        if inputs.ndim != 4 or inputs.shape[1] != self.in_channels:
             raise ValueError(
-                f"YOLO26Backbone expects NCHW RGB input, got {tuple(inputs.shape)}"
+                f"YOLO26Backbone expects NCHW with {self.in_channels} channels, "
+                f"got {tuple(inputs.shape)}"
             )
         if inputs.shape[2] <= 0 or inputs.shape[3] <= 0:
             raise ValueError("input height and width must be positive")

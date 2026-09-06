@@ -25,11 +25,11 @@ def position_encoding_2d(
     """Create the contract's row-major 2-D sine/cosine encoding."""
 
     if channels % 4:
-        raise ValueError('position-encoding channels must be divisible by four')
+        raise ValueError("position-encoding channels must be divisible by four")
     y, x = torch.meshgrid(
         torch.arange(height, device=device, dtype=torch.float32),
         torch.arange(width, device=device, dtype=torch.float32),
-        indexing='ij',
+        indexing="ij",
     )
     quarter = channels // 4
     omega = 1.0 / (
@@ -64,7 +64,7 @@ class _AIFILayer(nn.Module):
         )
         tokens = tokens + attended
         normalized = self.norm2(tokens)
-        return tokens + self.ffn2(F.gelu(self.ffn1(normalized), approximate='tanh'))
+        return tokens + self.ffn2(F.gelu(self.ffn1(normalized), approximate="tanh"))
 
 
 @MODELS.register_module()
@@ -89,13 +89,15 @@ class PortableHybridEncoderNeck(BaseModule):
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         if len(in_channels) != 3 or min(in_channels) <= 0:
-            raise ValueError('in_channels must contain three positive levels')
+            raise ValueError("in_channels must contain three positive levels")
         if hidden_dim <= 0 or hidden_dim % num_heads:
-            raise ValueError('hidden_dim must be positive and divisible by num_heads')
+            raise ValueError("hidden_dim must be positive and divisible by num_heads")
         if ffn_dim <= 0 or num_aifi_layers < 0:
-            raise ValueError('ffn_dim must be positive and AIFI layer count non-negative')
-        if num_outs != 4:
-            raise ValueError('v1 portable neck requires exactly four outputs')
+            raise ValueError(
+                "ffn_dim must be positive and AIFI layer count non-negative"
+            )
+        if num_outs not in (3, 4):
+            raise ValueError("portable neck requires three or four outputs")
         self.in_channels = tuple(int(value) for value in in_channels)
         self.hidden_dim = int(hidden_dim)
         self.num_heads = int(num_heads)
@@ -119,26 +121,34 @@ class PortableHybridEncoderNeck(BaseModule):
             nn.Conv2d(self.hidden_dim * 2, self.hidden_dim, 3, padding=1, bias=False)
             for _ in range(2)
         )
-        self.derived_p6 = nn.Conv2d(
-            self.hidden_dim, self.hidden_dim, 3, stride=2, padding=1, bias=False
+        self.derived_p6 = (
+            nn.Conv2d(
+                self.hidden_dim, self.hidden_dim, 3, stride=2, padding=1, bias=False
+            )
+            if num_outs == 4
+            else None
         )
 
     def _validate(self, inputs: Sequence[Tensor]) -> None:
         if len(inputs) != 3:
-            raise ValueError(f'expected three feature levels, got {len(inputs)}')
+            raise ValueError(f"expected three feature levels, got {len(inputs)}")
         previous_size: tuple[int, int] | None = None
         for level, (feature, channels) in enumerate(zip(inputs, self.in_channels)):
             if feature.ndim != 4:
-                raise ValueError(f'level {level} must be NCHW, got {tuple(feature.shape)}')
+                raise ValueError(
+                    f"level {level} must be NCHW, got {tuple(feature.shape)}"
+                )
             if feature.shape[1] != channels:
                 raise ValueError(
-                    f'level {level} channels must be {channels}, got {feature.shape[1]}'
+                    f"level {level} channels must be {channels}, got {feature.shape[1]}"
                 )
             size = (int(feature.shape[-2]), int(feature.shape[-1]))
             if previous_size is not None and (
                 size[0] > previous_size[0] or size[1] > previous_size[1]
             ):
-                raise ValueError('feature spatial sizes must be non-increasing by level')
+                raise ValueError(
+                    "feature spatial sizes must be non-increasing by level"
+                )
             previous_size = size
 
     @staticmethod
@@ -176,17 +186,19 @@ class PortableHybridEncoderNeck(BaseModule):
             upsampled = F.interpolate(
                 top_down[level + 1],
                 size=top_down[level].shape[-2:],
-                mode='nearest-exact',
+                mode="nearest-exact",
             )
             top_down[level] = F.silu(
-                self.lateral[lateral_index](torch.cat((top_down[level], upsampled), dim=1))
+                self.lateral[lateral_index](
+                    torch.cat((top_down[level], upsampled), dim=1)
+                )
             )
 
         outputs = list(top_down)
         for level in range(1, len(outputs)):
             pooled = self.same_divide4_pool(outputs[level - 1])
             pooled = F.interpolate(
-                pooled, size=outputs[level].shape[-2:], mode='nearest-exact'
+                pooled, size=outputs[level].shape[-2:], mode="nearest-exact"
             )
             outputs[level] = F.silu(
                 self.pan[level - 1](torch.cat((outputs[level], pooled), dim=1))
@@ -195,4 +207,6 @@ class PortableHybridEncoderNeck(BaseModule):
 
     def forward(self, inputs: Sequence[Tensor]) -> tuple[Tensor, ...]:
         shared = self.forward_shared(inputs)
+        if self.derived_p6 is None:
+            return shared
         return (*shared, self.derived_p6(shared[-1]))
