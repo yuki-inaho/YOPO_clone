@@ -1,4 +1,4 @@
-"""Strict JAX HWIO to PyTorch OIHW transfer for YOLO26m layers 0--10."""
+"""Strict JAX HWIO to PyTorch OIHW transfer for YOLO26 layers 0--10."""
 
 from __future__ import annotations
 
@@ -61,7 +61,7 @@ def convert_jax_yolo26_backbone_arrays(
     target_prefix: str = "backbone.rgb_backbone.",
     strict: bool = True,
 ) -> tuple[dict[str, Tensor], JAXYOLO26TransferReport]:
-    """Map every and only YOLO26m backbone leaf, rejecting drift."""
+    """Map every and only one explicit YOLO26 backbone, rejecting drift."""
 
     if weights not in {"params", "ema"}:
         raise ValueError("weights must be 'params' or 'ema'")

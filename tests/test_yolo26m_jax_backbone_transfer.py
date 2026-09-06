@@ -9,8 +9,11 @@ import pytest
 import torch
 from mmengine.config import Config
 
-from yopo.models.backbones.yolo26 import YOLO26MBackbone
+from yopo.models.backbones.yolo26 import YOLO26Backbone, YOLO26MBackbone
 from yopo.utils.jax_yolo26_transfer import convert_jax_yolo26_backbone_arrays
+from yopo.utils.rotated_yolo26_transfer import (
+    convert_rotated_yolo26_backbone_arrays,
+)
 from yopo.utils.yolo26_frontend_calibration import (
     factor_depth_adapter,
     fit_ridge_projection,
@@ -28,6 +31,58 @@ def _target_state() -> dict[str, torch.Tensor]:
         TARGET_PREFIX + key: value.detach().cpu()
         for key, value in model.state_dict().items()
     }
+
+
+def _scale_target_state(scale: str) -> dict[str, torch.Tensor]:
+    model = YOLO26Backbone(scale=scale)
+    return {
+        TARGET_PREFIX + key: value.detach().cpu()
+        for key, value in model.state_dict().items()
+    }
+
+
+def _rotated_path(relative: str) -> str:
+    relative = relative.removeprefix("layers.")
+    layer, _, remainder = relative.partition(".")
+    if layer == "10":
+        remainder = remainder.replace("block.attention.projection", "m.0.attn.proj")
+        remainder = remainder.replace("block.attention", "m.0.attn")
+        remainder = remainder.replace("block.ffn", "m.0.ffn")
+    else:
+        remainder = remainder.replace("block.bottleneck", "m.0.bottleneck")
+        remainder = remainder.replace("block.c3k.blocks", "m.0.c3k.m")
+        remainder = remainder.replace("block.c3k", "m.0.c3k")
+    return f"yolo26/model/{layer}" + (
+        f"/{remainder.replace('.', '/')}" if remainder else ""
+    )
+
+
+def _canonical_rotated_source(
+    target_state: Mapping[str, torch.Tensor],
+) -> dict[str, np.ndarray]:
+    source: dict[str, np.ndarray] = {}
+    for target_key, target in target_state.items():
+        relative = target_key.removeprefix(TARGET_PREFIX)
+        if relative.endswith("num_batches_tracked"):
+            continue
+        if relative.endswith(".conv.weight"):
+            path = _rotated_path(relative.removesuffix(".conv.weight"))
+            source[f"params/{path}/conv/kernel"] = np.ascontiguousarray(
+                target.numpy().transpose(2, 3, 1, 0)
+            )
+            continue
+        path, field = relative.rsplit(".norm.", 1)
+        collection = "batch_stats" if field.startswith("running_") else "params"
+        source_field = {
+            "weight": "scale",
+            "bias": "bias",
+            "running_mean": "mean",
+            "running_var": "var",
+        }[field]
+        source[f"{collection}/{_rotated_path(path)}/norm/{source_field}"] = (
+            np.ascontiguousarray(target.numpy())
+        )
+    return source
 
 
 def _source_key(target_key: str) -> tuple[str, bool] | None:
@@ -73,6 +128,80 @@ def test_yolo26m_backbone_outputs_expected_three_level_pyramid() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("scale", "channels", "mapped_leaves", "batch_norms"),
+    [
+        ("n", (128, 128, 256), 200, 40),
+        ("s", (256, 256, 512), 200, 40),
+        ("m", (512, 512, 512), 250, 50),
+    ],
+)
+def test_yolo26_rgb_backbone_outputs_scale_specific_channels(
+    scale: str,
+    channels: tuple[int, int, int],
+    mapped_leaves: int,
+    batch_norms: int,
+) -> None:
+    model = YOLO26Backbone(scale=scale)
+
+    outputs = model(torch.randn(1, 3, 64, 96))
+
+    assert model.scale == scale
+    assert tuple(model._out_channels.values()) == channels
+    assert tuple(output.shape for output in outputs) == (
+        (1, channels[0], 8, 12),
+        (1, channels[1], 4, 6),
+        (1, channels[2], 2, 3),
+    )
+    state = model.state_dict()
+    assert (
+        sum(not key.endswith("num_batches_tracked") for key in state) == mapped_leaves
+    )
+    assert sum(key.endswith("num_batches_tracked") for key in state) == batch_norms
+
+
+def test_yolo26_generic_backbone_rejects_implicit_scale_fallback() -> None:
+    with pytest.raises(ValueError, match="scale"):
+        YOLO26Backbone(scale="x")
+
+
+@pytest.mark.parametrize(("scale", "leaf_count"), [("n", 200), ("s", 200), ("m", 250)])
+def test_rotated_backbone_transfer_maps_exact_scale_leaf_count(
+    scale: str, leaf_count: int
+) -> None:
+    target = _scale_target_state(scale)
+    source = _canonical_rotated_source(target)
+    source["params/yolo26/model/23/head/kernel"] = np.zeros(1, np.float32)
+
+    converted, report = convert_rotated_yolo26_backbone_arrays(
+        source, target, weights="params"
+    )
+
+    assert report.ok
+    assert len(converted) == len(report.mapped) == leaf_count
+    assert report.excluded_source == ()
+    assert report.ignored_non_backbone == ("params/yolo26/model/23/head/kernel",)
+
+
+@pytest.mark.parametrize("failure", ["missing", "extra", "shape", "nonfinite"])
+def test_rotated_backbone_transfer_fails_closed(failure: str) -> None:
+    target = _scale_target_state("n")
+    source = _canonical_rotated_source(target)
+    first_key = sorted(source)[0]
+    if failure == "missing":
+        source.pop(first_key)
+    elif failure == "extra":
+        source["params/yolo26/model/10/unexpected/kernel"] = np.zeros(1, np.float32)
+    elif failure == "shape":
+        source[first_key] = np.zeros(1, np.float32)
+    else:
+        source[first_key] = source[first_key].copy()
+        source[first_key].flat[0] = np.nan
+
+    with pytest.raises(ValueError, match=failure):
+        convert_rotated_yolo26_backbone_arrays(source, target, strict=True)
+
+
 def test_yolo26m_backbone_supports_native_600_style_non_aligned_height() -> None:
     model = YOLO26MBackbone()
 
@@ -87,14 +216,18 @@ def test_yolo26m_backbone_supports_native_600_style_non_aligned_height() -> None
 
 def test_yolo26m_backbone_freezes_bn_statistics_but_trains_affine() -> None:
     model = YOLO26MBackbone().train()
-    norms = [module for module in model.modules() if isinstance(module, torch.nn.BatchNorm2d)]
+    norms = [
+        module for module in model.modules() if isinstance(module, torch.nn.BatchNorm2d)
+    ]
     assert len(norms) == 50
     assert all(not norm.training for norm in norms)
     before = [(norm.running_mean.clone(), norm.running_var.clone()) for norm in norms]
 
     sum(output.mean() for output in model(torch.randn(2, 3, 64, 64))).backward()
 
-    assert all(norm.weight.requires_grad and norm.weight.grad is not None for norm in norms)
+    assert all(
+        norm.weight.requires_grad and norm.weight.grad is not None for norm in norms
+    )
     assert all(
         torch.equal(norm.running_mean, mean) and torch.equal(norm.running_var, var)
         for norm, (mean, var) in zip(norms, before)
@@ -194,27 +327,49 @@ def test_stage8_reuse_fails_closed_on_contract_drift(failure: str) -> None:
         select_stage8_reuse_state(source, target, strict=True)
 
 
-def test_yolo26m_rgbd_full_config_replaces_only_the_rgb_interface() -> None:
+@pytest.mark.parametrize(
+    ("scale", "channels"),
+    [
+        ("n", [128, 128, 256]),
+        ("s", [256, 256, 512]),
+        ("m", [512, 512, 512]),
+    ],
+)
+def test_yolo26_rgbd_full_config_replaces_only_the_rgb_interface(
+    scale: str, channels: list[int]
+) -> None:
     config = Config.fromfile(
-        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage1_full.py"
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage1_full.py"
     )
 
     assert config.model.backbone.type == "RGBDResidualBackbone"
-    assert config.model.backbone.rgb_backbone.type == "YOLO26MBackbone"
+    assert config.model.backbone.rgb_backbone.type == "YOLO26Backbone"
+    assert config.model.backbone.rgb_backbone.scale == scale
     assert config.model.backbone.rgb_backbone.return_idx == [1, 2, 3]
     assert config.model.backbone.depth_backbone.type == "HGNetV2"
     assert config.model.backbone.depth_backbone.name == "B0"
-    assert config.model.neck.in_channels == [512, 512, 512]
-    assert config.load_from.endswith("yolo26m_rgbd_stage1_initial.pth")
+    assert config.model.neck.in_channels == channels
+    assert config.load_from.endswith(f"yolo26{scale}_rgbd_stage1_initial.pth")
     assert config.resume is False
+    assert (
+        config.optim_wrapper.optimizer.type
+        == "yopo.engine.optimizers.amuse.AmuseOptimizer"
+    )
+    assert (
+        config.optim_wrapper.type == "yopo.engine.optimizers.amuse.AmpAmuseOptimWrapper"
+    )
+    assert config.optim_wrapper.dtype == "bfloat16"
 
 
-def test_yolo26m_rgbd_capacity_and_resume_gate_configs_are_bounded() -> None:
+@pytest.mark.parametrize("scale", ["n", "s", "m"])
+def test_yolo26_rgbd_capacity_and_resume_gate_configs_are_bounded(
+    scale: str,
+) -> None:
     capacity = Config.fromfile(
-        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage1_capacity.py"
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage1_capacity.py"
     )
     gate = Config.fromfile(
-        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage1_gate200.py"
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage1_gate200.py"
     )
 
     assert capacity.train_cfg.type == "IterBasedTrainLoop"
@@ -228,16 +383,17 @@ def test_yolo26m_rgbd_capacity_and_resume_gate_configs_are_bounded() -> None:
     assert gate.default_hooks.checkpoint.interval == 100
 
 
-def test_calibrated_full_changes_only_the_weight_source() -> None:
+@pytest.mark.parametrize("scale", ["n", "s", "m"])
+def test_calibrated_full_changes_only_the_weight_source(scale: str) -> None:
     original = Config.fromfile(
-        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage1_full.py"
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage1_full.py"
     ).to_dict()
     calibrated = Config.fromfile(
-        "configs/yopo/nocs_fruits_2026_rgbd_yolo26m_stage2_calibrated_full.py"
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage2_calibrated_full.py"
     ).to_dict()
 
     assert calibrated["load_from"].endswith(
-        "yolo26m_rgbd_frontend_calibrated_train64.pth"
+        f"yolo26{scale}_rgbd_frontend_calibrated_train64.pth"
     )
     calibrated["load_from"] = original["load_from"]
 

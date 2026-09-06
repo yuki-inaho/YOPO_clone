@@ -1,4 +1,4 @@
-"""YOLO26m layers 0--10 used as YOPO's RGB feature backbone."""
+"""Official YOLO26 n/s/m layers 0--10 used as YOPO's RGB backbone."""
 
 from __future__ import annotations
 
@@ -101,18 +101,30 @@ class _C3kBranch(nn.Module):
         return self.c3k(inputs)
 
 
+class _BottleneckBranch(nn.Module):
+    """Retain the JAX ``block/bottleneck`` state-tree boundary."""
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.bottleneck = _Bottleneck(channels, channels)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.bottleneck(inputs)
+
+
 class _C3k2(nn.Module):
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
         *,
+        c3k: bool,
         expansion: float,
     ) -> None:
         super().__init__()
         hidden = int(out_channels * expansion)
         self.cv1 = _ConvNormAct(in_channels, hidden * 2)
-        self.block = _C3kBranch(hidden)
+        self.block = _C3kBranch(hidden) if c3k else _BottleneckBranch(hidden)
         self.cv2 = _ConvNormAct(hidden * 3, out_channels)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -208,9 +220,16 @@ class _C2PSA(nn.Module):
         return self.cv2(torch.cat((first, transformed), dim=1))
 
 
+_SCALE_CHANNELS = {
+    "n": (16, 32, 64, 64, 128, 128, 128, 256, 256, 256, 256),
+    "s": (32, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512),
+    "m": (64, 128, 256, 256, 512, 512, 512, 512, 512, 512, 512),
+}
+
+
 @MODELS.register_module()
-class YOLO26MBackbone(BaseModule):
-    """Official YOLO26m layers 0--10 with P3/P4/P5 feature taps.
+class YOLO26Backbone(BaseModule):
+    """Official YOLO26 n/s/m layers 0--10 with P3/P4/P5 feature taps.
 
     The public ``return_idx`` values are YOPO output-level identifiers and
     align with HGNetV2-B0. Actual YOLO graph taps remain explicit in
@@ -219,37 +238,46 @@ class YOLO26MBackbone(BaseModule):
 
     def __init__(
         self,
+        scale: str,
         in_channels: int = 3,
         return_idx: tuple[int, int, int] | list[int] = (1, 2, 3),
         init_cfg: dict | None = None,
     ) -> None:
         super().__init__(init_cfg=init_cfg)
         if in_channels != 3:
-            raise ValueError("YOLO26MBackbone requires exactly three RGB channels")
+            raise ValueError("YOLO26Backbone requires exactly three RGB channels")
+        if scale not in _SCALE_CHANNELS:
+            raise ValueError("scale must be one of 'n', 's', or 'm'")
         indices = tuple(return_idx)
         if len(indices) != 3 or len(set(indices)) != 3:
             raise ValueError("return_idx must contain three unique output-level IDs")
+        self.scale = scale
         self.return_idx = indices
         self.out_layer_indices = (4, 6, 10)
-        self._out_channels = {index: 512 for index in indices}
+        channels = _SCALE_CHANNELS[scale]
+        self._out_channels = {
+            index: channels[layer]
+            for index, layer in zip(indices, self.out_layer_indices)
+        }
+        early_c3k = scale == "m"
         self.layers = nn.ModuleDict(
             {
-                "0": _ConvNormAct(3, 64, 3, stride=2),
-                "1": _ConvNormAct(64, 128, 3, stride=2),
-                "2": _C3k2(128, 256, expansion=0.25),
-                "3": _ConvNormAct(256, 256, 3, stride=2),
-                "4": _C3k2(256, 512, expansion=0.25),
-                "5": _ConvNormAct(512, 512, 3, stride=2),
-                "6": _C3k2(512, 512, expansion=0.5),
-                "7": _ConvNormAct(512, 512, 3, stride=2),
-                "8": _C3k2(512, 512, expansion=0.5),
-                "9": _SPPF(512),
-                "10": _C2PSA(512),
+                "0": _ConvNormAct(3, channels[0], 3, stride=2),
+                "1": _ConvNormAct(channels[0], channels[1], 3, stride=2),
+                "2": _C3k2(channels[1], channels[2], c3k=early_c3k, expansion=0.25),
+                "3": _ConvNormAct(channels[2], channels[3], 3, stride=2),
+                "4": _C3k2(channels[3], channels[4], c3k=early_c3k, expansion=0.25),
+                "5": _ConvNormAct(channels[4], channels[5], 3, stride=2),
+                "6": _C3k2(channels[5], channels[6], c3k=True, expansion=0.5),
+                "7": _ConvNormAct(channels[6], channels[7], 3, stride=2),
+                "8": _C3k2(channels[7], channels[8], c3k=True, expansion=0.5),
+                "9": _SPPF(channels[9]),
+                "10": _C2PSA(channels[10]),
             }
         )
         self.train(self.training)
 
-    def train(self, mode: bool = True) -> "YOLO26MBackbone":
+    def train(self, mode: bool = True) -> "YOLO26Backbone":
         """Keep BN statistics frozen while preserving affine gradients."""
 
         super().train(mode)
@@ -261,8 +289,7 @@ class YOLO26MBackbone(BaseModule):
     def forward(self, inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
         if inputs.ndim != 4 or inputs.shape[1] != 3:
             raise ValueError(
-                "YOLO26MBackbone expects NCHW RGB input, "
-                f"got {tuple(inputs.shape)}"
+                f"YOLO26Backbone expects NCHW RGB input, got {tuple(inputs.shape)}"
             )
         if inputs.shape[2] <= 0 or inputs.shape[3] <= 0:
             raise ValueError("input height and width must be positive")
@@ -275,4 +302,22 @@ class YOLO26MBackbone(BaseModule):
         return tuple(features)
 
 
-__all__ = ["YOLO26MBackbone"]
+@MODELS.register_module()
+class YOLO26MBackbone(YOLO26Backbone):
+    """Backward-compatible explicit alias for the original m-only class."""
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        return_idx: tuple[int, int, int] | list[int] = (1, 2, 3),
+        init_cfg: dict | None = None,
+    ) -> None:
+        super().__init__(
+            scale="m",
+            in_channels=in_channels,
+            return_idx=return_idx,
+            init_cfg=init_cfg,
+        )
+
+
+__all__ = ["YOLO26Backbone", "YOLO26MBackbone"]

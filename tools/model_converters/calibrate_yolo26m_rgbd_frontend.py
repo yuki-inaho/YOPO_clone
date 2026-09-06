@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Calibrate the seven fresh YOLO26m-to-YOPO RGB-D boundary leaves."""
+"""Calibrate the seven fresh YOLO26-to-YOPO RGB-D boundary leaves."""
 
 from __future__ import annotations
 
@@ -63,9 +63,7 @@ def _load_component(
     }
     incompatible = module.load_state_dict(component_state, strict=True)
     if incompatible.missing_keys or incompatible.unexpected_keys:
-        raise RuntimeError(
-            f"strict component load failed for {prefix}: {incompatible}"
-        )
+        raise RuntimeError(f"strict component load failed for {prefix}: {incompatible}")
 
 
 def _deterministic_train_loader(
@@ -160,6 +158,7 @@ def calibrate_checkpoint(
     ridge: float = 1e-4,
     depth_ridge: float = 1e-6,
     seed: int = 20260906,
+    scale: str | None = None,
 ) -> tuple[Path, Path]:
     """Calibrate and save a complete weight-only student checkpoint."""
 
@@ -186,9 +185,13 @@ def calibrate_checkpoint(
     student_state = student_checkpoint["state_dict"]
     teacher_state = teacher_checkpoint["state_dict"]
 
-    student_backbone = MODELS.build(student_config.model.backbone).to(torch_device).eval()
+    student_backbone = (
+        MODELS.build(student_config.model.backbone).to(torch_device).eval()
+    )
     student_neck = MODELS.build(student_config.model.neck).to(torch_device).eval()
-    teacher_backbone = MODELS.build(teacher_config.model.backbone).to(torch_device).eval()
+    teacher_backbone = (
+        MODELS.build(teacher_config.model.backbone).to(torch_device).eval()
+    )
     teacher_neck = MODELS.build(teacher_config.model.neck).to(torch_device).eval()
     preprocessor = MODELS.build(student_config.model.data_preprocessor).to(torch_device)
     preprocessor.eval()
@@ -199,6 +202,27 @@ def calibrate_checkpoint(
 
     if student_backbone.num_scales != 3 or teacher_backbone.num_scales != 3:
         raise ValueError("calibration requires exactly three feature levels")
+    student_rgb = student_backbone.rgb_backbone
+    student_scale = getattr(student_rgb, "scale", None)
+    if student_scale not in {"n", "s", "m"}:
+        raise ValueError(f"student RGB backbone has invalid scale {student_scale!r}")
+    if scale is not None and scale != student_scale:
+        raise ValueError(
+            f"student config scale {student_scale!r} does not match requested {scale!r}"
+        )
+    student_indices = sorted(student_rgb.return_idx)
+    student_channels = tuple(
+        student_rgb._out_channels[index] for index in student_indices
+    )
+    projection_channels = tuple(
+        int(layer.weight.shape[0]) for layer in student_neck.projections
+    )
+    if tuple(int(layer.weight.shape[1]) for layer in student_neck.projections) != (
+        student_channels
+    ):
+        raise ValueError("student neck projection input channels do not match RGB taps")
+    if len(set(projection_channels)) != 1:
+        raise ValueError("student neck projections must have one shared output width")
     loader = _deterministic_train_loader(
         student_config,
         batch_size=batch_size,
@@ -206,8 +230,14 @@ def calibrate_checkpoint(
         seed=seed,
     )
     iterator = iter(loader)
-    grams = [torch.zeros(512, 512, dtype=torch.float64) for _ in range(3)]
-    crosses = [torch.zeros(512, 256, dtype=torch.float64) for _ in range(3)]
+    grams = [
+        torch.zeros(channels, channels, dtype=torch.float64)
+        for channels in student_channels
+    ]
+    crosses = [
+        torch.zeros(channels, output, dtype=torch.float64)
+        for channels, output in zip(student_channels, projection_channels)
+    ]
     target_squares = [0.0, 0.0, 0.0]
     sample_counts = [0, 0, 0]
 
@@ -220,7 +250,8 @@ def calibrate_checkpoint(
             for level in range(3):
                 target = teacher_neck.projections[level](teacher_rgb[level])
                 source_samples, target_samples = _sample_aligned(
-                    student_rgb[level], target,
+                    student_rgb[level],
+                    target,
                     maximum=samples_per_level,
                     generator=generator,
                 )
@@ -240,7 +271,11 @@ def calibrate_checkpoint(
         )
         student_projection = fitted
         teacher_projection = (
-            teacher_neck.projections[level].weight.detach().cpu().squeeze(-1).squeeze(-1)
+            teacher_neck.projections[level]
+            .weight.detach()
+            .cpu()
+            .squeeze(-1)
+            .squeeze(-1)
         ).double()
         teacher_adapter = (
             teacher_backbone.depth_adapters[level]
@@ -327,7 +362,9 @@ def calibrate_checkpoint(
                 )
                 calibrated = student_neck.projections[level](calibrated_fused)
                 initial_samples, calibrated_samples, target_samples = _sample_aligned(
-                    initial, calibrated, target,
+                    initial,
+                    calibrated,
+                    target,
                     maximum=samples_per_level,
                     generator=generator,
                 )
@@ -387,7 +424,9 @@ def calibrate_checkpoint(
             f"missing={sorted(BOUNDARY_KEYS - changed)}, "
             f"extra={sorted(changed - BOUNDARY_KEYS)[:3]}"
         )
-    if not all(bool(torch.isfinite(value).all()) for value in calibrated_state.values()):
+    if not all(
+        bool(torch.isfinite(value).all()) for value in calibrated_state.values()
+    ):
         raise RuntimeError("calibrated state contains non-finite values")
 
     strict_model = MODELS.build(student_config.model)
@@ -396,7 +435,10 @@ def calibrate_checkpoint(
         raise RuntimeError(f"strict calibrated model load failed: {incompatible}")
 
     metadata = {
-        "format": "yopo_yolo26m_rgbd_frontend_calibrated_v1",
+        "format": "yopo_yolo26_rgbd_frontend_calibrated_v2",
+        "scale": student_scale,
+        "rgb_channels": list(student_channels),
+        "projection_channels": list(projection_channels),
         "student_checkpoint": student_checkpoint_path.name,
         "student_checkpoint_sha256": _sha256(student_checkpoint_path),
         "teacher_checkpoint": teacher_checkpoint_path.name,
@@ -451,6 +493,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ridge", type=float, default=1e-4)
     parser.add_argument("--depth-ridge", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=20260906)
+    parser.add_argument("--scale", choices=("n", "s", "m"))
     return parser.parse_args()
 
 
@@ -471,6 +514,7 @@ def main() -> None:
         ridge=args.ridge,
         depth_ridge=args.depth_ridge,
         seed=args.seed,
+        scale=args.scale,
     )
     print(json.dumps({"output": str(output), "report": str(report)}, indent=2))
 

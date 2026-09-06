@@ -1,4 +1,4 @@
-"""Closed-form calibration for the YOLO26m-to-YOPO feature boundary."""
+"""Closed-form calibration for a YOLO26-to-YOPO feature boundary."""
 
 from __future__ import annotations
 

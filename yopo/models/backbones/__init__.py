@@ -21,7 +21,7 @@ from .ssd_vgg import SSDVGG
 from .swin import SwinTransformer
 from .trident_resnet import TridentResNet
 from .dual_rgbd import RGBDDualBackbone, RGBDResidualBackbone
-from .yolo26 import YOLO26MBackbone
+from .yolo26 import YOLO26Backbone, YOLO26MBackbone
 
 __all__ = [
     'RegNet', 'ResNet', 'ResNetV1d', 'ResNeXt', 'SSDVGG', 'HRNet',
@@ -30,5 +30,5 @@ __all__ = [
     'SwinTransformer', 'PyramidVisionTransformer',
     'PyramidVisionTransformerV2', 'EfficientNet', 'CSPNeXt',
     'DinoConvNeXt', 'HGNetV2', 'RGBDDualBackbone', 'RGBDResidualBackbone',
-    'YOLO26MBackbone'
+    'YOLO26Backbone', 'YOLO26MBackbone'
 ]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Create the audited YOPO RGB-D initial weight from JAX best and stage 8."""
+"""Create audited YOLO26 n/s/m YOPO RGB-D initial weights."""
 
 from __future__ import annotations
 
@@ -16,6 +16,9 @@ import torch
 from yopo.registry import MODELS
 from yopo.utils import register_all_modules
 from yopo.utils.jax_yolo26_transfer import convert_jax_yolo26_backbone_arrays
+from yopo.utils.rotated_yolo26_transfer import (
+    convert_rotated_yolo26_backbone_arrays,
+)
 from yopo.utils.yolo26_rgbd_initialization import select_stage8_reuse_state
 
 
@@ -39,39 +42,106 @@ def _expected_fresh_target(key: str) -> bool:
     )
 
 
+def _nested(mapping: dict[str, Any], *path: str) -> Any:
+    value: Any = mapping
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def _source_scale(metadata: dict[str, Any], source_format: str) -> str | None:
+    if source_format == "deim":
+        return _nested(metadata, "config", "model", "backbone", "variant")
+    return _nested(metadata, "config", "model", "yolo26_scale") or _nested(
+        metadata, "model_config", "yolo26_scale"
+    )
+
+
 def prepare_checkpoint(
-    jax_checkpoint: Path,
+    backbone_checkpoint: Path,
     stage8_checkpoint: Path,
     target_config: Path,
     output: Path,
     *,
     weights: str = "ema",
+    scale: str = "m",
+    source_format: str = "auto",
     seed: int = 3407,
 ) -> tuple[Path, Path]:
     """Build a complete weight-only checkpoint with every origin audited."""
 
-    arrays_path = jax_checkpoint / "arrays.npz"
-    manifest_path = jax_checkpoint / "manifest.json"
-    for required in (arrays_path, manifest_path, stage8_checkpoint, target_config):
+    if scale not in {"n", "s", "m"}:
+        raise ValueError("scale must be one of 'n', 's', or 'm'")
+    if source_format not in {"auto", "deim", "rotated"}:
+        raise ValueError("source_format must be 'auto', 'deim', or 'rotated'")
+    if source_format == "auto":
+        source_format = "deim" if backbone_checkpoint.is_dir() else "rotated"
+    for required in (stage8_checkpoint, target_config):
         if not required.is_file():
             raise FileNotFoundError(required)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    arrays_sha256 = _sha256(arrays_path)
-    if arrays_sha256 != manifest.get("array_sha256"):
-        raise ValueError("JAX arrays SHA-256 does not match its manifest")
 
     torch.manual_seed(seed)
     register_all_modules()
     config = Config.fromfile(str(target_config))
     model = MODELS.build(config.model)
     target_state = model.state_dict()
+    target_scale = getattr(model.backbone.rgb_backbone, "scale", None)
+    if target_scale != scale:
+        raise ValueError(
+            f"target config scale {target_scale!r} does not match requested {scale!r}"
+        )
 
-    with np.load(arrays_path, allow_pickle=False) as source_arrays:
-        yolo_state, yolo_report = convert_jax_yolo26_backbone_arrays(
-            source_arrays,
-            target_state,
-            weights=weights,
-            strict=True,
+    source_metadata: dict[str, Any]
+    source_sha256: str
+    source_manifest_sha256: str | None = None
+    if source_format == "deim":
+        arrays_path = backbone_checkpoint / "arrays.npz"
+        manifest_path = backbone_checkpoint / "manifest.json"
+        for required in (arrays_path, manifest_path):
+            if not required.is_file():
+                raise FileNotFoundError(required)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        source_sha256 = _sha256(arrays_path)
+        if source_sha256 != manifest.get("array_sha256"):
+            raise ValueError("DEIM arrays SHA-256 does not match its manifest")
+        source_manifest_sha256 = _sha256(manifest_path)
+        source_metadata = manifest.get("metadata") or {}
+        with np.load(arrays_path, allow_pickle=False) as source_arrays:
+            yolo_state, yolo_report = convert_jax_yolo26_backbone_arrays(
+                source_arrays,
+                target_state,
+                weights=weights,
+                strict=True,
+            )
+    else:
+        if not backbone_checkpoint.is_file():
+            raise FileNotFoundError(backbone_checkpoint)
+        source_sha256 = _sha256(backbone_checkpoint)
+        with np.load(backbone_checkpoint, allow_pickle=False) as source_arrays:
+            if "__metadata__" not in source_arrays.files:
+                raise ValueError("Rotated checkpoint metadata is missing")
+            source_metadata = json.loads(
+                bytes(source_arrays["__metadata__"].tobytes()).decode("utf-8")
+            )
+            yolo_state, yolo_report = convert_rotated_yolo26_backbone_arrays(
+                source_arrays,
+                target_state,
+                weights=weights,
+                strict=True,
+            )
+    actual_source_scale = _source_scale(source_metadata, source_format)
+    if actual_source_scale != scale:
+        raise ValueError(
+            f"{source_format} source scale {actual_source_scale!r} "
+            f"does not match requested {scale!r}"
+        )
+    expected_leaf_count = {"n": 200, "s": 200, "m": 250}[scale]
+    if len(yolo_report.mapped) != expected_leaf_count:
+        raise ValueError(
+            f"{scale} backbone mapped {len(yolo_report.mapped)} leaves, "
+            f"expected {expected_leaf_count}"
         )
 
     stage8 = torch.load(stage8_checkpoint, map_location="cpu", weights_only=False)
@@ -103,7 +173,10 @@ def prepare_checkpoint(
     reported_missing = {
         key for key in expected_missing if not key.endswith("num_batches_tracked")
     }
-    if incompatible.unexpected_keys or set(incompatible.missing_keys) != reported_missing:
+    if (
+        incompatible.unexpected_keys
+        or set(incompatible.missing_keys) != reported_missing
+    ):
         raise RuntimeError(
             "model load audit failed: "
             f"missing={incompatible.missing_keys[:3]}, "
@@ -115,19 +188,20 @@ def prepare_checkpoint(
     final_state = {
         key: value.detach().cpu().clone() for key, value in model.state_dict().items()
     }
-    source_metadata = manifest.get("metadata") or {}
     metadata: dict[str, Any] = {
-        "format": "yopo_yolo26m_rgbd_initial_v1",
-        "architecture": "YOLO26m layers 0-10 RGB + HGNetV2-B0 depth",
-        "jax_weights": weights,
-        "jax_step": source_metadata.get("step", manifest.get("step")),
-        "jax_arrays_sha256": arrays_sha256,
-        "jax_manifest_sha256": _sha256(manifest_path),
+        "format": "yopo_yolo26_rgbd_initial_v2",
+        "architecture": f"YOLO26{scale} layers 0-10 RGB + HGNetV2-B0 depth",
+        "scale": scale,
+        "backbone_source_format": source_format,
+        "backbone_weights": weights,
+        "backbone_step": source_metadata.get("step"),
+        "backbone_checkpoint_sha256": source_sha256,
+        "backbone_manifest_sha256": source_manifest_sha256,
         "stage8_checkpoint_sha256": _sha256(stage8_checkpoint),
         "target_config": target_config.name,
         "target_config_sha256": _sha256(target_config),
         "fresh_seed": seed,
-        "mapped_jax_leaf_count": len(yolo_report.mapped),
+        "mapped_backbone_leaf_count": len(yolo_report.mapped),
         "mapped_stage8_leaf_count": len(reuse_report.mapped),
         "fresh_target_leaf_count": len(expected_missing),
         "state_leaf_count": len(final_state),
@@ -141,7 +215,7 @@ def prepare_checkpoint(
         "output": output.name,
         "output_sha256": _sha256(output),
         "fresh_target": sorted(expected_missing),
-        "jax_transfer": yolo_report.to_dict(),
+        "backbone_transfer": yolo_report.to_dict(),
         "stage8_reuse": reuse_report.to_dict(),
     }
     report_path = output.with_suffix(output.suffix + ".json")
@@ -154,11 +228,21 @@ def prepare_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--jax-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--backbone-checkpoint",
+        "--jax-checkpoint",
+        dest="backbone_checkpoint",
+        type=Path,
+        required=True,
+    )
     parser.add_argument("--stage8-checkpoint", type=Path, required=True)
     parser.add_argument("--target-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--weights", choices=("ema", "params"), default="ema")
+    parser.add_argument("--scale", choices=("n", "s", "m"), default="m")
+    parser.add_argument(
+        "--source-format", choices=("auto", "deim", "rotated"), default="auto"
+    )
     parser.add_argument("--seed", type=int, default=3407)
     return parser.parse_args()
 
@@ -166,11 +250,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     output, report = prepare_checkpoint(
-        args.jax_checkpoint.expanduser().resolve(),
+        args.backbone_checkpoint.expanduser().resolve(),
         args.stage8_checkpoint.expanduser().resolve(),
         args.target_config.expanduser().resolve(),
         args.output.expanduser().resolve(),
         weights=args.weights,
+        scale=args.scale,
+        source_format=args.source_format,
         seed=args.seed,
     )
     print(json.dumps({"output": str(output), "report": str(report)}, indent=2))

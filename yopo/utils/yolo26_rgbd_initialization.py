@@ -1,4 +1,4 @@
-"""Audited stage-8 reuse contract for YOLO26m RGB-D initialization."""
+"""Audited stage-8 reuse contract for YOLO26 RGB-D initialization."""
 
 from __future__ import annotations
 
@@ -91,7 +91,9 @@ def select_stage8_reuse_state(
         missing=tuple(sorted(missing)),
         shape_errors=tuple(sorted(shape_errors)),
         fresh_target=tuple(sorted(set(target_state).difference(selected))),
-        excluded_source=tuple(sorted(key for key in source_state if not _is_reused(key))),
+        excluded_source=tuple(
+            sorted(key for key in source_state if not _is_reused(key))
+        ),
         unexpected_source=tuple(unexpected),
     )
     if strict and not report.ok:
