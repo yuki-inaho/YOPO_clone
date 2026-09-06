@@ -66,7 +66,7 @@ ratioの1からの距離、HBBの順で判定し、結果を見て閾値や重�
 - [x] AMUSE aux分類とexact freeze hookを実装・単体検証した。
 - [x] zero-init Depth-to-shape adapterを実装し、初期等価性とgradientを確認した。
 - [x] D/E/F-on/F-off/Gを同一親から学習し、各bestを181枚で独立評価した。
-- [x] 事前規則を適用し、D15を主採用、G10をstrict 3D向けPareto代替とした。
+- [x] 事前規則でD15/G10をPareto集合に残し、ユーザー判断でG10を主採用、D15をshared向け代替とした。
 - [x] focused/full pytest、ruff、diff/config/checkpoint監査を完了する。
 - [x] private path/data/modelを除外し、公開変更をcommit/pushする。
 
@@ -75,15 +75,16 @@ ratioの1からの距離、HBBの順で判定し、結果を見て閾値や重�
 | 候補 | HBB AP50 | ellipse | projection | shared AP25 | strict 3D AP25 | ray median mm | depth ratio | 適格 |
 |---|---:|---:|---:|---:|---:|---:|---:|---|
 | B | .848343 | .848167 | .825071 | .315796 | .187744 | 8.4846 | 1.8235 | yes |
-| **D15（主採用）** | **.863438** | **.864990** | **.846640** | **.353354** | .220186 | **7.6803** | 1.6961 | yes |
+| **D15（shared代替）** | **.863438** | **.864990** | **.846640** | **.353354** | .220186 | **7.6803** | 1.6961 | yes |
 | E15 | .881085 | .881639 | .859584 | .310539 | .241219 | 8.5413 | 1.4156 | no: shared |
 | F-on15 | .848343 | .848167 | .828359 | .310222 | .187744 | 8.4836 | 1.4535 | no: shared |
 | F-off5 | .848343 | .848167 | .821415 | .274820 | .187744 | 8.4518 | 1.2040 | no: shared |
-| **G10（strict代替）** | **.871735** | **.872072** | **.850226** | **.313780** | **.236604** | 8.5308 | **1.4567** | yes |
+| **G10（主採用）** | **.871735** | **.872072** | **.850226** | **.313780** | **.236604** | 8.5308 | **1.4567** | yes |
 | G15 | .880279 | .880763 | .858270 | .308193 | .249705 | 8.5691 | 1.4109 | no: shared |
 
-D15とG10は一方が他方を支配しない。主指標sharedを優先する完成品はD15、strict 3Dを
-優先する用途ではG10を選ぶ。G15のstrict値だけをD/G10の2D値へ混ぜた成績は作らない。
+D15とG10は一方が他方を支配しない。事前規則でPareto集合を確定後、ユーザー判断により
+strict 3Dが高いG10を現行の主採用、D15をshared重視の代替とした。G15のstrict値だけを
+D/G10の2D値へ混ぜた成績は作らない。
 
 実測driver peakはD/Eが29,192 MiB、Gが29,244 MiBで、固定上限29,346 MiB以内。
 F-on/offは凍結により7,644 MiBだった。全runはexit 0、finite、invalid=0で完了した。
@@ -118,8 +119,8 @@ F-on/offは凍結により7,644 MiBだった。全runはexit 0、finite、invali
 | 用途 | config | checkpoint / SHA256 | 独立評価JSON / SHA256 |
 |---|---|---|---|
 | 親B | `configs/yopo/nocs_fruits_2026_rgbd_yolo26s_n_raw_features_calibrated_full.py` | `work_dirs/yopo_yolo26s_n_raw_features_calibrated_full_20260906/best_ellipsoid_shared_AP_25_epoch_20.pth` / `227da40d…510d` | `work_dirs/yopo_yolo26s_n_raw_features_b_best_eval_20260906/20260906_220020/20260906_220020.json` / `c4c04572…5f5b` |
-| 主採用D15 | `configs/yopo/nocs_fruits_2026_rgbd_yolo26s_n_raw_features_geometry_fp32.py` | `work_dirs/yopo_geometry_fp32_20260906/best_ellipsoid_shared_AP_25_epoch_15.pth` / `e9851c71…bcd3` | `work_dirs/yopo_geometry_fp32_best_eval_20260907/20260907_000932/20260907_000932.json` / `a736713b…456c` |
-| strict代替G10 | `configs/yopo/nocs_fruits_2026_rgbd_yolo26s_n_raw_features_geometry_depth_shape.py` | `work_dirs/yopo_geometry_depth_shape_20260906/best_ellipsoid_shared_AP_25_epoch_10.pth` / `dd01c325…3c64` | `work_dirs/yopo_geometry_depth_shape_best_eval_20260907/20260907_020053/20260907_020053.json` / `f902abca…1a07` |
+| shared代替D15 | `configs/yopo/nocs_fruits_2026_rgbd_yolo26s_n_raw_features_geometry_fp32.py` | `work_dirs/yopo_geometry_fp32_20260906/best_ellipsoid_shared_AP_25_epoch_15.pth` / `e9851c71…bcd3` | `work_dirs/yopo_geometry_fp32_best_eval_20260907/20260907_000932/20260907_000932.json` / `a736713b…456c` |
+| 主採用G10 | `configs/yopo/nocs_fruits_2026_rgbd_yolo26s_n_raw_features_geometry_depth_shape.py` | `work_dirs/yopo_geometry_depth_shape_20260906/best_ellipsoid_shared_AP_25_epoch_10.pth` / `dd01c325…3c64` | `work_dirs/yopo_geometry_depth_shape_best_eval_20260907/20260907_020053/20260907_020053.json` / `f902abca…1a07` |
 
 lineageはいずれもB-bestからのweights-only loadで、D/G間のoptimizer stateや追加学習を
 継承していない。完全なSHA256は結果要約に記載する。
@@ -137,3 +138,4 @@ lineageはいずれもB-bestからのweights-only loadで、D/G間のoptimizer s
 | 2026-09-07 02:06 | 事前規則による選抜・公開文書作成 | Pareto集合はD15/G10、主採用D15 |
 | 2026-09-07 02:10–02:13 | 最終品質確認 | focused 25、code suite 651 passed。ruff/config/strict load PASS |
 | 2026-09-07 02:13–02:16 | 公開安全監査・同期 | private artifact 0、commit `8de9577`を`origin/rgb-d`へpush |
+| 2026-09-07 08:09 | ユーザー採用判断 | G10を現行主採用、D15をshared向けPareto代替へ更新 |
