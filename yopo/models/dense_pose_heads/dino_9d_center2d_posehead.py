@@ -273,6 +273,7 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             gaucho_size_prior: float = 0.03,
             gaucho_classwise: bool = True,
             gaucho_use_bbox_conditioning: bool = True,
+            gaucho_depth_context: bool = False,
             gaucho_ellipse2d: bool = False,
             gaucho_ellipse2d_dn: bool = False,
             gaucho_ellipse2d_reference_detach: bool = True,
@@ -290,6 +291,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             sensor_depth_window: int = 2,
             sensor_depth_anchor: bool = False,
             sensor_depth_anchor_denoising: bool = True,
+            geometry_float32: bool = False,
+            geometry_output_aux_optimizer: bool = False,
             distill_attributes: Tuple[str, ...] = (),
             center_teacher_source: str = 'pose_center',
             obb_center_teacher_checkpoint: str = None,
@@ -534,6 +537,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         self.gaucho_size_prior = float(gaucho_size_prior)
         self.gaucho_classwise = bool(gaucho_classwise)
         self.gaucho_use_bbox_conditioning = bool(gaucho_use_bbox_conditioning)
+        self.gaucho_depth_context = bool(gaucho_depth_context)
+        if self.gaucho_depth_context and not self.gaucho_ellipsoid:
+            raise ValueError(
+                'gaucho_depth_context requires gaucho_ellipsoid=True')
+        if self.gaucho_depth_context and not self.requires_depth_features:
+            raise ValueError(
+                'gaucho_depth_context requires depth-query features')
         self.gaucho_eps = 1e-7
         self.gaucho_ellipse2d = bool(gaucho_ellipse2d)
         self.gaucho_ellipse2d_dn = bool(gaucho_ellipse2d_dn)
@@ -644,6 +654,13 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
         # regressing absolute depth exactly as before.
         self.sensor_depth_anchor_denoising = bool(
             sensor_depth_anchor_denoising)
+        # Keep sub-pixel centres and metric depth out of autocast's bf16
+        # quantisation.  The feature extractor and classification head remain
+        # autocast-controlled; only geometry modules and their arithmetic use
+        # float32 when this explicitly opt-in flag is enabled.
+        self.geometry_float32 = bool(geometry_float32)
+        self.geometry_output_aux_optimizer = bool(
+            geometry_output_aux_optimizer)
         self._num_denoising_queries = 0
         if self.sensor_depth_anchor and self.sensor_depth_scale is None:
             raise ValueError(
@@ -714,6 +731,8 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
 
         self._init_layers()
+        if self.geometry_output_aux_optimizer:
+            self._mark_geometry_outputs_auxiliary()
         self._init_distillation_teachers()
 
     def _classification_loss(
@@ -774,6 +793,40 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             return nn.ModuleList([layer] * num_layers)
         else:
             return nn.ModuleList([copy.deepcopy(layer) for _ in range(num_layers)])
+
+    @staticmethod
+    def _mark_auxiliary_weight(module: nn.Module) -> None:
+        """Mark only a final predictor's matrix weight for AMUSE's aux path."""
+        weight = getattr(module, 'weight', None)
+        if isinstance(weight, nn.Parameter):
+            weight._amuse_force_aux = True
+
+    def _mark_geometry_outputs_auxiliary(self) -> None:
+        """Keep small geometry predictors out of Muon's orthogonalisation."""
+        sequential_branches = (
+            self.reg_branches,
+            self.reg_centers_2d_branch,
+            self.reg_z_branch,
+            self.reg_rotation_branch,
+            self.reg_size_branch,
+        )
+        if self.gaucho_ellipse2d:
+            sequential_branches += (self.reg_ellipse2d_branch,)
+        if self.gaucho_ellipsoid:
+            sequential_branches += (self.reg_ellipsoid_branch,)
+        for branches in sequential_branches:
+            for branch in branches:
+                self._mark_auxiliary_weight(branch[-1])
+
+        if self.o2m_aux_topk:
+            self._mark_auxiliary_weight(self.o2m_reg_branch[-1])
+        if self.use_cop_chain:
+            for name in ('cop_z_out', 'cop_size_out', 'cop_rotation_out'):
+                for predictor in getattr(self, name):
+                    self._mark_auxiliary_weight(predictor)
+            if self.loss_obb_aux is not None:
+                for predictor in self.cop_obb_out:
+                    self._mark_auxiliary_weight(predictor)
 
     def _init_layers(self) -> None:
         """Initialize classification branch and pose regression branches."""
@@ -854,6 +907,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             gaucho_branch.append(Linear(gaucho_dims, gaucho_out))
             self.reg_ellipsoid_branch = self.replicate(
                 nn.Sequential(*gaucho_branch), self.num_pred_layer)
+            if self.gaucho_depth_context:
+                adapter = nn.Linear(self.embed_dims, self.embed_dims)
+                nn.init.zeros_(adapter.weight)
+                nn.init.zeros_(adapter.bias)
+                self.gaucho_depth_adapter = self.replicate(
+                    adapter, self.num_pred_layer)
 
         self.reg_centers_2d_branch = self.replicate(all_branches[0], self.num_pred_layer)
         self.reg_z_branch = self.replicate(all_branches[1], self.num_pred_layer)
@@ -913,6 +972,40 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                     **self.cop_depth_context_cfg,
                 )
 
+
+    def _geometry_call(self, module: nn.Module, *inputs):
+        """Run a geometry module in FP32 without widening the whole model."""
+        if not self.geometry_float32:
+            return module(*inputs)
+
+        def as_float32(value):
+            if isinstance(value, Tensor):
+                return value.float() if value.is_floating_point() else value
+            if isinstance(value, tuple):
+                return tuple(as_float32(item) for item in value)
+            if isinstance(value, list):
+                return [as_float32(item) for item in value]
+            if isinstance(value, dict):
+                return {key: as_float32(item) for key, item in value.items()}
+            return value
+
+        def first_tensor(value):
+            if isinstance(value, Tensor):
+                return value
+            if isinstance(value, (tuple, list)):
+                return next((found for item in value
+                             if (found := first_tensor(item)) is not None), None)
+            if isinstance(value, dict):
+                return next((found for item in value.values()
+                             if (found := first_tensor(item)) is not None), None)
+            return None
+
+        anchor = next((found for value in inputs
+                       if (found := first_tensor(value)) is not None), None)
+        if anchor is None:
+            raise ValueError('geometry module call requires a tensor input')
+        with torch.autocast(device_type=anchor.device.type, enabled=False):
+            return module(*(as_float32(value) for value in inputs))
 
     @torch.no_grad()
     def _sample_depth_anchor(self, centres_norm: Tensor) -> Tensor:
@@ -1103,7 +1196,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
             reference = inverse_sigmoid(references[layer_id])
             hidden_state = hidden_states[layer_id]
             outputs_class = self.cls_branches[layer_id](hidden_state)
-            tmp_reg_bbox_preds = self.reg_branches[layer_id](hidden_state)
+            geometry_hidden = hidden_state.float() \
+                if self.geometry_float32 else hidden_state
+            if self.geometry_float32:
+                reference = reference.float()
+            tmp_reg_bbox_preds = self._geometry_call(
+                self.reg_branches[layer_id], geometry_hidden)
 
             if reference.shape[-1] == 4:
                 tmp_reg_bbox_preds += reference
@@ -1112,45 +1210,54 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 tmp_reg_bbox_preds[..., :2] += reference
             outputs_coord = tmp_reg_bbox_preds.sigmoid()
             if self.requires_depth_features:
-                depth_query = self.depth_query_sampler(
+                depth_query = self._geometry_call(
+                    self.depth_query_sampler,
                     depth_features, outputs_coord)
                 depth_context_shapes.append(tuple(depth_query.shape))
             else:
                 depth_query = None
 
             if self.use_bbox_for_centers_2d:
-                tmp_centers_2d_input = torch.cat((hidden_state, outputs_coord), dim=-1)
+                tmp_centers_2d_input = torch.cat(
+                    (geometry_hidden, outputs_coord), dim=-1)
             else:
-                tmp_centers_2d_input = hidden_state
+                tmp_centers_2d_input = geometry_hidden
 
             if self.use_bbox_for_z:
-                tmp_z_input = torch.cat((hidden_state, outputs_coord), dim=-1)
+                tmp_z_input = torch.cat(
+                    (geometry_hidden, outputs_coord), dim=-1)
             else:
-                tmp_z_input = hidden_state
+                tmp_z_input = geometry_hidden
 
             if self.use_bbox_for_rotation:
-                tmp_rotation_input = torch.cat((hidden_state, outputs_coord), dim=-1)
+                tmp_rotation_input = torch.cat(
+                    (geometry_hidden, outputs_coord), dim=-1)
             else:
-                tmp_rotation_input = hidden_state
+                tmp_rotation_input = geometry_hidden
             if self.use_bbox_for_size:
-                tmp_size_input = torch.cat((hidden_state, outputs_coord), dim=-1)
+                tmp_size_input = torch.cat(
+                    (geometry_hidden, outputs_coord), dim=-1)
             else:
-                tmp_size_input = hidden_state
+                tmp_size_input = geometry_hidden
 
-            tmp_reg_centers_2d_preds = self.reg_centers_2d_branch[layer_id](tmp_centers_2d_input)
+            tmp_reg_centers_2d_preds = self._geometry_call(
+                self.reg_centers_2d_branch[layer_id], tmp_centers_2d_input)
             tmp_reg_centers_2d_preds = tmp_reg_centers_2d_preds.sigmoid() + outputs_coord[..., :2] - 0.5
             if self.cop_prediction_mode != 'chain':
-                tmp_reg_z_preds = self.reg_z_branch[layer_id](tmp_z_input)
-                tmp_rotation_preds = self.reg_rotation_branch[layer_id](tmp_rotation_input)
-                tmp_sizes = self.reg_size_branch[layer_id](tmp_size_input)
+                tmp_reg_z_preds = self._geometry_call(
+                    self.reg_z_branch[layer_id], tmp_z_input)
+                tmp_rotation_preds = self._geometry_call(
+                    self.reg_rotation_branch[layer_id], tmp_rotation_input)
+                tmp_sizes = self._geometry_call(
+                    self.reg_size_branch[layer_id], tmp_size_input)
             else:
                 tmp_reg_z_preds = tmp_rotation_preds = tmp_sizes = None
 
             if self.use_cop_chain:
-                chain_feature = hidden_state
+                chain_feature = geometry_hidden
                 if self.cop_use_bbox_conditioning:
-                    chain_feature = chain_feature + self.cop_bbox_embed[layer_id](
-                        outputs_coord)
+                    chain_feature = chain_feature + self._geometry_call(
+                        self.cop_bbox_embed[layer_id], outputs_coord)
                 chain_outputs = {}
                 chain_features = {}
                 nets = {
@@ -1165,24 +1272,30 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                 }
                 tmp_obb_aux = None
                 for attribute in self.cop_chain_order:
-                    stage_input = self.cop_stage_fusions[attribute][layer_id](
+                    stage_input = self._geometry_call(
+                        self.cop_stage_fusions[attribute][layer_id],
                         chain_feature, hidden_state, depth_query)
                     if (attribute == 'rotation' and
                             self.cop_obb_rotation_conditioning):
-                        raw_obb = self.cop_obb_out[layer_id](stage_input)
+                        raw_obb = self._geometry_call(
+                            self.cop_obb_out[layer_id], stage_input)
                         tmp_obb_aux = _compact_gaussian_from_raw_cholesky(
                             raw_obb)
                         orientation_descriptor = \
                             compact_gaussian_orientation_descriptor(
                                 tmp_obb_aux)
                         stage_input = stage_input + \
-                            self.cop_obb_rotation_embed[layer_id](
+                            self._geometry_call(
+                                self.cop_obb_rotation_embed[layer_id],
                                 orientation_descriptor)
-                    chain_feature = nets[attribute](stage_input) + stage_input
-                    chain_outputs[attribute] = outs[attribute](chain_feature)
+                    chain_feature = self._geometry_call(
+                        nets[attribute], stage_input) + stage_input
+                    chain_outputs[attribute] = self._geometry_call(
+                        outs[attribute], chain_feature)
                     chain_features[attribute] = chain_feature
                 if self.loss_obb_aux is not None and tmp_obb_aux is None:
-                    raw_obb = self.cop_obb_out[layer_id](
+                    raw_obb = self._geometry_call(
+                        self.cop_obb_out[layer_id],
                         chain_features['rotation'])
                     tmp_obb_aux = _compact_gaussian_from_raw_cholesky(raw_obb)
                 if self.cop_obb_rotation_refinement:
@@ -1190,10 +1303,12 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
                         compact_gaussian_orientation_descriptor(
                             tmp_obb_aux)
                     refined_rotation_feature = chain_features['rotation'] + \
-                        self.cop_obb_rotation_embed[layer_id](
+                        self._geometry_call(
+                            self.cop_obb_rotation_embed[layer_id],
                             orientation_descriptor)
-                    chain_outputs['rotation'] = self.cop_rotation_out[
-                        layer_id](refined_rotation_feature)
+                    chain_outputs['rotation'] = self._geometry_call(
+                        self.cop_rotation_out[layer_id],
+                        refined_rotation_feature)
                 tmp_z_chain = chain_outputs['z']
                 tmp_sizes_chain = chain_outputs['size']
                 tmp_rotation_chain = chain_outputs['rotation']
@@ -1236,19 +1351,25 @@ class DINO9DCenter2DPoseHead(SimpleDINO9DPoseHead):
 
             if self.gaucho_ellipse2d:
                 all_layers_outputs_ellipse2d.append(
-                    self.reg_ellipse2d_branch[layer_id](
-                        torch.cat((hidden_state, outputs_coord), dim=-1)))
+                    self._geometry_call(
+                        self.reg_ellipse2d_branch[layer_id],
+                        torch.cat((geometry_hidden, outputs_coord), dim=-1)))
             else:
                 all_layers_outputs_ellipse2d.append(None)
 
             if self.gaucho_ellipsoid:
+                gaucho_hidden = geometry_hidden
+                if self.gaucho_depth_context:
+                    gaucho_hidden = gaucho_hidden + self._geometry_call(
+                        self.gaucho_depth_adapter[layer_id], depth_query)
                 if self.gaucho_use_bbox_conditioning:
                     gaucho_input = torch.cat(
-                        (hidden_state, outputs_coord), dim=-1)
+                        (gaucho_hidden, outputs_coord), dim=-1)
                 else:
-                    gaucho_input = hidden_state
+                    gaucho_input = gaucho_hidden
                 all_layers_outputs_ellipsoid.append(
-                    self.reg_ellipsoid_branch[layer_id](gaucho_input))
+                    self._geometry_call(
+                        self.reg_ellipsoid_branch[layer_id], gaucho_input))
             else:
                 all_layers_outputs_ellipsoid.append(None)
 

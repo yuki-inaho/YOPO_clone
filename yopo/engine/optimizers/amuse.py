@@ -35,7 +35,8 @@ def _source_groups(
 
 def _is_muon_parameter(parameter: Tensor) -> bool:
     # Match YOPO's existing AutoMuon split: convolution and linear kernels.
-    return parameter.ndim in (2, 4)
+    return (parameter.ndim in (2, 4)
+            and not bool(getattr(parameter, "_amuse_force_aux", False)))
 
 
 @torch.no_grad()
