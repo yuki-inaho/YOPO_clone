@@ -68,7 +68,7 @@ ratioの1からの距離、HBBの順で判定し、結果を見て閾値や重�
 - [x] D/E/F-on/F-off/Gを同一親から学習し、各bestを181枚で独立評価した。
 - [x] 事前規則を適用し、D15を主採用、G10をstrict 3D向けPareto代替とした。
 - [x] focused/full pytest、ruff、diff/config/checkpoint監査を完了する。
-- [ ] private path/data/modelを除外し、公開変更をcommit/pushする。
+- [x] private path/data/modelを除外し、公開変更をcommit/pushする。
 
 ## 5. 結果と選抜
 
@@ -136,3 +136,4 @@ lineageはいずれもB-bestからのweights-only loadで、D/G間のoptimizer s
 | 2026-09-07 01:58–02:03 | G学習・独立評価 | G10が全gate通過、strict .236604 |
 | 2026-09-07 02:06 | 事前規則による選抜・公開文書作成 | Pareto集合はD15/G10、主採用D15 |
 | 2026-09-07 02:10–02:13 | 最終品質確認 | focused 25、code suite 651 passed。ruff/config/strict load PASS |
+| 2026-09-07 02:13–02:16 | 公開安全監査・同期 | private artifact 0、commit `8de9577`を`origin/rgb-d`へpush |
