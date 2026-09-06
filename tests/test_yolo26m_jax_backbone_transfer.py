@@ -9,7 +9,10 @@ import pytest
 import torch
 from mmengine.config import Config
 
+from tools.model_converters.calibrate_yolo26m_rgbd_frontend import BOUNDARY_KEYS
 from yopo.models.backbones.yolo26 import YOLO26Backbone, YOLO26MBackbone
+from yopo.registry import MODELS
+from yopo.utils import register_all_modules
 from yopo.utils.jax_yolo26_transfer import convert_jax_yolo26_backbone_arrays
 from yopo.utils.rotated_yolo26_transfer import (
     convert_rotated_yolo26_backbone_arrays,
@@ -398,6 +401,37 @@ def test_calibrated_full_changes_only_the_weight_source(scale: str) -> None:
     calibrated["load_from"] = original["load_from"]
 
     assert calibrated == original
+
+
+@pytest.mark.parametrize(
+    ("scale", "rgb_channels"),
+    [
+        ("n", (128, 128, 256)),
+        ("s", (256, 256, 512)),
+        ("m", (512, 512, 512)),
+    ],
+)
+def test_scale_specific_calibration_changes_only_seven_leaves(
+    scale: str, rgb_channels: tuple[int, int, int]
+) -> None:
+    register_all_modules()
+    config = Config.fromfile(
+        f"configs/yopo/nocs_fruits_2026_rgbd_yolo26{scale}_stage1_full.py"
+    )
+    backbone = MODELS.build(config.model.backbone)
+    neck = MODELS.build(config.model.neck)
+
+    assert BOUNDARY_KEYS == {
+        "backbone.depth_beta",
+        *(f"backbone.depth_adapters.{level}.weight" for level in range(3)),
+        *(f"neck.projections.{level}.weight" for level in range(3)),
+    }
+    assert len(BOUNDARY_KEYS) == 7
+    assert tuple(layer.weight.shape[0] for layer in backbone.depth_adapters) == (
+        rgb_channels
+    )
+    assert tuple(layer.weight.shape[1] for layer in neck.projections) == rgb_channels
+    assert tuple(layer.weight.shape[0] for layer in neck.projections) == (256, 256, 256)
 
 
 def test_ridge_projection_recovers_a_known_channel_map() -> None:
