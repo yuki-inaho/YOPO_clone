@@ -108,6 +108,12 @@ def prepare_checkpoint(
             raise ValueError("DEIM arrays SHA-256 does not match its manifest")
         source_manifest_sha256 = _sha256(manifest_path)
         source_metadata = manifest.get("metadata") or {}
+        actual_source_scale = _source_scale(source_metadata, source_format)
+        if actual_source_scale != scale:
+            raise ValueError(
+                f"{source_format} source scale {actual_source_scale!r} "
+                f"does not match requested {scale!r}"
+            )
         with np.load(arrays_path, allow_pickle=False) as source_arrays:
             yolo_state, yolo_report = convert_jax_yolo26_backbone_arrays(
                 source_arrays,
@@ -125,18 +131,18 @@ def prepare_checkpoint(
             source_metadata = json.loads(
                 bytes(source_arrays["__metadata__"].tobytes()).decode("utf-8")
             )
+            actual_source_scale = _source_scale(source_metadata, source_format)
+            if actual_source_scale != scale:
+                raise ValueError(
+                    f"{source_format} source scale {actual_source_scale!r} "
+                    f"does not match requested {scale!r}"
+                )
             yolo_state, yolo_report = convert_rotated_yolo26_backbone_arrays(
                 source_arrays,
                 target_state,
                 weights=weights,
                 strict=True,
             )
-    actual_source_scale = _source_scale(source_metadata, source_format)
-    if actual_source_scale != scale:
-        raise ValueError(
-            f"{source_format} source scale {actual_source_scale!r} "
-            f"does not match requested {scale!r}"
-        )
     expected_leaf_count = {"n": 200, "s": 200, "m": 250}[scale]
     if len(yolo_report.mapped) != expected_leaf_count:
         raise ValueError(

@@ -9,7 +9,10 @@ import pytest
 import torch
 from mmengine.config import Config
 
-from tools.model_converters.calibrate_yolo26m_rgbd_frontend import BOUNDARY_KEYS
+from tools.model_converters.calibrate_yolo26m_rgbd_frontend import (
+    BOUNDARY_KEYS,
+    _deterministic_train_loader,
+)
 from yopo.models.backbones.yolo26 import YOLO26Backbone, YOLO26MBackbone
 from yopo.registry import MODELS
 from yopo.utils import register_all_modules
@@ -432,6 +435,21 @@ def test_scale_specific_calibration_changes_only_seven_leaves(
     )
     assert tuple(layer.weight.shape[1] for layer in neck.projections) == rgb_channels
     assert tuple(layer.weight.shape[0] for layer in neck.projections) == (256, 256, 256)
+
+
+def test_frontend_calibration_rejects_validation_split_before_loading() -> None:
+    config = Config(
+        dict(
+            train_dataloader=dict(
+                batch_size=1,
+                num_workers=0,
+                dataset=dict(split="valid", pipeline=[]),
+            )
+        )
+    )
+
+    with pytest.raises(ValueError, match="train split"):
+        _deterministic_train_loader(config, batch_size=1, num_workers=0, seed=7)
 
 
 def test_ridge_projection_recovers_a_known_channel_map() -> None:
