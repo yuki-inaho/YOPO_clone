@@ -21,7 +21,8 @@ class _ClassificationBranch(nn.Module):
     def forward(self, inputs):
         scores = inputs.new_zeros(*inputs.shape[:-1], self.out_features)
         scores[..., 0] = torch.arange(
-            inputs.shape[1], device=inputs.device, dtype=inputs.dtype)
+            inputs.shape[1], device=inputs.device, dtype=inputs.dtype
+        )
         return scores
 
 
@@ -55,8 +56,7 @@ def test_no_dn_training_uses_only_matching_queries(monkeypatch):
     model = DINO9DCenter2DPose(dn_cfg=None)
 
     assert model.dn_query_generator is None
-    assert not any(key.startswith("dn_query_generator.")
-                   for key in model.state_dict())
+    assert not any(key.startswith("dn_query_generator.") for key in model.state_dict())
 
     model.query_embedding = nn.Embedding(model.num_queries, model.embed_dims)
     model.decoder = _Decoder()
@@ -69,14 +69,17 @@ def test_no_dn_training_uses_only_matching_queries(monkeypatch):
         cop_encoder_pose_supervision=False,
     )
     model.gen_encoder_output_proposals = lambda memory, *_: (
-        memory, memory.new_zeros(*memory.shape[:-1], 4))
+        memory,
+        memory.new_zeros(*memory.shape[:-1], 4),
+    )
     model.train()
 
     memory = torch.randn(2, 3, model.embed_dims)
     memory_mask = torch.zeros(2, 3, dtype=torch.bool)
     spatial_shapes = torch.tensor([[1, 3]])
     decoder_inputs, head_inputs = model.pre_decoder(
-        memory, memory_mask, spatial_shapes, batch_data_samples=[])
+        memory, memory_mask, spatial_shapes, batch_data_samples=[]
+    )
 
     expected_query = model.query_embedding.weight.unsqueeze(0).expand(2, -1, -1)
     assert torch.equal(decoder_inputs["query"], expected_query)
@@ -118,6 +121,46 @@ def test_configured_dn_generator_keeps_existing_construction(monkeypatch):
     assert "dn_query_generator.label_embedding.weight" in model.state_dict()
 
 
+def test_depth_feature_extraction_returns_raw_pyramid_without_second_forward(
+    monkeypatch,
+):
+    monkeypatch.setattr(DeformablePoseDETR, "__init__", _stub_detector_init)
+    model = DINO9DCenter2DPose(dn_cfg=None)
+
+    class _DepthBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward_with_depth_features(self, inputs):
+            self.calls += 1
+            return (inputs[:, :1] + 1.0,), (inputs[:, 3:4] + 2.0,)
+
+    class _Neck(nn.Module):
+        def forward(self, features):
+            return tuple(feature * 3.0 for feature in features)
+
+    model.backbone = _DepthBackbone()
+    model.neck = _Neck()
+    model.bbox_head = SimpleNamespace(
+        num_classes=2,
+        sensor_depth_scale=None,
+        requires_depth_features=True,
+    )
+    inputs = torch.zeros(1, 4, 3, 4)
+
+    detector_features, raw_features = model._extract_feat_with_backbone(inputs)
+
+    assert model.backbone.calls == 1
+    torch.testing.assert_close(raw_features[0], torch.ones(1, 1, 3, 4))
+    torch.testing.assert_close(
+        detector_features["fused_features"][0], torch.full((1, 1, 3, 4), 3.0)
+    )
+    torch.testing.assert_close(
+        detector_features["depth_features"][0], torch.full((1, 1, 3, 4), 2.0)
+    )
+
+
 def test_split_outputs_accepts_missing_dn_metadata():
     predictions = (
         torch.randn(2, 1, 3, 2),
@@ -128,13 +171,14 @@ def test_split_outputs_accepts_missing_dn_metadata():
         torch.randn(2, 1, 3, 3),
     )
 
-    no_dn_outputs = DINO9DCenter2DPoseHead.split_outputs(
-        *predictions, dn_meta=None)
-    assert all(actual is expected
-               for actual, expected in zip(no_dn_outputs[:6], predictions))
+    no_dn_outputs = DINO9DCenter2DPoseHead.split_outputs(*predictions, dn_meta=None)
+    assert all(
+        actual is expected for actual, expected in zip(no_dn_outputs[:6], predictions)
+    )
     assert no_dn_outputs[6:] == (None,) * 6
 
     dn_outputs = DINO9DCenter2DPoseHead.split_outputs(
-        *predictions, dn_meta={"num_denoising_queries": 1})
+        *predictions, dn_meta={"num_denoising_queries": 1}
+    )
     assert all(output.shape[2] == 2 for output in dn_outputs[:6])
     assert all(output.shape[2] == 1 for output in dn_outputs[6:])

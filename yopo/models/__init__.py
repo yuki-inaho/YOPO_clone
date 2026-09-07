@@ -11,3 +11,4 @@ from .necks import *  # noqa: F401,F403
 from .roi_heads import *  # noqa: F401,F403
 from .task_modules import *  # noqa: F401,F403
 from .test_time_augs import *  # noqa: F401,F403
+from .tracking import *  # noqa: F401,F403

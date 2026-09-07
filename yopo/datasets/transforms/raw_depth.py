@@ -9,6 +9,43 @@ from mmcv.transforms import BaseTransform
 from yopo.registry import TRANSFORMS
 
 
+def normalize_raw_depth_mm(
+    depth_mm: np.ndarray, *, norm_scale: float = 1000.0
+) -> np.ndarray:
+    """Convert uint16 millimetres to the metric depth consumed by RGB-D models."""
+
+    if norm_scale <= 0:
+        raise ValueError(f"norm_scale must be positive, got {norm_scale}")
+    if depth_mm.ndim != 2 or depth_mm.dtype != np.uint16:
+        raise ValueError(
+            "depth_mm must be a two-dimensional uint16 array, "
+            f"got shape={depth_mm.shape}, dtype={depth_mm.dtype}"
+        )
+    return depth_mm.astype(np.float32) / float(norm_scale)
+
+
+def compose_metric_rgbd_input(
+    image_bgr: np.ndarray,
+    depth_mm: np.ndarray,
+    *,
+    rgb_scale: float = 255.0,
+    depth_norm_scale: float = 1000.0,
+) -> np.ndarray:
+    """Create the RGB-[0,1] plus metric-depth input shared by train and inference."""
+
+    if rgb_scale <= 0:
+        raise ValueError(f"rgb_scale must be positive, got {rgb_scale}")
+    if image_bgr.ndim != 3 or image_bgr.shape[2] != 3:
+        raise ValueError(f"image_bgr must have shape [H,W,3], got {image_bgr.shape}")
+    if image_bgr.shape[:2] != depth_mm.shape:
+        raise ValueError(
+            f"RGB/depth shape mismatch: rgb={image_bgr.shape[:2]}, depth={depth_mm.shape}"
+        )
+    rgb = image_bgr[..., ::-1].astype(np.float32) / float(rgb_scale)
+    depth_m = normalize_raw_depth_mm(depth_mm, norm_scale=depth_norm_scale)
+    return np.concatenate([rgb, depth_m[..., None]], axis=-1)
+
+
 @TRANSFORMS.register_module()
 class LoadRawDepthImageWithValidMask(BaseTransform):
     """Load uint16 millimetre depth without completion and retain validity."""
@@ -39,7 +76,7 @@ class LoadRawDepthImageWithValidMask(BaseTransform):
             )
 
         results["depth_valid_mask"] = depth_mm > 0
-        results["depth"] = depth_mm.astype(np.float32) / self.norm_scale
+        results["depth"] = normalize_raw_depth_mm(depth_mm, norm_scale=self.norm_scale)
         return results
 
 
