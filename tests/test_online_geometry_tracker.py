@@ -106,6 +106,111 @@ def test_missing_geometry_uses_appearance_only_and_retains_last_position() -> No
     )
 
 
+def test_default_assignment_strategy_remains_legacy_linear_cost() -> None:
+    config = TrackerConfig()
+
+    assert config.assignment_strategy == "linear_cost_v1"
+
+
+def test_explicit_legacy_strategy_matches_default_updates() -> None:
+    default = OnlineGeometryTracker(TrackerConfig())
+    explicit = OnlineGeometryTracker(
+        TrackerConfig(assignment_strategy="linear_cost_v1")
+    )
+    sequence = [
+        [_detection(0.0), _detection(0.04, embedding=(0.0, 1.0))],
+        [_detection(0.01), _detection(0.05, embedding=(0.0, 1.0))],
+        [_detection(0.02), _detection(0.06, embedding=(0.0, 1.0))],
+    ]
+
+    default_updates = [
+        default.update(detections, frame_index=frame_index)
+        for frame_index, detections in enumerate(sequence)
+    ]
+    explicit_updates = [
+        explicit.update(detections, frame_index=frame_index)
+        for frame_index, detections in enumerate(sequence)
+    ]
+
+    assert explicit_updates == default_updates
+    assert explicit.tracks == default.tracks
+
+
+def test_soft_affinity_prioritizes_a_near_candidate_over_far_appearance() -> None:
+    tracker = OnlineGeometryTracker(
+        TrackerConfig(
+            assignment_strategy="soft_affinity_v1",
+            geometry_gate_m=0.15,
+            geometry_weight=0.75,
+            embedding_weight=0.25,
+            geometry_affinity_sigma_m=0.04,
+            embedding_affinity_temperature=0.20,
+        )
+    )
+    track_id = tracker.update([_detection(0.0)], frame_index=0).detection_track_ids[0]
+
+    update = tracker.update(
+        [
+            _detection(0.02, embedding=(0.8, 0.6)),
+            _detection(0.10, embedding=(1.0, 0.0)),
+        ],
+        frame_index=1,
+    )
+
+    assert update.matched_track_detection_pairs == ((track_id, 0),)
+    assert update.detection_track_ids[0] == track_id
+    assert update.detection_track_ids[1] != track_id
+
+
+def test_soft_affinity_can_match_beyond_legacy_gate_with_explicit_wider_gate() -> None:
+    tracker = OnlineGeometryTracker(
+        TrackerConfig(
+            assignment_strategy="soft_affinity_v1",
+            geometry_gate_m=0.15,
+            geometry_affinity_sigma_m=0.05,
+            embedding_affinity_temperature=0.25,
+        )
+    )
+    track_id = tracker.update([_detection(0.0)], frame_index=0).detection_track_ids[0]
+
+    update = tracker.update([_detection(0.10)], frame_index=1)
+
+    assert update.detection_track_ids == (track_id,)
+    assert update.created_track_ids == ()
+
+
+def test_soft_affinity_missing_geometry_is_appearance_only() -> None:
+    tracker = OnlineGeometryTracker(
+        TrackerConfig(
+            assignment_strategy="soft_affinity_v1",
+            geometry_gate_m=0.15,
+            geometry_affinity_sigma_m=0.05,
+            embedding_affinity_temperature=0.25,
+        )
+    )
+    track_id = tracker.update([_detection(0.0)], frame_index=0).detection_track_ids[0]
+
+    update = tracker.update(
+        [Detection(None, torch.tensor([1.0, 0.0]), 0.9)], frame_index=1
+    )
+
+    assert update.detection_track_ids == (track_id,)
+    assert update.created_track_ids == ()
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"assignment_strategy": "unknown"},
+        {"geometry_affinity_sigma_m": 0.0},
+        {"embedding_affinity_temperature": 0.0},
+    ],
+)
+def test_soft_affinity_config_is_validated(override: dict) -> None:
+    with pytest.raises(ValueError, match="strategy|sigma|temperature"):
+        TrackerConfig(**override)
+
+
 def test_low_confidence_match_does_not_update_prototype() -> None:
     tracker = OnlineGeometryTracker(
         TrackerConfig(

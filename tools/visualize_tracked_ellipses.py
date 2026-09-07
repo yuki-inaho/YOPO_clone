@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -14,7 +16,11 @@ import torch
 from mmengine.config import Config
 from mmengine.runner.checkpoint import load_checkpoint
 
-from yopo.datasets.pose_estimation.yopo_sequence import RGBDFrameReader, SequenceIndex
+from yopo.datasets.pose_estimation.yopo_sequence import (
+    FrameRecord,
+    RGBDFrameReader,
+    SequenceIndex,
+)
 from yopo.datasets.transforms.raw_depth import compose_metric_rgbd_input
 from yopo.models.tracking.causal_inference import (
     build_detection_observations,
@@ -28,6 +34,15 @@ from yopo.registry import MODELS
 from yopo.utils import register_all_modules, register_mmengine_checkpoint_safe_globals
 
 
+@dataclass(frozen=True)
+class RawSourceSelection:
+    """Validated annotation-free frame range from a COLMAP RGB-D source."""
+
+    frame_contract: dict[str, Any]
+    records: tuple[FrameRecord, ...]
+    metadata: dict[str, Any]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -38,8 +53,14 @@ def parse_args() -> argparse.Namespace:
         "--descriptor-mode", choices=("B0", "B2", "C0", "C1"), default="C1"
     )
     parser.add_argument("--split", choices=("train", "val", "smoke"), default="smoke")
-    parser.add_argument("--window-indices", type=int, nargs=2, default=(0, 34))
+    parser.add_argument("--window-indices", type=int, nargs=2)
     parser.add_argument("--max-frames", type=int, default=4)
+    parser.add_argument("--raw-source-root", type=Path)
+    parser.add_argument("--scene", default="scene_000000")
+    parser.add_argument("--start-frame", type=int, default=0)
+    parser.add_argument("--frame-count", type=int, default=300)
+    parser.add_argument("--contact-samples", type=int, default=12)
+    parser.add_argument("--progress-interval", type=int, default=25)
     parser.add_argument("--fps", type=float, default=2.0)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -52,6 +73,163 @@ def prepare_output_directory(path: Path) -> Path:
         raise FileExistsError(f"output directory is not empty: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     return destination
+
+
+def _positive_int(value: Any, field: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{field} must be a positive integer")
+    return value
+
+
+def _mapping(value: Any, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"raw dataset {field} must be an object")
+    return value
+
+
+def load_raw_source_records(
+    root: Path, *, scene: str, start_frame: int, frame_count: int
+) -> RawSourceSelection:
+    """Load one exact contiguous raw RGB-D range without opening annotations."""
+
+    source_root = root.expanduser().resolve()
+    dataset_path = source_root / "dataset.json"
+    scene_root = (source_root / "scenes" / scene).resolve()
+    scenes_root = (source_root / "scenes").resolve()
+    cameras_path = scene_root / "cameras.npz"
+    if not dataset_path.is_file() or not cameras_path.is_file():
+        raise FileNotFoundError(
+            "raw source requires dataset.json and scene cameras.npz"
+        )
+    if not scene or not scene_root.is_relative_to(scenes_root):
+        raise ValueError("raw source scene escapes the scenes directory")
+    try:
+        document = json.loads(dataset_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"cannot read raw dataset.json: {error}") from error
+    if (
+        not isinstance(document, Mapping)
+        or document.get("format") != "colmap_rgbd_v1"
+        or document.get("schema_version") != 1
+    ):
+        raise ValueError("unsupported raw RGB-D dataset contract")
+    total_frames = _positive_int(document.get("frame_count"), "dataset frame_count")
+    requested_count = _positive_int(frame_count, "frame_count")
+    if (
+        not isinstance(start_frame, int)
+        or isinstance(start_frame, bool)
+        or start_frame < 0
+    ):
+        raise ValueError("start_frame must be a non-negative integer")
+    stop_frame = start_frame + requested_count
+    if stop_frame > total_frames:
+        raise ValueError(
+            f"requested frame range [{start_frame},{stop_frame}) is outside "
+            f"dataset frame_count={total_frames}"
+        )
+
+    image = _mapping(document.get("image"), "image")
+    depth = _mapping(document.get("depth"), "depth")
+    width = _positive_int(image.get("width"), "image width")
+    height = _positive_int(image.get("height"), "image height")
+    expected = {
+        "image channels": (image.get("channels"), 3),
+        "image dtype": (image.get("dtype"), "uint8"),
+        "depth width": (depth.get("width"), width),
+        "depth height": (depth.get("height"), height),
+        "depth dtype": (depth.get("dtype"), "uint16"),
+        "depth invalid_value": (depth.get("invalid_value"), 0),
+    }
+    for field, (actual, required) in expected.items():
+        if actual != required:
+            raise ValueError(f"raw dataset {field}={actual!r}, expected {required!r}")
+    depth_unit = depth.get("unit")
+    if depth_unit not in {"mm", "millimeters"}:
+        raise ValueError(
+            f"raw dataset depth unit={depth_unit!r}, expected 'mm' or 'millimeters'"
+        )
+
+    with np.load(cameras_path, allow_pickle=False) as cameras:
+        required_keys = {
+            "frame_ids",
+            "intrinsics",
+            "extrinsics_w2c",
+            "quality_flags",
+        }
+        if not required_keys.issubset(cameras.files):
+            raise ValueError("raw camera archive is missing required arrays")
+        frame_ids = np.asarray(cameras["frame_ids"], dtype=np.int64)
+        intrinsics = np.asarray(cameras["intrinsics"], dtype=np.float32)
+        extrinsics = np.asarray(cameras["extrinsics_w2c"], dtype=np.float32)
+        quality = np.asarray(cameras["quality_flags"], dtype=bool)
+    if (
+        frame_ids.shape != (total_frames,)
+        or intrinsics.shape != (total_frames, 3, 3)
+        or extrinsics.shape != (total_frames, 3, 4)
+        or quality.shape != (total_frames,)
+        or len(np.unique(frame_ids)) != total_frames
+    ):
+        raise ValueError("raw camera arrays do not align with dataset frame_count")
+    row_by_id = {int(frame_id): row for row, frame_id in enumerate(frame_ids)}
+    requested_ids = tuple(range(start_frame, stop_frame))
+    if any(frame_id not in row_by_id for frame_id in requested_ids):
+        raise ValueError("raw camera frame IDs do not cover the requested range")
+
+    records = []
+    for frame_id in requested_ids:
+        row = row_by_id[frame_id]
+        if not quality[row]:
+            raise ValueError(f"raw camera quality is false for frame {frame_id}")
+        intrinsic = intrinsics[row]
+        extrinsic = extrinsics[row]
+        if not np.isfinite(intrinsic).all() or not np.isfinite(extrinsic).all():
+            raise ValueError(f"raw camera is non-finite for frame {frame_id}")
+        stem = f"frame_{frame_id:06d}"
+        color_path = scene_root / "rgb" / f"{stem}.png"
+        depth_path = scene_root / "depth" / f"{stem}.png"
+        if not color_path.is_file() or not depth_path.is_file():
+            raise FileNotFoundError(
+                f"raw RGB-D artifact is missing for frame {frame_id}"
+            )
+        records.append(
+            FrameRecord(
+                scene=scene,
+                frame_id=frame_id,
+                source_stem=stem,
+                split="raw",
+                color_path=color_path,
+                depth_path=depth_path,
+                label_path=source_root / ".annotations_are_not_opened" / f"{stem}.pkl",
+                annotation_kind="unlabeled",
+                intrinsic=intrinsic.copy(),
+                extrinsic_w2c=extrinsic.copy(),
+            )
+        )
+    frame_contract = {
+        "width": width,
+        "height": height,
+        "rgb_dtype": "uint8",
+        "rgb_channels": 3,
+        "depth_dtype": "uint16",
+        "depth_unit": "mm",
+        "depth_invalid_value": 0,
+    }
+    metadata = {
+        "kind": "raw_colmap_rgbd_v1",
+        "scene": scene,
+        "start_frame": start_frame,
+        "stop_frame_exclusive": stop_frame,
+        "frame_count": requested_count,
+        "contiguous_frame_ids": True,
+        "camera_quality_all_true": True,
+        "label_artifacts_opened": False,
+        "source_timestamps_available": False,
+        "source_depth_unit": depth_unit,
+        "normalized_depth_unit": "mm",
+        "dataset_sha256": sha256_file(dataset_path),
+        "cameras_sha256": sha256_file(cameras_path),
+    }
+    return RawSourceSelection(frame_contract, tuple(records), metadata)
 
 
 def _prediction_ellipses(predictions: object) -> tuple[torch.Tensor, torch.Tensor]:
@@ -94,24 +272,40 @@ def _banner(image: np.ndarray, text: str) -> None:
 
 
 def _contact_sheet(
-    clips: list[list[np.ndarray]], *, tile_size=(320, 240)
+    clips: list[list[np.ndarray]], *, tile_size=(320, 240), max_columns: int = 4
 ) -> np.ndarray:
-    columns = max(len(clip) for clip in clips)
+    if not clips or any(not clip for clip in clips) or max_columns <= 0:
+        raise ValueError("contact sheet requires non-empty clips and positive columns")
     rows = []
     for clip in clips:
         tiles = [
             cv2.resize(frame, tile_size, interpolation=cv2.INTER_AREA) for frame in clip
         ]
-        tiles.extend(np.zeros_like(tiles[0]) for _ in range(columns - len(tiles)))
-        rows.append(np.concatenate(tiles, axis=1))
+        for offset in range(0, len(tiles), max_columns):
+            row = tiles[offset : offset + max_columns]
+            row.extend(np.zeros_like(row[0]) for _ in range(max_columns - len(row)))
+            rows.append(np.concatenate(row, axis=1))
     return np.concatenate(rows, axis=0)
 
 
 def main() -> None:
     args = parse_args()
-    if args.max_frames <= 0 or args.fps <= 0:
-        raise ValueError("--max-frames and --fps must be positive")
-    if len(set(args.window_indices)) != 2:
+    if (
+        args.max_frames <= 0
+        or args.fps <= 0
+        or args.contact_samples <= 0
+        or args.progress_interval <= 0
+    ):
+        raise ValueError(
+            "--max-frames, --fps, --contact-samples, and --progress-interval "
+            "must be positive"
+        )
+    window_indices = tuple(args.window_indices or (0, 34))
+    if args.raw_source_root is not None and args.window_indices is not None:
+        raise ValueError(
+            "--raw-source-root and --window-indices are mutually exclusive"
+        )
+    if args.raw_source_root is None and len(set(window_indices)) != 2:
         raise ValueError("--window-indices must select two distinct clips")
     paths = (
         args.config,
@@ -143,16 +337,65 @@ def main() -> None:
     detector_sha = sha256_file(detector_path)
 
     index = SequenceIndex(manifest_path, split=args.split)
-    if any(not 0 <= value < len(index.windows) for value in args.window_indices):
-        raise IndexError("a window index is outside the selected split")
-    windows = [index.windows[value] for value in args.window_indices]
-    if set(windows[0].frame_ids) & set(windows[1].frame_ids):
-        raise ValueError("selected clips must not share frames")
+    if args.raw_source_root is not None:
+        raw_selection = load_raw_source_records(
+            args.raw_source_root,
+            scene=args.scene,
+            start_frame=args.start_frame,
+            frame_count=args.frame_count,
+        )
+        frame_contract = raw_selection.frame_contract
+        clip_specs = [
+            {
+                "selection_kind": "continuous_raw_source_range",
+                "window_index": None,
+                "sequence_id": (
+                    f"{args.scene}/raw/{args.start_frame:06d}-"
+                    f"{args.start_frame + args.frame_count - 1:06d}"
+                ),
+                "physical_scene": args.scene,
+                "source_row": None,
+                "records": raw_selection.records,
+            }
+        ]
+        interpretation = "one_continuous_raw_source_clip"
+        source_metadata = raw_selection.metadata
+        contact_name = "continuous_contact_sheet.png"
+        report_split = "raw"
+    else:
+        if any(not 0 <= value < len(index.windows) for value in window_indices):
+            raise IndexError("a window index is outside the selected split")
+        windows = [index.windows[value] for value in window_indices]
+        if set(windows[0].frame_ids) & set(windows[1].frame_ids):
+            raise ValueError("selected clips must not share frames")
+        frame_contract = index.frame_contract
+        clip_specs = [
+            {
+                "selection_kind": "manifest_window",
+                "window_index": window_index,
+                "sequence_id": window.sequence_id,
+                "physical_scene": window.scene,
+                "source_row": window.source_row,
+                "records": tuple(
+                    index.record(window.scene, frame_id)
+                    for frame_id in window.frame_ids[: args.max_frames]
+                ),
+            }
+            for window_index, window in zip(window_indices, windows)
+        ]
+        interpretation = "two_sequential_clips_from_one_physical_scene"
+        source_metadata = {
+            "kind": "yopo_sequence_manifest_windows",
+            "window_indices": list(window_indices),
+            "label_artifacts_opened": False,
+        }
+        contact_name = "two_clip_contact_sheet.png"
+        report_split = args.split
     image_size = (
-        int(index.frame_contract["height"]),
-        int(index.frame_contract["width"]),
+        int(frame_contract["height"]),
+        int(frame_contract["width"]),
     )
-    reader = RGBDFrameReader(index.frame_contract)
+    reader = RGBDFrameReader(frame_contract)
     descriptor = None
     descriptor_metadata = None
     clip_reports = []
@@ -163,10 +406,15 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
     with torch.inference_mode():
-        for clip_index, (window_index, window) in enumerate(
-            zip(args.window_indices, windows)
-        ):
+        for clip_index, clip_spec in enumerate(clip_specs):
             tracker = OnlineGeometryTracker(TrackerConfig(**dict(inference.tracker)))
+            records = clip_spec["records"]
+            sample_count = min(args.contact_samples, len(records))
+            sample_ordinals = set(
+                np.rint(np.linspace(0, len(records) - 1, sample_count))
+                .astype(np.int64)
+                .tolist()
+            )
             clip_dir = output_dir / f"clip_{clip_index:02d}"
             clip_dir.mkdir()
             video_path = output_dir / f"clip_{clip_index:02d}.mp4"
@@ -181,8 +429,7 @@ def main() -> None:
             frame_reports = []
             rendered_frames = []
             try:
-                for ordinal, frame_id in enumerate(window.frame_ids[: args.max_frames]):
-                    record = index.record(window.scene, frame_id)
+                for ordinal, record in enumerate(records):
                     frame = reader.read(record)
                     rgbd = compose_metric_rgbd_input(
                         frame["image_bgr"], frame["depth_mm"]
@@ -271,7 +518,8 @@ def main() -> None:
                         raise OSError(f"failed to write image: {output_path}")
                     writer.write(rendered)
                     artifact_paths.append(output_path)
-                    rendered_frames.append(rendered)
+                    if ordinal in sample_ordinals:
+                        rendered_frames.append(rendered.copy())
                     frame_reports.append(
                         {
                             "frame_id": record.frame_id,
@@ -293,6 +541,15 @@ def main() -> None:
                             "image": str(output_path),
                         }
                     )
+                    if (
+                        ordinal + 1
+                    ) % args.progress_interval == 0 or ordinal + 1 == len(records):
+                        print(
+                            f"clip={clip_index} frames={ordinal + 1}/{len(records)} "
+                            f"frame_id={record.frame_id} "
+                            f"tracks={len(observations)} drawn={len(drawn_ids)}",
+                            flush=True,
+                        )
             finally:
                 writer.release()
             if not rendered_frames:
@@ -302,10 +559,12 @@ def main() -> None:
             clip_reports.append(
                 {
                     "clip_index": clip_index,
-                    "window_index": window_index,
-                    "sequence_id": window.sequence_id,
-                    "physical_scene": window.scene,
-                    "source_row": window.source_row,
+                    "selection_kind": clip_spec["selection_kind"],
+                    "window_index": clip_spec["window_index"],
+                    "sequence_id": clip_spec["sequence_id"],
+                    "physical_scene": clip_spec["physical_scene"],
+                    "source_row": clip_spec["source_row"],
+                    "frame_count": len(records),
                     "tracker_reset": True,
                     "track_id_namespace": f"clip_{clip_index:02d}",
                     "video": str(video_path),
@@ -314,23 +573,31 @@ def main() -> None:
             )
 
     contact_sheet = _contact_sheet(rendered_clips)
-    contact_path = output_dir / "two_clip_contact_sheet.png"
+    contact_path = output_dir / contact_name
     if not cv2.imwrite(str(contact_path), contact_sheet):
         raise OSError(f"failed to write contact sheet: {contact_path}")
     artifact_paths.append(contact_path)
     report = {
         "status": "completed",
-        "schema": "yopo_tracked_projected_ellipse_visualization_v1",
-        "interpretation": "two_sequential_clips_from_one_physical_scene",
-        "physical_scene_count": len({window.scene for window in windows}),
-        "rendered_clip_count": len(windows),
+        "schema": "yopo_tracked_projected_ellipse_visualization_v2",
+        "interpretation": interpretation,
+        "physical_scene_count": len(
+            {clip_spec["physical_scene"] for clip_spec in clip_specs}
+        ),
+        "rendered_clip_count": len(clip_specs),
+        "rendered_frame_count": sum(
+            len(clip_spec["records"]) for clip_spec in clip_specs
+        ),
+        "playback_fps": args.fps,
         "tracker_reset_per_clip": True,
+        "tracker_config": dict(inference.tracker),
         "input_contract": "current_rgbd_and_manifest_camera_only_no_label_v1",
         "causal": True,
         "future_frame_access": False,
         "label_artifacts_opened": False,
         "ellipse_contract": "projected_ellipses_semiaxes_first_radians_v1",
-        "split": args.split,
+        "split": report_split,
+        "source": source_metadata,
         "descriptor": descriptor_metadata,
         "detector": {
             "checkpoint_kind": "raw",

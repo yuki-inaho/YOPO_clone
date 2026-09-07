@@ -43,6 +43,9 @@ class TrackerConfig:
     embedding_gate: float = 0.50
     geometry_weight: float = 0.50
     embedding_weight: float = 0.50
+    assignment_strategy: str = "linear_cost_v1"
+    geometry_affinity_sigma_m: float = 0.05
+    embedding_affinity_temperature: float = 0.25
     miss_cost: float = 0.55
     new_cost: float = 0.55
     min_confirmed_hits: int = 2
@@ -59,6 +62,15 @@ class TrackerConfig:
             raise ValueError("assignment weights must be nonnegative")
         if self.geometry_weight + self.embedding_weight <= 0:
             raise ValueError("at least one assignment weight must be positive")
+        if self.assignment_strategy not in {
+            "linear_cost_v1",
+            "soft_affinity_v1",
+        }:
+            raise ValueError("unsupported assignment strategy")
+        if self.geometry_affinity_sigma_m <= 0:
+            raise ValueError("geometry affinity sigma must be positive")
+        if self.embedding_affinity_temperature <= 0:
+            raise ValueError("embedding affinity temperature must be positive")
         if self.miss_cost < 0 or self.new_cost < 0:
             raise ValueError("miss and new costs must be nonnegative")
         if self.min_confirmed_hits < 1 or self.max_unobserved_frames < 0:
@@ -425,12 +437,27 @@ class OnlineGeometryTracker:
         total_weight = geometry_weight + self.config.embedding_weight
         valid &= total_weight > 0
         cost_dtype = geometry_distance.dtype
-        cost = (
-            geometry_weight * geometry_distance / self.config.geometry_gate_m
-            + self.config.embedding_weight
-            * embedding_distance
-            / self.config.embedding_gate
-        ) / total_weight.clamp_min(torch.finfo(cost_dtype).eps)
+        if self.config.assignment_strategy == "soft_affinity_v1":
+            geometry_affinity = torch.exp(
+                -0.5
+                * (geometry_distance / self.config.geometry_affinity_sigma_m).square()
+            )
+            embedding_affinity = torch.exp(
+                -embedding_distance.clamp_min(0.0)
+                / self.config.embedding_affinity_temperature
+            )
+            affinity = (
+                geometry_weight * geometry_affinity
+                + self.config.embedding_weight * embedding_affinity
+            ) / total_weight.clamp_min(torch.finfo(cost_dtype).eps)
+            cost = (1.0 - affinity).clamp_min(0.0)
+        else:
+            cost = (
+                geometry_weight * geometry_distance / self.config.geometry_gate_m
+                + self.config.embedding_weight
+                * embedding_distance
+                / self.config.embedding_gate
+            ) / total_weight.clamp_min(torch.finfo(cost_dtype).eps)
         return partial_linear_assignment(
             cost.to(cost_dtype),
             valid,

@@ -9,7 +9,9 @@ import torch
 from mmengine.structures import InstanceData
 
 from tools.visualize_tracked_ellipses import (
+    _contact_sheet,
     _prediction_ellipses,
+    load_raw_source_records,
     prepare_output_directory,
 )
 from yopo.models.tracking.ellipse_overlay import (
@@ -101,3 +103,89 @@ def test_prediction_ellipse_fields_are_required_and_shape_checked() -> None:
     )
     with pytest.raises(ValueError, match="shape"):
         _prediction_ellipses(malformed)
+
+
+def _write_raw_source(tmp_path, *, frame_count: int = 5) -> tuple:
+    root = tmp_path / "raw"
+    scene = root / "scenes" / "scene_a"
+    rgb_dir = scene / "rgb"
+    depth_dir = scene / "depth"
+    rgb_dir.mkdir(parents=True)
+    depth_dir.mkdir()
+    for frame_id in range(frame_count):
+        assert cv2.imwrite(
+            str(rgb_dir / f"frame_{frame_id:06d}.png"),
+            np.full((6, 8, 3), frame_id, dtype=np.uint8),
+        )
+        assert cv2.imwrite(
+            str(depth_dir / f"frame_{frame_id:06d}.png"),
+            np.full((6, 8), 1000 + frame_id, dtype=np.uint16),
+        )
+    document = {
+        "format": "colmap_rgbd_v1",
+        "schema_version": 1,
+        "frame_count": frame_count,
+        "scene_count": 1,
+        "image": {"width": 8, "height": 6, "channels": 3, "dtype": "uint8"},
+        "depth": {
+            "width": 8,
+            "height": 6,
+            "dtype": "uint16",
+            "unit": "mm",
+            "invalid_value": 0,
+        },
+    }
+    (root / "dataset.json").write_text(__import__("json").dumps(document))
+    np.savez(
+        scene / "cameras.npz",
+        frame_ids=np.arange(frame_count, dtype=np.int64),
+        intrinsics=np.repeat(np.eye(3, dtype=np.float32)[None], frame_count, axis=0),
+        extrinsics_w2c=np.repeat(
+            np.eye(3, 4, dtype=np.float32)[None], frame_count, axis=0
+        ),
+        quality_flags=np.ones(frame_count, dtype=bool),
+    )
+    return root, scene
+
+
+def test_raw_source_records_preserve_contiguous_range_without_labels(tmp_path) -> None:
+    root, _ = _write_raw_source(tmp_path)
+
+    selection = load_raw_source_records(
+        root, scene="scene_a", start_frame=1, frame_count=3
+    )
+
+    assert selection.frame_contract["width"] == 8
+    assert selection.frame_contract["height"] == 6
+    assert [record.frame_id for record in selection.records] == [1, 2, 3]
+    assert all(not record.label_path.exists() for record in selection.records)
+    assert selection.metadata["label_artifacts_opened"] is False
+
+
+def test_raw_source_records_reject_bad_quality_and_out_of_range(tmp_path) -> None:
+    root, scene = _write_raw_source(tmp_path)
+    cameras = np.load(scene / "cameras.npz")
+    quality = cameras["quality_flags"].copy()
+    quality[2] = False
+    np.savez(
+        scene / "cameras.npz",
+        frame_ids=cameras["frame_ids"],
+        intrinsics=cameras["intrinsics"],
+        extrinsics_w2c=cameras["extrinsics_w2c"],
+        quality_flags=quality,
+    )
+
+    with pytest.raises(ValueError, match="quality"):
+        load_raw_source_records(root, scene="scene_a", start_frame=1, frame_count=3)
+    with pytest.raises(ValueError, match="outside"):
+        load_raw_source_records(root, scene="scene_a", start_frame=4, frame_count=2)
+
+
+def test_contact_sheet_wraps_long_clip_into_bounded_columns() -> None:
+    frames = [np.full((12, 16, 3), index, np.uint8) for index in range(5)]
+
+    sheet = _contact_sheet([frames], tile_size=(16, 12), max_columns=4)
+
+    assert sheet.shape == (24, 64, 3)
+    assert np.array_equal(sheet[:12, :16], frames[0])
+    assert np.array_equal(sheet[12:, :16], frames[4])
