@@ -2,6 +2,11 @@
 name = "yopo-clone"
 version = "0.1.0"
 requires-python = ">=3.8, <3.9"
+# The package is still configured by setup.py (as required by the upstream
+# MMDetection-style installation).  Declare fields supplied there as dynamic
+# so modern setuptools does not try to merge an incomplete PEP 621 table with
+# setup.py's metadata during editable installs.
+dynamic = ["description", "readme", "license", "authors", "keywords", "classifiers"]
 dependencies = [
     "muon-optimizer",
     "schedulefree==1.4.1",

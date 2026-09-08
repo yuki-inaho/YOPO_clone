@@ -1,0 +1,5 @@
+# Dependencies for tools/deployment/export_yopo_onnx.py and
+# tools/deployment/run_yopo_onnx.py.
+onnx>=1.16,<1.17
+onnxruntime>=1.18,<1.19
+onnxsim==0.4.36

@@ -172,6 +172,12 @@ python tools/test.py configs/yopo/nocs_yopo_real_camera_swinl.py <path_to_ckpt>
 python tools/test.py configs/yopo/housecat6d_yopo_swinl.py <path_to_ckpt>
 ```
 
+## Tomato RGB-D smoke test and ONNX deployment
+
+The reproducible setup, RGB-D scene probing, released-checkpoint smoke test,
+and the fixed-shape ONNX export/runtime flow are documented in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+
 
 ## Citation
 

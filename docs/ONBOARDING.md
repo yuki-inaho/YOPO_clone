@@ -15,7 +15,7 @@
 - camera座標は `+X=画像右`, `+Y=画像下`, `+Z=カメラ前方` として扱う。投影は `u = fx * X / Z + cx`, `v = fy * Y / Z + cy`。
 - NOCS / HouseCat6D の評価では translation 差分を `* 100` して cm にするため、通常は m 単位を前提にする。BOP由来データなど mm 単位の場合は変換が必要。
 - Python 3.8環境では `list[float]` や `tuple[int, int]` の実行時評価で落ちるため、型注釈は `typing.List` か `from __future__ import annotations` で互換化する。
-- `setup.py` がトップレベルで `torch` を import するため、editable install は `torch` 導入後に `uv pip install --no-build-isolation -e .` で行う。
+- `setup.py` のCUDA extension用torch importは遅延されており、metadata生成時にはtorchを要求しない。editable installは通常 `uv pip install --no-build-isolation -e .` で行える。
 - `cityscapesscripts` は optional 依存だが Python 3.8で古い `typing` backport を要求して `uv pip check` を壊すため、この環境では外している。
 
 ## 3. 参照すべき合意済み資料

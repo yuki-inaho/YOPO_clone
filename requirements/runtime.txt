@@ -2,7 +2,10 @@ matplotlib
 numpy
 pycocotools
 scipy
+scikit-learn
 shapely
 six
 terminaltables
+platformdirs
+tomli; python_version < '3.11'
 tqdm

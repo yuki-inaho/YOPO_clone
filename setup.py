@@ -8,9 +8,7 @@ import sys
 import warnings
 from setuptools import find_packages, setup
 
-import torch
-from torch.utils.cpp_extension import (BuildExtension, CppExtension,
-                                       CUDAExtension)
+from setuptools.command.build_ext import build_ext as BuildExtension
 
 
 def readme():
@@ -29,6 +27,11 @@ def get_version():
 
 
 def make_cuda_ext(name, module, sources, sources_cuda=[]):
+    # Import torch only when an extension is actually requested.  The current
+    # package has no ext_modules, so metadata/build isolation must not require
+    # torch merely to inspect setup.py.
+    import torch
+    from torch.utils.cpp_extension import (CppExtension, CUDAExtension)
 
     define_macros = []
     extra_compile_args = {'cxx': []}
